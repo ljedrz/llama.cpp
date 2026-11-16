@@ -497,6 +497,47 @@ static void get_rows_back_sycl_float(ggml_backend_sycl_context & ctx, const ggml
     GGML_UNUSED(ctx);
 }
 
+// f32 -> f32 with rows of whole 16-byte pieces: one float4 per work-item, consecutive work-items on
+// consecutive pieces (the plain kernel copies one float per work-item; for large rows such as a
+// recurrent state it runs at less than half the copy bandwidth)
+static bool get_rows_f32_vec4(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, queue_ptr stream) {
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2];
+    const bool aligned = ne00 % 4 == 0 && (uintptr_t) src0->data % 16 == 0 && (uintptr_t) dst->data % 16 == 0 &&
+                         src0->nb[1] % 16 == 0 && src0->nb[2] % 16 == 0 && src0->nb[3] % 16 == 0 &&
+                         dst->nb[1] % 16 == 0 && dst->nb[2] % 16 == 0 && dst->nb[3] % 16 == 0 &&
+                         src1->ne[3] == 1 && ne10*ne11*ne12 <= INT32_MAX && ne00/4 <= INT32_MAX;
+    if (!aligned) {
+        return false;
+    }
+    const int64_t n4   = ne00/4;
+    const int64_t rows = ne10*ne11*ne12;
+    const size_t s01 = src0->nb[1], s02 = src0->nb[2], s03 = src0->nb[3];
+    const size_t d1 = dst->nb[1], d2 = dst->nb[2], d3 = dst->nb[3];
+    const size_t s10 = src1->nb[0]/sizeof(int32_t), s11 = src1->nb[1]/sizeof(int32_t), s12 = src1->nb[2]/sizeof(int32_t);
+    const char    * s0 = (const char *) src0->data;
+    const int32_t * ix = (const int32_t *) src1->data;
+    char          * d  = (char *) dst->data;
+    constexpr int WG = 256;
+    stream->parallel_for(
+        sycl::nd_range<2>(sycl::range<2>((size_t) rows, (size_t) ((n4 + WG - 1)/WG)*WG), sycl::range<2>(1, WG)),
+        [=](sycl::nd_item<2> it) {
+            const int64_t j = (int64_t) it.get_global_id(1);
+            if (j >= n4) {
+                return;
+            }
+            const int64_t r   = (int64_t) it.get_group(0);
+            const int64_t i10 = r % ne10;
+            const int64_t i11 = (r / ne10) % ne11;
+            const int64_t i12 = r / (ne10*ne11);
+            const int64_t i01 = ix[i10*s10 + i11*s11 + i12*s12];
+            const sycl::float4 * src = (const sycl::float4 *) (s0 + i01*s01 + i11*s02 + i12*s03);
+            sycl::float4       * out = (sycl::float4 *) (d + i10*d1 + i11*d2 + i12*d3);
+            out[j] = src[j];
+        });
+    return true;
+}
+
 void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(dst->src[1]->type == GGML_TYPE_I32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_I32 );
@@ -522,6 +563,9 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
                                 src1_i32, (float *)dst->data, ctx.stream());
             break;
         case GGML_TYPE_F32:
+            if (dst->type == GGML_TYPE_F32 && get_rows_f32_vec4(dst->src[0], dst->src[1], dst, ctx.stream())) {
+                break;
+            }
             get_rows_sycl_float(ctx, dst->src[0], dst->src[1], dst, (const float *)dst->src[0]->data,
             src1_i32, (float *)dst->data, ctx.stream());
             break;
