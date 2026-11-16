@@ -21,6 +21,7 @@
 #include "fattn-onednn.hpp"
 #include "fattn-sparse.hpp"
 #include "fattn-dpas.hpp"
+#include "mach1.hpp"
 
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
     {                                                                                                            \
@@ -287,6 +288,10 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
 void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_sycl_set_device(ctx.device);
+    // Mach-1: one query token over the keys its mask keeps, or a batch whose tokens each see a small part of a long KV
+    if (ggml_sycl_mach1_attn_one(ctx, dst) || ggml_sycl_mach1_attn_batch(ctx, dst)) {
+        return;
+    }
 
     ggml_tensor * Q = dst->src[0];
     ggml_tensor * K = dst->src[1];

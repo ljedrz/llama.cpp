@@ -9594,6 +9594,46 @@ struct test_flash_attn_ext_kv_rows : public test_case {
     }
 };
 
+// FLASH_ATTN_EXT with a mask as Mach-2's QSA leaves it at prefill: every query token sees its own
+// `vis` blocks of 4 keys (a few of them with a finite bias) and nothing else; the last tokens see
+// fewer, one sees none.
+struct test_flash_attn_ext_qsa : public test_flash_attn_ext {
+    const int64_t vis;
+
+    test_flash_attn_ext_qsa(int64_t hs, int64_t nh, int64_t nr, int64_t kv, int64_t nb, int64_t vis)
+        : test_flash_attn_ext(hs, hs, nh, {nr, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16), vis(vis) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",qsa=" + std::to_string(vis);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") != 0) {
+                continue;
+            }
+            std::mt19937 rng(std::random_device{}());
+            const int64_t n_blk = kv/4;
+            std::vector<ggml_fp16_t> data((size_t) kv*nb, ggml_fp32_to_fp16(-INFINITY));
+            std::vector<int64_t> perm(n_blk);
+            for (int64_t q = 0; q < nb; q++) {
+                const int64_t nv = nb == 1 ? vis : q == nb - 1 ? 0 : q >= nb - 4 ? std::min<int64_t>(vis, 3 + q % 5) : vis;
+                for (int64_t b = 0; b < n_blk; b++) {
+                    perm[b] = b;
+                }
+                for (int64_t i = 0; i < nv; i++) {
+                    std::swap(perm[i], perm[i + rng() % (n_blk - i)]);
+                    for (int64_t c = 0; c < 4; c++) {
+                        data[(size_t) q*kv + perm[i]*4 + c] = ggml_fp32_to_fp16(rng() % 16 == 0 ? -0.5f : 0.0f);
+                    }
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -13804,6 +13844,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
 
+    // Mach-2 QSA masks: one token over a long KV, batches whose tokens each see their own blocks, one not sparse
+    test_cases.emplace_back(new test_flash_attn_ext_qsa(256, 2, 12, 28672, 1, 512));
+    test_cases.emplace_back(new test_flash_attn_ext_qsa(256, 2, 12, 16384, 1, 7));
+    test_cases.emplace_back(new test_flash_attn_ext_qsa(256, 2, 12, 8192, 64, 512));
+    test_cases.emplace_back(new test_flash_attn_ext_qsa(64, 4, 3, 4352, 40, 70));
+    test_cases.emplace_back(new test_flash_attn_ext_qsa(128, 1, 16, 6000, 33, 100));
+    test_cases.emplace_back(new test_flash_attn_ext_qsa(256, 2, 12, 4096, 48, 700));
     test_cases.emplace_back(new test_mach1_rt_mm());
     test_cases.emplace_back(new test_mach1_rt_mm(64, 128, 8));
     test_cases.emplace_back(new test_mach1_rt_mm(640, 2560, 3));
@@ -14571,6 +14618,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
 
+    // Mach-2 attention with QSA masks: one token and 512 tokens that each see 512 blocks of 4 keys
+    for (int64_t kv : {(int64_t) 8192, (int64_t) 28672, (int64_t) 131072}) {
+        test_cases.emplace_back(new test_flash_attn_ext_qsa(256, 2, 12, kv, 1, 512));
+        test_cases.emplace_back(new test_flash_attn_ext_qsa(256, 2, 12, kv, 512, 512));
+    }
     // Mach-2 spine shapes at decode and in a 512-token batch
     for (int64_t n_tok : {(int64_t) 1, (int64_t) 512}) {
         for (auto mn : std::vector<std::pair<int64_t, int64_t>>{{10240, 2560}, {6144, 2560}, {2560, 6144}, {12288, 2560},

@@ -145,6 +145,11 @@ bool ggml_sycl_mach1_rt_supported(const ggml_tensor * op, size_t local_mem);
 bool ggml_sycl_mach1_rt_pair_swiglu(ggml_backend_sycl_context & ctx, const ggml_tensor * g, const ggml_tensor * u,
                                     ggml_tensor * out);
 void ggml_sycl_mach1_head_mm(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
+// FLASH_ATTN_EXT for one query token, skipping the keys the mask excludes; false: not applicable
+bool ggml_sycl_mach1_attn_one(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
+// FLASH_ATTN_EXT for a batch whose tokens each see a small part of a long KV, over every token's own
+// keys; false: not applicable or not sparse enough (the dense kernel then)
+bool ggml_sycl_mach1_attn_batch(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 void ggml_sycl_mach1_embed_gather(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
 // fusions of the Mach-1 payload graph (expert pairs and weighted sum, hc activation tails); returns the
