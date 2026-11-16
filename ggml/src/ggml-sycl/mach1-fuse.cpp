@@ -1,5 +1,5 @@
 // Fusions for the elementwise tails of the Mach-1 payload graph (qwen4exp): the routed-expert weighted sum, the
-// paired gate + up + SWIGLU products at decode, and the hc activation tails. Each fused kernel computes the same fp32
+// paired gate + up + SWIGLU products at decode, the hc activation tails and RMS_NORM x weight on long rows. Each fused kernel computes the same fp32
 // operations in the same order as the nodes it replaces (the mach1 sources build with -fp-model=precise).
 
 #include "mach1.hpp"
@@ -226,6 +226,130 @@ static int mach1_fuse_moe_wsum(ggml_backend_sycl_context & ctx, ggml_cgraph * cg
 }
 
 //
+// RMS_NORM followed by a MUL with a (broadcast) weight, with or without a RESHAPE of the weight
+// in between: dst = (x * rsqrt(mean(x^2) + eps)) * w
+//
+static int mach1_fuse_rms_mul(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * norm = cgraph->nodes[i];
+    if (norm->op != GGML_OP_RMS_NORM || i + 2 > cgraph->n_nodes) {
+        return 0;
+    }
+    int j = i + 1;
+    if (cgraph->nodes[j]->op == GGML_OP_RESHAPE && i + 3 <= cgraph->n_nodes) {
+        j++;
+    }
+    ggml_tensor * mul = cgraph->nodes[j];
+    if (mul->op != GGML_OP_MUL) {
+        return 0;
+    }
+    const ggml_tensor * w = mul->src[0] == norm ? mul->src[1] : mul->src[1] == norm ? mul->src[0] : nullptr;
+    const ggml_tensor * x = norm->src[0];
+    if (w == nullptr || !mach1_f32c(x) || !mach1_f32c(norm) || !mach1_f32c(mul) || !mach1_f32c(w) ||
+        !ggml_are_same_shape(norm, mul) || w->ne[0] != x->ne[0] || !ggml_can_repeat(w, mul)) {
+        return 0;
+    }
+    if (j == i + 2 && cgraph->nodes[i + 1] != w) {
+        return 0;
+    }
+    // short rows and RMS_NORM + MUL + ADD stay with the backend's own fusions
+    if (x->ne[0] < 512) {
+        return 0;
+    }
+    if (j + 1 < cgraph->n_nodes && cgraph->nodes[j + 1]->op == GGML_OP_ADD &&
+        (cgraph->nodes[j + 1]->src[0] == mul || cgraph->nodes[j + 1]->src[1] == mul)) {
+        return 0;
+    }
+    int ok;
+    if (j == i + 1) {
+        const ggml_op ops[2]  = { GGML_OP_RMS_NORM, GGML_OP_MUL };
+        const int     outs[1] = { i + 1 };
+        ok = ggml_can_fuse_subgraph(cgraph, i, 2, ops, outs, 1);
+    } else {
+        const ggml_op ops[3]  = { GGML_OP_RMS_NORM, GGML_OP_RESHAPE, GGML_OP_MUL };
+        const int     outs[1] = { i + 2 };
+        ok = ggml_can_fuse_subgraph(cgraph, i, 3, ops, outs, 1);
+    }
+    if (!ok) {
+        return 0;
+    }
+    mach1_fuse_out fo(ctx, mul, { w }, { x });
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    const int     ncols = (int) x->ne[0];
+    const int64_t ne1 = x->ne[1], ne2 = x->ne[2];
+    const int64_t nrows = ggml_nrows(x);
+    const int64_t w1 = w->ne[1], w2 = w->ne[2], w3 = w->ne[3];
+    const float * xd = (const float *) x->data;
+    const float * wd = (const float *) w->data;
+    float       * yd = fo.ptr;
+    // the row's weight row under broadcasting
+    const auto wrow = [=](int64_t r) {
+        const int64_t i1 = r % ne1, i2 = (r / ne1) % ne2, i3 = r / (ne1*ne2);
+        return ((i3 % w3)*w2*w1 + (i2 % w2)*w1 + (i1 % w1))*(int64_t) ncols;
+    };
+    constexpr int KR = 16;   // columns per work-item held in registers
+    if (ncols >= 512 && ncols <= KR*MACH1_FUSE_WG) {
+        // the row and its weights loaded up front, all in flight at once (a few rows at decode: the
+        // loops below wait for each load in turn); the same per-work-item order of the squares
+        ctx.stream()->parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) nrows*MACH1_FUSE_WG), sycl::range<1>(MACH1_FUSE_WG)),
+            [=](sycl::nd_item<1> it) {
+                const int64_t r   = (int64_t) it.get_group(0);
+                const int     tid = (int) it.get_local_id(0);
+                const float * xr  = xd + r*ncols;
+                const float * wr  = wd + wrow(r);
+                float xv[KR], wv[KR];
+#pragma unroll
+                for (int k = 0; k < KR; ++k) {
+                    const int c = tid + k*MACH1_FUSE_WG;
+                    xv[k] = c < ncols ? xr[c] : 0.0f;
+                    wv[k] = c < ncols ? wr[c] : 0.0f;
+                }
+                float ss = 0.0f;
+#pragma unroll
+                for (int k = 0; k < KR; ++k) {
+                    if (tid + k*MACH1_FUSE_WG < ncols) {
+                        ss += xv[k]*xv[k];
+                    }
+                }
+                ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+                const float scale = sycl::rsqrt(ss/ncols + eps);
+                float * yr = yd + r*ncols;
+#pragma unroll
+                for (int k = 0; k < KR; ++k) {
+                    const int c = tid + k*MACH1_FUSE_WG;
+                    if (c < ncols) {
+                        const float v = scale*xv[k];
+                        yr[c] = v*wv[k];
+                    }
+                }
+            });
+    } else {
+        ctx.stream()->parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) nrows*MACH1_FUSE_WG), sycl::range<1>(MACH1_FUSE_WG)),
+            [=](sycl::nd_item<1> it) {
+                const int64_t r   = (int64_t) it.get_group(0);
+                const int     tid = (int) it.get_local_id(0);
+                const float * xr  = xd + r*ncols;
+                float ss = 0.0f;
+                for (int c = tid; c < ncols; c += MACH1_FUSE_WG) {
+                    ss += xr[c]*xr[c];
+                }
+                ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+                const float scale = sycl::rsqrt(ss/ncols + eps);
+                const float * wr = wd + wrow(r);
+                float       * yr = yd + r*ncols;
+                for (int c = tid; c < ncols; c += MACH1_FUSE_WG) {
+                    const float v = scale*xr[c];
+                    yr[c] = v*wr[c];
+                }
+            });
+    }
+    fo.finish(ctx.stream());
+    return j - i;
+}
+
+//
 // gate, up, SWIGLU(gate, up) as one paired pass at decode: the routed experts (D4) and the
 // shared expert (RT)
 //
@@ -261,6 +385,7 @@ int ggml_sycl_mach1_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, 
     switch (cgraph->nodes[i]->op) {
         case GGML_OP_SCALE:       return mach1_fuse_scale_act(ctx, cgraph, i);
         case GGML_OP_MUL:         return mach1_fuse_moe_wsum(ctx, cgraph, i);
+        case GGML_OP_RMS_NORM:    return mach1_fuse_rms_mul(ctx, cgraph, i);
         case GGML_OP_MACH1_D4_MM: return mach1_fuse_pair<GGML_OP_MACH1_D4_MM>(ctx, cgraph, i);
         case GGML_OP_MACH1_RT_MM: return mach1_fuse_pair<GGML_OP_MACH1_RT_MM>(ctx, cgraph, i);
         default:                  return 0;
