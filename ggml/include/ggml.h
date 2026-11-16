@@ -429,6 +429,11 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MACH1_RT_MM,
+        GGML_OP_MACH1_HEAD_MM,
+        GGML_OP_MACH1_EMBED_GATHER,
+        GGML_OP_MACH1_D4_MM,
+
         GGML_OP_COUNT,
     };
 
@@ -2517,6 +2522,50 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+
+    // Mach-1 rotated trellis dense matmul: W = diag(sv).H_m.fp16(hatW).H_n^T.diag(su), y = W x
+    //   trellis: I16 [64, (m/16)*(n/16)]   tlut: F16 [2, 512]   su: F32 [n]   sv: F32 [m]
+    //   x: F32 [n, n_tokens, ...]  ->  dst F32 [m, n_tokens, ...]
+    GGML_API struct ggml_tensor * ggml_mach1_rt_mm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * trellis,
+            struct ggml_tensor  * su,
+            struct ggml_tensor  * sv,
+            struct ggml_tensor  * tlut,
+            struct ggml_tensor  * x);
+
+    // Mach-1 int5-g64 head matmul: W[r,j] = q[r,j] * f32(gscale[r][j/64]), 8 codes per 5 bytes (stored q+16)
+    //   qp: I8 [n/8*5, n_vocab]   gscale: F16 [n/64, n_vocab]
+    //   x: F32 [n, n_tokens, ...]  ->  dst F32 [n_vocab, n_tokens, ...]
+    GGML_API struct ggml_tensor * ggml_mach1_head_mm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * qp,
+            struct ggml_tensor  * gscale,
+            struct ggml_tensor  * x);
+
+    // Mach-1 lossless nibble-LUT embedding gather: W[r,j] = bf16(lut[r*(n_embd/64) + j/64][nib(codes[r], j)])
+    //   codes: I8 [n_embd/2, n_vocab]   lut: BF16 [16, n_vocab*n_embd/64]
+    //   ids: I32 [n_tokens]  ->  dst F32 [n_embd, n_tokens]
+    GGML_API struct ggml_tensor * ggml_mach1_embed_gather(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * codes,
+            struct ggml_tensor  * lut,
+            struct ggml_tensor  * ids);
+
+    // Mach-1 D4 routed-expert matmul: y[:, i, t] = W[ids[i, t]] x[:, i, t]
+    //   hash: 15 int32 or NULL
+    GGML_API struct ggml_tensor * ggml_mach1_d4_mm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * trellis,
+            struct ggml_tensor  * offs,
+            struct ggml_tensor  * su,
+            struct ggml_tensor  * sv,
+            struct ggml_tensor  * gw,
+            struct ggml_tensor  * zt,
+            struct ggml_tensor  * units,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * x,
+            const int32_t       * hash);
 
     // custom operators
 

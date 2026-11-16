@@ -2117,6 +2117,22 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_top_k_mask(params, tensor);
             } break;
+        case GGML_OP_MACH1_RT_MM:
+            {
+                ggml_compute_forward_mach1_rt_mm(params, tensor);
+            } break;
+        case GGML_OP_MACH1_HEAD_MM:
+            {
+                ggml_compute_forward_mach1_head_mm(params, tensor);
+            } break;
+        case GGML_OP_MACH1_EMBED_GATHER:
+            {
+                ggml_compute_forward_mach1_embed_gather(params, tensor);
+            } break;
+        case GGML_OP_MACH1_D4_MM:
+            {
+                ggml_compute_forward_mach1_d4_mm(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2300,6 +2316,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
         case GGML_OP_TOP_K_MASK:
+        case GGML_OP_MACH1_RT_MM:
+        case GGML_OP_MACH1_HEAD_MM:
+        case GGML_OP_MACH1_EMBED_GATHER:
+        case GGML_OP_MACH1_D4_MM:
             {
                 n_tasks = n_threads;
             } break;
@@ -3035,6 +3055,26 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t K   = ggml_get_op_params_i32(node, 0);
                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
                         cur = per_thread * sizeof(float) * n_tasks;
+                    } break;
+                case GGML_OP_MACH1_RT_MM:
+                    {
+                        // u[nt][n] + v[nt][m], plus a token-major copy of u padded to whole vector lanes
+                        const int64_t n  = node->src[1]->ne[0];
+                        const int64_t m  = node->src[2]->ne[0];
+                        const struct ggml_tensor * x = node->src[4];
+                        const int64_t nt = x->ne[1]*x->ne[2]*x->ne[3];
+                        cur = sizeof(float)*((nt + 16)*(m + n) + (nt + 16)*n);
+                    } break;
+                case GGML_OP_MACH1_D4_MM:
+                    {
+                        const int64_t n        = node->src[2]->ne[0];
+                        const int64_t m        = node->src[3]->ne[0];
+                        const int64_t n_expert = node->src[1]->ne[1];
+                        const int64_t n_pairs  = node->src[7]->ne[0]*node->src[7]->ne[1];
+                        cur  = sizeof(float)*(size_t) n_pairs*(n + m);
+                        cur += sizeof(int32_t)*(size_t)(3*n_expert + 3*n_pairs + 2);
+                        cur += (size_t) n_pairs*n + sizeof(float)*(size_t) n_pairs*(n/16);
+                        cur += 64;
                     } break;
                 case GGML_OP_COUNT:
                     {

@@ -1354,6 +1354,10 @@ struct test_case {
         ggml_backend_tensor_get(t2, t2_data.data(), 0, ggml_nbytes(t2));
         return t1_data == t2_data;
     }
+    // perf mode: the ops of a graph that holds several of them, each on its own weights, so that
+    // every op reads data that is not in the device caches (as in a model); empty: the output
+    // node is duplicated instead
+    virtual std::vector<ggml_tensor *> perf_nodes() { return {}; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
 
@@ -1607,6 +1611,11 @@ struct test_case {
             }
 
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+            // TEST_BACKEND_OPS_PRINT_ERR: the error of every compared tensor, not only of the failures
+            static const bool print_err = getenv("TEST_BACKEND_OPS_PRINT_ERR") != nullptr;
+            if (print_err) {
+                printf("[%s] err = %.3e ", ggml_op_desc(t1), err);
+            }
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
                 //for (int i = 0; i < (int) f1.size(); i++) {
@@ -1719,6 +1728,10 @@ struct test_case {
         // build graph
         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
         ggml_build_forward_expand(gf, out);
+        const std::vector<ggml_tensor *> own_nodes = perf_nodes();
+        for (ggml_tensor * t : own_nodes) {
+            ggml_build_forward_expand(gf, t);
+        }
 
         // warmup run
         ggml_status status = ggml_backend_graph_compute(backend, gf);
@@ -1730,7 +1743,9 @@ struct test_case {
         // determine number of runs
         int n_runs;
         bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
-        if (op_flops(out) > 0) {
+        if (!own_nodes.empty()) {
+            n_runs = (int) own_nodes.size();
+        } else if (op_flops(out) > 0) {
             // based on flops
             const uint64_t GFLOP = 1000 * 1000 * 1000;
             const uint64_t target_flops_cpu =   8ULL * GFLOP;
@@ -1747,7 +1762,7 @@ struct test_case {
         }
 
         // duplicate the op
-        for (int i = 1; i < n_runs; i++) {
+        for (int i = 1; i < n_runs && own_nodes.empty(); i++) {
             ggml_graph_add_node(gf, out);
         }
 
@@ -5225,6 +5240,283 @@ struct test_rwkv_wkv6 : public test_case {
         ggml_tensor * s   = ggml_new_tensor(ctx, type, 2, std::vector<int64_t>{ head_size * head_size * head_count, n_seqs }.data());
         ggml_tensor * out = ggml_rwkv_wkv6(ctx, k, v, r, tf, td, s);
         return out;
+    }
+};
+
+// GGML_OP_MACH1_* codec ops. Any random bitstream is a valid trellis code, so
+// packed tensors are filled with random bytes; the CPU kernels (bit-exact vs
+// the reference decoder) are the comparison baseline.
+static void init_mach1_lattice_tlut(ggml_tensor * t) {
+    std::mt19937 rng(4242);
+    std::uniform_int_distribution<int> lv(-5, 4);
+    const float scale = 0.8963924050331116f;
+    std::vector<float> data(ggml_nelements(t));
+    for (float & v : data) {
+        v = scale*(float) lv(rng);
+    }
+    ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+}
+
+static void init_mach1_random_bytes(ggml_tensor * t) {
+    std::vector<uint8_t> data(ggml_nbytes(t));
+    for (size_t i = 0; i < data.size(); i++) {
+        data[i] = rand() & 0xFF;
+    }
+    ggml_backend_tensor_set(t, data.data(), 0, data.size());
+}
+
+struct test_mach1_d4_mm : public test_case {
+    const int64_t m, n, n_exp, n_used, n_tok;
+    const bool per_slot_x;
+    const bool hashed;
+    // perf: this many products in the graph, each with its own experts (cold weights)
+    const int cold;
+    // perf: the experts of a token drawn as Mach-2 routes real text (see mach1_d4_skew_weight);
+    // otherwise uniformly
+    const bool skew;
+    std::vector<ggml_tensor *> cold_nodes;
+    int32_t hash[15];
+
+    // The pairs an expert gets in a 512-token batch of text, by the expert's rank in its layer
+    // (the mean over the 47 layers and 15 batches of an 8K-token prompt of Rust source): a few
+    // experts take 100-200 of the 5,120 pairs, a third get none.
+    static double mach1_d4_skew_weight(double rank) {
+        static const double pts[][2] = {{0, 207}, {1, 154}, {2, 130}, {3, 116}, {5, 99}, {7, 88}, {10, 76}, {15, 63},
+                                        {20, 53}, {30, 41}, {50, 27}, {75, 19}, {100, 14}, {150, 8}, {200, 5},
+                                        {250, 3}, {300, 1.6}, {350, 0.6}, {511, 0.01}};
+        const int np = (int) (sizeof(pts)/sizeof(pts[0]));
+        for (int i = 1; i < np; ++i) {
+            if (rank <= pts[i][0]) {
+                const double f = (rank - pts[i - 1][0])/(pts[i][0] - pts[i - 1][0]);
+                return std::exp(std::log(pts[i - 1][1])*(1.0 - f) + std::log(pts[i][1])*f);
+            }
+        }
+        return pts[np - 1][1];
+    }
+
+    test_mach1_d4_mm(int64_t m = 64, int64_t n = 128, int64_t n_exp = 5, int64_t n_used = 2, int64_t n_tok = 3,
+            bool per_slot_x = false, bool hashed = false, int cold = 0, bool skew = false)
+        : m(m), n(n), n_exp(n_exp), n_used(n_used), n_tok(n_tok), per_slot_x(per_slot_x), hashed(hashed), cold(cold),
+          skew(skew) {
+        for (int r = 0; r < 5; ++r) {
+            uint32_t w0 = 0, w1 = 0;
+            for (int k = 0; k < 8; ++k) {
+                w0 |= (uint32_t)((k*5 + r) & 15) << (4*k);
+                w1 |= (uint32_t)((k*7 + 3*r + 1) & 15) << (4*k);
+            }
+            hash[3*r + 0] = (int32_t)(r % 2 ? 0x9E3779B1u : 0x27D4EB2Fu);
+            hash[3*r + 1] = (int32_t) w0;
+            hash[3*r + 2] = (int32_t) w1;
+        }
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(m, n, n_exp, n_used, n_tok, per_slot_x, hashed) + (cold ? ",cold=" + std::to_string(cold) : "") +
+               (skew ? ",skew=1" : "");
+    }
+
+    double max_nmse_err() override {
+        return 1e-4;
+    }
+
+    std::vector<ggml_tensor *> perf_nodes() override {
+        return cold_nodes;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t ntiles = (m/16)*(n/16);
+        ggml_tensor * trellis = ggml_new_tensor_1d(ctx, GGML_TYPE_I16, n_exp*ntiles*32);
+        ggml_tensor * offs  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, n_exp);
+        ggml_tensor * su    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n, n_exp);
+        ggml_tensor * sv    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, m, n_exp);
+        ggml_tensor * gw    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m/16 + n/16, n_exp);
+        ggml_tensor * zt    = ggml_new_tensor_2d(ctx, GGML_TYPE_I16, 65536, 5);
+        ggml_tensor * units = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 5);
+        ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tok);
+        ggml_tensor * x     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, per_slot_x ? n_used : 1, n_tok);
+        ggml_set_name(offs, "offs");
+        ggml_set_name(ids, "ids");
+        ggml_set_name(zt, "zt");
+        ggml_tensor * out = ggml_mach1_d4_mm(ctx, trellis, offs, su, sv, gw, zt, units, ids, x, hashed ? hash : nullptr);
+        cold_nodes.clear();
+        for (int k = 1; k < cold; ++k) {
+            ggml_tensor * ids_k = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tok);
+            ggml_format_name(ids_k, "ids%d", k);
+            cold_nodes.push_back(ggml_mach1_d4_mm(ctx, trellis, offs, su, sv, gw, zt, units, ids_k, x, hashed ? hash : nullptr));
+        }
+        if (cold) {
+            cold_nodes.push_back(out);
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t ntiles = (m/16)*(n/16);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (hashed && strcmp(t->name, "zt") == 0) {
+                std::vector<uint16_t> data(5*65536);
+                for (int r = 0; r < 5; ++r) {
+                    const uint32_t mult = (uint32_t) hash[3*r];
+                    const uint64_t lv   = (uint64_t)(uint32_t) hash[3*r + 1] | ((uint64_t)(uint32_t) hash[3*r + 2] << 32);
+                    for (uint32_t st = 0; st < 65536; ++st) {
+                        const uint32_t h = (st*mult) >> 16;
+                        uint16_t v = 0;
+                        for (int c = 0; c < 4; ++c) {
+                            const int z = (int)(((lv >> (4*((h >> (4*c)) & 15))) & 15) ^ 8) - 8;
+                            v |= (uint16_t)((z + 8) << (4*c));
+                        }
+                        data[r*65536 + st] = v;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(uint16_t));
+            } else if (t->type == GGML_TYPE_I16) {
+                init_mach1_random_bytes(t);
+            } else if (strcmp(t->name, "offs") == 0) {
+                std::vector<int32_t> data;
+                for (int64_t e = 0; e < n_exp; e++) {
+                    data.push_back((int32_t)(e*ntiles*32));
+                    data.push_back(4 + (int32_t)(e % 5));
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strncmp(t->name, "ids", 3) == 0) {
+                std::vector<int32_t> data(n_used*n_tok);
+                if (skew) {
+                    // rank r is expert (r*197) % n_exp: the loaded experts spread over the ids
+                    std::vector<double> w(n_exp);
+                    for (int64_t r = 0; r < n_exp; r++) {
+                        w[(r*197) % n_exp] = mach1_d4_skew_weight((double) r*512.0/(double) n_exp);
+                    }
+                    std::mt19937 rng(1234);
+                    for (int64_t tk = 0; tk < n_tok; tk++) {
+                        std::vector<double> wt = w;
+                        for (int64_t s = 0; s < n_used; s++) {
+                            std::discrete_distribution<int> dist(wt.begin(), wt.end());
+                            const int e = dist(rng);
+                            data[tk*n_used + s] = e;
+                            wt[e] = 0.0;
+                        }
+                    }
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+                    continue;
+                }
+                // cold: product k takes the experts of group k
+                const int64_t kc = cold ? atoi(t->name + 3) % (n_exp/n_used) : -1;
+                for (int64_t tk = 0; tk < n_tok; tk++) {
+                    for (int64_t s = 0; s < n_used; s++) {
+                        data[tk*n_used + s] = (int32_t)((kc >= 0 ? kc : rand() % (n_exp/n_used))*n_used + s);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+struct test_mach1_rt_mm : public test_case {
+    const int64_t m, n, words = 64, n_tok;
+    // perf: this many products in the graph, each with its own matrix (cold weights)
+    const int cold;
+    std::vector<ggml_tensor *> cold_nodes;
+
+    test_mach1_rt_mm(int64_t m = 64, int64_t n = 128, int64_t n_tok = 3, int cold = 0)
+        : m(m), n(n), n_tok(n_tok), cold(cold) {}
+
+    std::string vars() override {
+        return VARS_TO_STR4(m, n, words, n_tok) + (cold ? ",cold=" + std::to_string(cold) : "");
+    }
+
+    std::vector<ggml_tensor *> perf_nodes() override {
+        return cold_nodes;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * su   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_tensor * sv   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        ggml_tensor * tlut = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 2, 512);
+        ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tok);
+        ggml_tensor * out  = nullptr;
+        cold_nodes.clear();
+        for (int k = 0; k < std::max(1, cold); ++k) {
+            ggml_tensor * trellis = ggml_new_tensor_2d(ctx, GGML_TYPE_I16, words, (m/16)*(n/16));
+            out = ggml_mach1_rt_mm(ctx, trellis, su, sv, tlut, x);
+            if (cold) {
+                cold_nodes.push_back(out);
+            }
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I16) {
+                init_mach1_random_bytes(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// perf: y = A x for `cold` matrices of the same shape in one graph, so that every product reads
+// weights that are not in the device caches (the decode mat-vecs of a model)
+struct test_mach1_head_mm : public test_case {
+    const int64_t n, vocab, n_tok;
+
+    test_mach1_head_mm(int64_t n = 128, int64_t vocab = 96, int64_t n_tok = 3)
+        : n(n), vocab(vocab), n_tok(n_tok) {}
+
+    std::string vars() override {
+        return VARS_TO_STR3(n, vocab, n_tok);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * qp = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, n/8*5, vocab);
+        ggml_tensor * gs = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n/64, vocab);
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tok);
+        return ggml_mach1_head_mm(ctx, qp, gs, x);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I8) {
+                init_mach1_random_bytes(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+struct test_mach1_embed_gather : public test_case {
+    const int64_t n_embd = 128, vocab = 32, n_tok = 5;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, vocab, n_tok);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * codes = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, n_embd/2, vocab);
+        ggml_tensor * lut   = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 16, vocab*(n_embd/64));
+        ggml_tensor * ids   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tok);
+        return ggml_mach1_embed_gather(ctx, codes, lut, ids);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I8) {
+                init_mach1_random_bytes(t);
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(n_tok);
+                for (int64_t i = 0; i < n_tok; i++) {
+                    data[i] = rand() % vocab;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, n_tok*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -13512,6 +13804,42 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
 
+    test_cases.emplace_back(new test_mach1_rt_mm());
+    test_cases.emplace_back(new test_mach1_rt_mm(64, 128, 8));
+    test_cases.emplace_back(new test_mach1_rt_mm(640, 2560, 3));
+    test_cases.emplace_back(new test_mach1_rt_mm(768, 1280, 9));
+    test_cases.emplace_back(new test_mach1_rt_mm(2560, 640, 2));
+    test_cases.emplace_back(new test_mach1_rt_mm(512, 640, 2));
+    test_cases.emplace_back(new test_mach1_rt_mm(640, 512, 2));
+    test_cases.emplace_back(new test_mach1_rt_mm(2560, 10240, 2));
+    test_cases.emplace_back(new test_mach1_rt_mm(10240, 2560, 1));
+    test_cases.emplace_back(new test_mach1_rt_mm(16384, 256, 2));
+    // batches large enough for the matrix-engine paths
+    test_cases.emplace_back(new test_mach1_rt_mm(640, 2560, 64));
+    test_cases.emplace_back(new test_mach1_rt_mm(2560, 640, 40));
+    test_cases.emplace_back(new test_mach1_rt_mm(10240, 2560, 17));
+    test_cases.emplace_back(new test_mach1_d4_mm());
+    test_cases.emplace_back(new test_mach1_d4_mm(128, 64, 6, 3, 4, true));
+    test_cases.emplace_back(new test_mach1_d4_mm(160, 320, 5, 1, 2));
+    test_cases.emplace_back(new test_mach1_d4_mm(64, 128, 6, 2, 1, false, true));
+    test_cases.emplace_back(new test_mach1_d4_mm(320, 160, 7, 2, 6, true, true));
+    // Mach-2 expert shapes (n_embd 2560, n_ff 640, 10 experts used): decode and grouped
+    test_cases.emplace_back(new test_mach1_d4_mm(640, 2560, 20, 10, 1, false, true));
+    test_cases.emplace_back(new test_mach1_d4_mm(2560, 640, 20, 10, 1, true, true));
+    test_cases.emplace_back(new test_mach1_d4_mm(640, 2560, 20, 10, 7, false, true));
+    // few experts, many tokens: more pairs per expert than one grouped-walk token tile
+    test_cases.emplace_back(new test_mach1_d4_mm(64, 128, 4, 2, 40, false, true));
+    test_cases.emplace_back(new test_mach1_d4_mm(640, 2560, 20, 10, 35, false, true));
+    test_cases.emplace_back(new test_mach1_d4_mm(2560, 640, 20, 10, 35, true, true));
+    test_cases.emplace_back(new test_mach1_d4_mm(128, 256, 9, 3, 24, true, false));
+    // experts loaded unevenly: units of 1 .. 8 pair groups, experts with more than one unit, an odd number of column tiles
+    test_cases.emplace_back(new test_mach1_d4_mm(64, 80, 24, 3, 96, false, true, 0, true));
+    test_cases.emplace_back(new test_mach1_d4_mm(96, 48, 24, 3, 96, true, false, 0, true));
+    test_cases.emplace_back(new test_mach1_head_mm());
+    test_cases.emplace_back(new test_mach1_head_mm(2560, 1024, 1));
+    test_cases.emplace_back(new test_mach1_head_mm(2560, 1024, 6));
+    test_cases.emplace_back(new test_mach1_embed_gather());
+
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
@@ -14242,6 +14570,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
     }
 
+
+    // Mach-2 spine shapes at decode and in a 512-token batch
+    for (int64_t n_tok : {(int64_t) 1, (int64_t) 512}) {
+        for (auto mn : std::vector<std::pair<int64_t, int64_t>>{{10240, 2560}, {6144, 2560}, {2560, 6144}, {12288, 2560},
+                                                                {640, 2560}, {2560, 640}, {512, 2560}}) {
+            test_cases.emplace_back(new test_mach1_rt_mm(mn.first, mn.second, n_tok));
+        }
+    }
+    for (int64_t n_tok : {(int64_t) 1, (int64_t) 512, (int64_t) 2048}) {
+        test_cases.emplace_back(new test_mach1_d4_mm( 640, 2560, 512, 10, n_tok, false, true));
+        test_cases.emplace_back(new test_mach1_d4_mm(2560,  640, 512, 10, n_tok, true,  true));
+    }
+    // a 512-token batch with the experts loaded as on real text
+    test_cases.emplace_back(new test_mach1_d4_mm( 640, 2560, 512, 10, 512, false, true, 0, true));
+    test_cases.emplace_back(new test_mach1_d4_mm(2560,  640, 512, 10, 512, true,  true, 0, true));
+    // decode on cold weights: 48 products per graph, each on its own matrix or experts
+    for (auto mn : std::vector<std::pair<int64_t, int64_t>>{{10240, 2560}, {6144, 2560}, {2560, 6144}, {12288, 2560},
+                                                            {640, 2560}, {2560, 640}, {512, 2560}}) {
+        test_cases.emplace_back(new test_mach1_rt_mm(mn.first, mn.second, 1, 48));
+    }
+    test_cases.emplace_back(new test_mach1_d4_mm( 640, 2560, 512, 10, 1, false, true, 48));
+    test_cases.emplace_back(new test_mach1_d4_mm(2560,  640, 512, 10, 1, true,  true, 48));
+    test_cases.emplace_back(new test_mach1_head_mm(2560, 248320, 1));
+    test_cases.emplace_back(new test_mach1_head_mm(2560, 248320, 8));
 
     return test_cases;
 }
