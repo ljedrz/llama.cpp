@@ -4097,6 +4097,17 @@ ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std:
     return create_tensor(*ml, tn, ne, flags);
 }
 
+ggml_tensor * llama_model_base::create_tensor_for_layer(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int il) {
+    GGML_ASSERT(ml != nullptr);
+    if (il < 0) {
+        return create_tensor(*ml, tn, ne, TENSOR_DUPLICATED);
+    }
+    const buft_list_t * buft_list_layer = pimpl->dev_layer.at(il).buft_list;
+    return ml->create_tensor(
+        hparams, &pimpl->cpu_buft_list, buft_list_layer, buft_list_layer, buft_list_layer,
+        tn, ne, TENSOR_DUPLICATED);
+}
+
 void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
     if (flags & TENSOR_SKIP) {
         const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP;

@@ -2845,6 +2845,46 @@ struct llama_model_qwen4exp : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    // Mach-1 payload (mach1.format_version 5): dense linears as RT trellis streams, routed experts as D4
+    // streams, a nibble-LUT embedding and an int5 head; a linear without a stream keeps its plain weight
+    struct m1_rt {
+        ggml_tensor * trellis = nullptr;
+        ggml_tensor * su      = nullptr;
+        ggml_tensor * sv      = nullptr;
+        ggml_tensor * tlut    = nullptr;
+        int64_t       n_out   = 0;
+    };
+    struct m1_d4 {
+        ggml_tensor * trellis = nullptr;
+        ggml_tensor * offs    = nullptr;
+        ggml_tensor * su      = nullptr;
+        ggml_tensor * sv      = nullptr;
+        ggml_tensor * gw      = nullptr;
+        ggml_tensor * zt      = nullptr;
+        ggml_tensor * units   = nullptr;
+    };
+    struct m1_layer {
+        m1_rt wq, wk, wv, wo;
+        m1_rt wqkv, wqkv_gate, ssm_out;
+        m1_rt gate_shexp, up_shexp, down_shexp;
+        m1_d4 exps[3]; // gate, up, down
+    };
+
+    uint32_t              m1_version = 0;
+    uint32_t              m1_ple_seed = 0;
+    std::vector<m1_layer> m1_layers;
+    ggml_tensor *         m1_ne_tlut     = nullptr;
+    ggml_tensor *         m1_d4_zt       = nullptr;
+    ggml_tensor *         m1_d4_units    = nullptr;
+    std::vector<int32_t>  m1_d4_hash;
+    ggml_tensor *         m1_head_qp     = nullptr;
+    ggml_tensor *         m1_head_gscale = nullptr;
+    ggml_tensor *         m1_embed_codes = nullptr;
+    ggml_tensor *         m1_embed_lut   = nullptr;
+
+    void load_m1_hparams(llama_model_loader & ml);
+    void load_m1_tensors(llama_model_loader & ml);
+
     struct graph : public llm_build_delta_net_base {
         graph(const llm_graph_params & params);
     protected:
@@ -2944,6 +2984,23 @@ struct llama_model_qwen4exp : public llama_model_base {
         std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(
                     ggml_tensor * input,
                             int   il);
+
+        // Mach-1 payload: a linear that may be an RT stream (c null or without one: w), the D4 routed
+        // experts, the LUT embedding
+        ggml_tensor * build_m1_mm(ggml_tensor * w, ggml_tensor * w_s, const m1_rt * c, ggml_tensor * x);
+        ggml_tensor * build_m1_moe(ggml_tensor * cur, int il);
+        ggml_tensor * build_m1_inp_embd();
+        // RT streams keep the V heads grouped by K head (HF order), the graph wants them tiled
+        ggml_tensor * m1_v_heads(ggml_tensor * y, int64_t hd, bool to_tiled);
+
+        const llama_model_qwen4exp & m1_model() const {
+            return static_cast<const llama_model_qwen4exp &>(model);
+        }
+        // the payload streams of layer il, null without a payload
+        const m1_layer * m1_at(int il) const {
+            const auto & ls = m1_model().m1_layers;
+            return il >= 0 && (size_t) il < ls.size() ? &ls[il] : nullptr;
+        }
     };
 
     // MTP draft head: one QSA block after the trunk, fed by the trunk's hc-wide residual

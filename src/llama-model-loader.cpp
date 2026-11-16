@@ -414,6 +414,7 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_arr<std::array<int32_t, 512>>(enum llm_kv kid, std::array<int32_t, 512> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<float, 3>>(enum llm_kv kid, std::array<float, 3> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
+    template bool llama_model_loader::get_arr<int32_t>(const std::string & key, std::vector<int32_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv kid, std::vector<uint32_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<uint64_t>>(enum llm_kv kid, std::vector<uint64_t> & result, bool required);
@@ -1351,6 +1352,26 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                             ggml_backend_buft_name(buft));
                     break;
                 }
+            }
+        }
+
+        // mach1 code streams ("<name>.m1_*") are read only by the mach1 ops, no stock op takes their types:
+        // put them in the first device buffer type of the list, else in the last (plain CPU) one
+        if (!buft && tn.suffix != nullptr && strncmp(tn.suffix, "m1_", 3) == 0) {
+            for (const auto & entry : *buft_list) {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(entry.second);
+                if (dev == nullptr) {
+                    continue;
+                }
+                const enum ggml_backend_dev_type dt = ggml_backend_dev_type(dev);
+                if ((dt == GGML_BACKEND_DEVICE_TYPE_GPU || dt == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
+                    entry.second == ggml_backend_dev_buffer_type(dev)) {
+                    buft = entry.second;
+                    break;
+                }
+            }
+            if (!buft) {
+                buft = buft_list->back().second;
             }
         }
 
