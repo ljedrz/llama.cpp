@@ -6,6 +6,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "topk-moe.hpp"
+#include "mach1.hpp"
 
 // SYCL port of ggml-cuda/topk-moe.cu. The kernel is a translation of the CUDA no-bias, no-PDL
 // path of topk_moe_cuda; the fusion-detection helpers below are ported near-verbatim from
@@ -541,6 +542,11 @@ static bool ggml_sycl_check_fusion_memory_ranges(const ggml_cgraph * cgraph, con
 int ggml_sycl_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
     if (!g_ggml_sycl_enable_fusion) {
         return 0;
+    }
+
+    const int n_mach1 = ggml_sycl_mach1_fuse(ctx, cgraph, i);
+    if (n_mach1 != 0) {
+        return n_mach1;
     }
 
     return ggml_sycl_fuse_topk_moe(ctx, cgraph, i);

@@ -90,6 +90,7 @@
 #include "ggml-sycl/opt-step.hpp"
 #include "ggml-sycl/solve_tri.hpp"
 #include "ggml-sycl/gated_delta_net.hpp"
+#include "ggml-sycl/mach1.hpp"
 #include "ggml-sycl/pool.hpp"
 #include "ggml-sycl/cross_entropy_loss.hpp"
 
@@ -6403,6 +6404,18 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         case GGML_OP_GATED_DELTA_NET:
             ggml_sycl_gated_delta_net(ctx, dst);
             break;
+        case GGML_OP_MACH1_D4_MM:
+            ggml_sycl_mach1_d4_mm(ctx, dst);
+            break;
+        case GGML_OP_MACH1_RT_MM:
+            ggml_sycl_mach1_rt_mm(ctx, dst);
+            break;
+        case GGML_OP_MACH1_HEAD_MM:
+            ggml_sycl_mach1_head_mm(ctx, dst);
+            break;
+        case GGML_OP_MACH1_EMBED_GATHER:
+            ggml_sycl_mach1_embed_gather(ctx, dst);
+            break;
         case GGML_OP_OPT_STEP_ADAMW:
             ggml_sycl_opt_step_adamw(ctx, dst);
             break;
@@ -7682,6 +7695,13 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
             return true;
+        case GGML_OP_MACH1_D4_MM:
+            return ggml_sycl_mach1_d4_supported(op);
+        case GGML_OP_MACH1_RT_MM:
+            return ggml_sycl_mach1_rt_supported(op, ggml_sycl_info().devices[device].smpbo);
+        case GGML_OP_MACH1_HEAD_MM:
+        case GGML_OP_MACH1_EMBED_GATHER:
+            return true;
         case GGML_OP_SSM_CONV:
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&
@@ -7738,6 +7758,7 @@ static bool ggml_backend_sycl_device_supports_buft(ggml_backend_dev_t dev, ggml_
 static int64_t get_op_batch_size(const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_GET_ROWS:
+        case GGML_OP_MACH1_EMBED_GATHER: // the table stays in host memory, offloading would upload it
             return 0;
         case GGML_OP_MUL_MAT:
             return op->ne[1];

@@ -32,6 +32,10 @@ list(APPEND GGML_SOURCES_SYCL ${SRCS})
 
 target_sources(ggml-sycl PRIVATE ${GGML_HEADERS_SYCL} ${GGML_SOURCES_SYCL})
 
+# the Mach-1 codec kernels keep CUDA's fp32 op order: no reassociation, IEEE division
+file(GLOB   GGML_SOURCES_SYCL_MACH1 "mach1*.cpp")
+set_source_files_properties(${GGML_SOURCES_SYCL_MACH1} PROPERTIES COMPILE_OPTIONS "-fp-model=precise")
+
 if (WIN32)
     # To generate a Visual Studio solution, using Intel C++ Compiler for ggml-sycl is mandatory
     if( ${CMAKE_GENERATOR} MATCHES "Visual Studio" AND NOT (${CMAKE_GENERATOR_TOOLSET} MATCHES "Intel C"))
