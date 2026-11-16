@@ -144,6 +144,74 @@ static void lightning_indexer_f32_sycl(
         });
 }
 
+// A batch of tokens over f32 keys: the head scores of a chunk of tokens as one fp32 GEMM (each key row is read
+// once per chunk, not once per token), then ReLU, the weighted sum over the heads (in head order) and the mask
+static bool lightning_indexer_f32_batch(ggml_backend_sycl_context & ctx, const ggml_tensor * q, const ggml_tensor * k,
+                                        const ggml_tensor * w, const ggml_tensor * m, ggml_tensor * dst) {
+    const int64_t n_embd  = q->ne[0];
+    const int64_t n_head  = q->ne[1];
+    const int64_t n_batch = q->ne[2];
+    const int64_t n_kv    = k->ne[2];
+
+    if (n_batch < 16 || q->ne[3] != 1 || k->ne[3] != 1 || k->type != GGML_TYPE_F32 ||
+        q->nb[1] != (size_t) n_embd*sizeof(float) || q->nb[2] != (size_t) n_head*q->nb[1] ||
+        k->nb[2] % sizeof(float) != 0 || k->nb[2] < (size_t) n_embd*sizeof(float) ||
+        w->nb[0] != sizeof(float) || dst->nb[1] % sizeof(float) != 0 || m->nb[1] % sizeof(sycl::half) != 0) {
+        return false;
+    }
+
+    queue_ptr stream = ctx.stream();
+
+    // about 64 MB of head scores per chunk
+    const int64_t chunk = std::max<int64_t>(1, std::min<int64_t>(n_batch, ((int64_t) 16 << 20) / std::max<int64_t>(1, n_kv*n_head)));
+    ggml_sycl_pool_alloc<float> scores(ctx.pool(), (size_t) (n_kv*n_head*chunk));
+
+    const float * kd = (const float *) k->data;
+    const int64_t ldk = k->nb[2] / sizeof(float);
+    const float * qd = (const float *) q->data;
+    const char  * wd = (const char *) w->data;
+    const char  * md = (const char *) m->data;
+    float       * od = (float *) dst->data;
+    float       * sd = scores.get();
+    const size_t nbw1 = w->nb[1];
+    const size_t nbm1 = m->nb[1];
+    const int64_t ld_dst = dst->nb[1] / sizeof(float);
+
+    for (int64_t t0 = 0; t0 < n_batch; t0 += chunk) {
+        const int64_t nt = std::min(chunk, n_batch - t0);
+        const float alpha = 1.0f;
+        const float beta  = 0.0f;
+        // scores[i_kv + n_kv*(t*n_head + h)] = k[i_kv] . q[t, h]
+        SYCL_CHECK(CHECK_TRY_ERROR(oneapi::mkl::blas::column_major::gemm(
+            *stream, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
+            n_kv, n_head*nt, n_embd,
+            alpha, kd, ldk, qd + t0*n_head*n_embd, n_embd,
+            beta, sd, n_kv)));
+
+        const int64_t total = n_kv*nt;
+        constexpr int WG = 256;
+        stream->parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) ((total + WG - 1)/WG)*WG), sycl::range<1>(WG)),
+            [=](sycl::nd_item<1> it) {
+                const int64_t i = (int64_t) it.get_global_id(0);
+                if (i >= total) {
+                    return;
+                }
+                const int64_t i_kv = i % n_kv;
+                const int64_t t    = i / n_kv;
+                const float * wr   = (const float *) (wd + (t0 + t)*nbw1);
+                const float * sr   = sd + t*n_head*n_kv + i_kv;
+                float score = 0.0f;
+                for (int64_t h = 0; h < n_head; ++h) {
+                    score += sycl::max(sr[h*n_kv], 0.0f) * wr[h];
+                }
+                const sycl::half * mr = (const sycl::half *) (md + (t0 + t)*nbm1);
+                od[(t0 + t)*ld_dst + i_kv] = score + static_cast<float>(mr[i_kv]);
+            });
+    }
+    return true;
+}
+
 void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4);
     const ggml_tensor * q = dst->src[0];
@@ -182,6 +250,10 @@ void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor
     const int64_t n_kv     = nek2;
 
     GGML_ASSERT(n_embd == WARP_SIZE * 8);
+
+    if (lightning_indexer_f32_batch(ctx, q, k, w, m, dst)) {
+        return;
+    }
 
     lightning_indexer_f32_sycl(
             (const char *) q->data, (const char *) k->data,
