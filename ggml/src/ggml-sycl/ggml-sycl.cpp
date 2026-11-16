@@ -5139,8 +5139,193 @@ static bool can_use_mul_mat_q(const ggml_tensor * src0, const ggml_tensor * src1
     return src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 }
 
+// y = W x for one f32 column and a float matrix with few rows (e.g. [10240, 4]): DMMV gives each
+// row one sub-group, which leaves the device nearly idle; here a work-group of 512 reduces a row
+#define GGML_SYCL_MMV_FEW_ROWS_MAX 64
+#define GGML_SYCL_MMV_FEW_ROWS_WG  512
+
+static bool ggml_sycl_mmv_few_rows_ok(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    return (src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F32) &&
+           src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+           src0->ne[1] <= GGML_SYCL_MMV_FEW_ROWS_MAX && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+           src0->nb[0] == ggml_type_size(src0->type) && src0->nb[1] % ggml_type_size(src0->type) == 0 &&
+           src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 && ggml_is_contiguous(src1) &&
+           ggml_is_contiguous(dst) && !ggml_backend_buffer_is_sycl_split(src0->buffer);
+}
+
+template <ggml_type T>
+static void ggml_sycl_mmv_few_rows(const void * vw, const float * x, float * y, const int ncols, const int nrows,
+                                   const int64_t ld, queue_ptr stream) {
+    // runs of 4 columns per work-item (one load of the weights and one of x each, a quarter of the
+    // loads a work-item waits for in turn) when the rows allow aligned loads
+    static const bool vec4_env = getenv("GGML_SYCL_MMV_FEW_ROWS_VEC4") == nullptr || atoi(getenv("GGML_SYCL_MMV_FEW_ROWS_VEC4")) != 0;
+    const size_t wsz  = T == GGML_TYPE_F32 ? sizeof(float) : sizeof(uint16_t);
+    const bool   vec4 = vec4_env && ncols % 4 == 0 && ld % 4 == 0 && (uintptr_t) x % 16 == 0 && (uintptr_t) vw % (4*wsz) == 0;
+    if (vec4) {
+        stream->parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) nrows*GGML_SYCL_MMV_FEW_ROWS_WG), sycl::range<1>(GGML_SYCL_MMV_FEW_ROWS_WG)),
+            [=](sycl::nd_item<1> it) {
+                const int row = (int) it.get_group(0);
+                const int tid = (int) it.get_local_id(0);
+                float acc = 0.0f;
+                for (int i = 4*tid; i < ncols; i += 4*GGML_SYCL_MMV_FEW_ROWS_WG) {
+                    const sycl::float4 xv = *(const sycl::float4 *) (x + i);
+                    sycl::float4 w;
+                    if constexpr (T == GGML_TYPE_BF16) {
+                        const sycl::vec<uint16_t, 4> b = *(const sycl::vec<uint16_t, 4> *) ((const uint16_t *) vw + row*ld + i);
+                        w = (b.convert<uint32_t>() << 16).template as<sycl::float4>();
+                    } else if constexpr (T == GGML_TYPE_F16) {
+                        w = (*(const sycl::vec<sycl::half, 4> *) ((const sycl::half *) vw + row*ld + i)).template convert<float>();
+                    } else {
+                        w = *(const sycl::float4 *) ((const float *) vw + row*ld + i);
+                    }
+                    acc += w.x()*xv.x() + w.y()*xv.y() + w.z()*xv.z() + w.w()*xv.w();
+                }
+                acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+                if (tid == 0) {
+                    y[row] = acc;
+                }
+            });
+        return;
+    }
+    stream->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) nrows*GGML_SYCL_MMV_FEW_ROWS_WG), sycl::range<1>(GGML_SYCL_MMV_FEW_ROWS_WG)),
+        [=](sycl::nd_item<1> it) {
+            const int row = (int) it.get_group(0);
+            const int tid = (int) it.get_local_id(0);
+            float acc = 0.0f;
+            for (int i = tid; i < ncols; i += GGML_SYCL_MMV_FEW_ROWS_WG) {
+                float w;
+                if constexpr (T == GGML_TYPE_BF16) {
+                    w = sycl::bit_cast<float>((uint32_t) ((const uint16_t *) vw)[row*ld + i] << 16);
+                } else if constexpr (T == GGML_TYPE_F16) {
+                    w = (float) ((const sycl::half *) vw)[row*ld + i];
+                } else {
+                    w = ((const float *) vw)[row*ld + i];
+                }
+                acc += w*x[i];
+            }
+            acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+            if (tid == 0) {
+                y[row] = acc;
+            }
+        });
+}
+
+// The same for a batch of columns and at most 8 rows (the hyper-connection [n, 4] products at
+// prefill, which the GEMM paths handle poorly): one work-group per column of src1, which is read
+// once for all rows.
+#define GGML_SYCL_MM_FEW_ROWS_MAX 8
+
+static bool ggml_sycl_mm_few_rows_ok(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    return (src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F32) &&
+           src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+           src0->ne[1] <= GGML_SYCL_MM_FEW_ROWS_MAX && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+           src0->nb[0] == ggml_type_size(src0->type) && src0->nb[1] % ggml_type_size(src0->type) == 0 &&
+           src1->ne[1] > 1 && src1->ne[2] == 1 && src1->ne[3] == 1 && ggml_is_contiguous(src1) &&
+           ggml_is_contiguous(dst) && !ggml_backend_buffer_is_sycl_split(src0->buffer);
+}
+
+template <ggml_type T>
+static void ggml_sycl_mm_few_rows(const void * vw, const float * x, float * y, const int ncols, const int nrows,
+                                  const int64_t ld, const int ntok, queue_ptr stream) {
+    constexpr int NR = GGML_SYCL_MM_FEW_ROWS_MAX;
+    const bool vec4 = ncols % 4 == 0 && ld % 4 == 0 && (uintptr_t) x % 16 == 0;
+    stream->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) ntok*GGML_SYCL_MMV_FEW_ROWS_WG), sycl::range<1>(GGML_SYCL_MMV_FEW_ROWS_WG)),
+        [=](sycl::nd_item<1> it) {
+            const int t   = (int) it.get_group(0);
+            const int tid = (int) it.get_local_id(0);
+            const float * xt = x + (int64_t) t*ncols;
+            float acc[NR];
+#pragma unroll
+            for (int r = 0; r < NR; ++r) {
+                acc[r] = 0.0f;
+            }
+            const auto wat = [&](int r, int i) {
+                if constexpr (T == GGML_TYPE_BF16) {
+                    return sycl::bit_cast<float>((uint32_t) ((const uint16_t *) vw)[r*ld + i] << 16);
+                } else if constexpr (T == GGML_TYPE_F16) {
+                    return (float) ((const sycl::half *) vw)[r*ld + i];
+                } else {
+                    return ((const float *) vw)[r*ld + i];
+                }
+            };
+            // runs of 4 columns per work-item when the rows allow 16-byte loads of x
+            if (vec4) {
+                for (int i = 4*tid; i < ncols; i += 4*GGML_SYCL_MMV_FEW_ROWS_WG) {
+                    const sycl::float4 xv = *(const sycl::float4 *) (xt + i);
+#pragma unroll
+                    for (int r = 0; r < NR; ++r) {
+                        if (r < nrows) {
+                            acc[r] += wat(r, i)*xv.x() + wat(r, i + 1)*xv.y() + wat(r, i + 2)*xv.z() + wat(r, i + 3)*xv.w();
+                        }
+                    }
+                }
+            } else {
+                for (int i = tid; i < ncols; i += GGML_SYCL_MMV_FEW_ROWS_WG) {
+                    const float xv = xt[i];
+#pragma unroll
+                    for (int r = 0; r < NR; ++r) {
+                        if (r < nrows) {
+                            acc[r] += wat(r, i)*xv;
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < NR; ++r) {
+                if (r < nrows) {
+                    const float s = sycl::reduce_over_group(it.get_group(), acc[r], sycl::plus<float>());
+                    if (tid == 0) {
+                        y[(int64_t) t*nrows + r] = s;
+                    }
+                }
+            }
+        });
+}
+
+static void ggml_sycl_mul_mat_few_rows(ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
+                                       const ggml_tensor * src1, ggml_tensor * dst) {
+    const int     ncols = (int) src0->ne[0];
+    const int     nrows = (int) src0->ne[1];
+    const int     ntok  = (int) src1->ne[1];
+    const int64_t ld    = (int64_t) (src0->nb[1]/ggml_type_size(src0->type));
+    const float * x     = (const float *) src1->data;
+    float       * y     = (float *) dst->data;
+    switch (src0->type) {
+        case GGML_TYPE_BF16: ggml_sycl_mm_few_rows<GGML_TYPE_BF16>(src0->data, x, y, ncols, nrows, ld, ntok, ctx.stream()); break;
+        case GGML_TYPE_F16:  ggml_sycl_mm_few_rows<GGML_TYPE_F16> (src0->data, x, y, ncols, nrows, ld, ntok, ctx.stream()); break;
+        default:             ggml_sycl_mm_few_rows<GGML_TYPE_F32> (src0->data, x, y, ncols, nrows, ld, ntok, ctx.stream()); break;
+    }
+}
+
+static void ggml_sycl_mul_mat_vec_few_rows(ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
+                                           const ggml_tensor * src1, ggml_tensor * dst) {
+    const int     ncols = (int) src0->ne[0];
+    const int     nrows = (int) src0->ne[1];
+    const int64_t ld    = (int64_t) (src0->nb[1]/ggml_type_size(src0->type));
+    const float * x     = (const float *) src1->data;
+    float       * y     = (float *) dst->data;
+    switch (src0->type) {
+        case GGML_TYPE_BF16: ggml_sycl_mmv_few_rows<GGML_TYPE_BF16>(src0->data, x, y, ncols, nrows, ld, ctx.stream()); break;
+        case GGML_TYPE_F16:  ggml_sycl_mmv_few_rows<GGML_TYPE_F16> (src0->data, x, y, ncols, nrows, ld, ctx.stream()); break;
+        default:             ggml_sycl_mmv_few_rows<GGML_TYPE_F32> (src0->data, x, y, ncols, nrows, ld, ctx.stream()); break;
+    }
+}
+
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
+
+    if (dst->op == GGML_OP_MUL_MAT && ggml_sycl_mmv_few_rows_ok(src0, src1, dst)) {
+        ggml_sycl_mul_mat_vec_few_rows(ctx, src0, src1, dst);
+        return;
+    }
+    static const bool mm_few = getenv("GGML_SYCL_MM_FEW_ROWS") == nullptr || atoi(getenv("GGML_SYCL_MM_FEW_ROWS")) != 0;
+    if (dst->op == GGML_OP_MUL_MAT && mm_few && ggml_sycl_mm_few_rows_ok(src0, src1, dst)) {
+        ggml_sycl_mul_mat_few_rows(ctx, src0, src1, dst);
+        return;
+    }
 
     // Handle HADAMARAD hint given from further up the pipeline and pass it to the correct
     // kernel.
