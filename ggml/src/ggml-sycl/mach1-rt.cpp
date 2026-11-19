@@ -313,6 +313,7 @@ static bool mach1_rt_sg_stage_r(dpct::queue_ptr stream, const float * src, const
     if constexpr (R > 1) {
         if (nt <= MACH1_RT_SPLIT_MAX_NT) {
             switch (M) {
+                case 128:  if (tmp) { mach1_rt_sg_stage_split<OUT, R, 8>(stream, src, side, dst, nt, src2, tmp); return true; } break;
                 case 512:  mach1_rt_sg_stage_split<OUT, R, 32>(stream, src, side, dst, nt, src2, tmp); return true;
                 case 1024: mach1_rt_sg_stage_split<OUT, R, 64>(stream, src, side, dst, nt, src2, tmp); return true;
                 default:   break;
