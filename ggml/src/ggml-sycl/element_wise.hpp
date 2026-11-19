@@ -132,6 +132,11 @@ void ggml_sycl_arange(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 // fused UNARY(silu|sigmoid|softplus) + MUL; see ggml_sycl_can_fuse() for the accepted shapes
 void ggml_sycl_op_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
+// r + v * sigmoid(g) with g one value per row of v (SIGMOID -> MUL -> ADD)
+bool ggml_sycl_sigmoid_mul_add_fusable(const ggml_cgraph * cgraph, int i);
+void ggml_sycl_op_sigmoid_mul_add_fused(ggml_backend_sycl_context & ctx, ggml_tensor * u, ggml_tensor * mul,
+                                        ggml_tensor * add);
+
 // fused f32 ADD + UNARY(silu|sigmoid|softplus) + MUL with the bias and the scale broadcast
 // over dim 0; see ggml_sycl_can_fuse() for the accepted shapes
 void ggml_sycl_op_add_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor * add_node,

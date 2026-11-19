@@ -1098,6 +1098,56 @@ void ggml_sycl_op_add_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tens
     dispatch_fused_unary_op(ggml_get_unary_op(unary_node), dispatch_op);
 }
 
+// out = r + v * sigmoid(g) for SIGMOID -> MUL -> ADD with g one value per row of v (a gate
+// broadcast over the row): one launch instead of three, the same fp32 operations in the same order
+bool ggml_sycl_sigmoid_mul_add_fusable(const ggml_cgraph * cgraph, int i) {
+    if (!g_ggml_sycl_enable_fusion || i + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * u   = cgraph->nodes[i];
+    const ggml_tensor * mul = cgraph->nodes[i + 1];
+    const ggml_tensor * add = cgraph->nodes[i + 2];
+    if (u->op != GGML_OP_UNARY || ggml_get_unary_op(u) != GGML_UNARY_OP_SIGMOID || mul->op != GGML_OP_MUL ||
+        add->op != GGML_OP_ADD ||
+        !ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD }, { i + 2 })) {
+        return false;
+    }
+    const ggml_tensor * g = u->src[0];
+    const ggml_tensor * v = mul->src[0] == u ? mul->src[1] : mul->src[0];
+    const ggml_tensor * r = add->src[0] == mul ? add->src[1] : add->src[0];
+    for (const ggml_tensor * t : { g, v, r, (const ggml_tensor *) u, mul, add }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+    return v != u && r != mul && g->ne[0] == 1 && ggml_nrows(g) == ggml_nrows(v) && ggml_are_same_shape(v, mul) &&
+           ggml_are_same_shape(r, add) && ggml_are_same_shape(mul, add) && ggml_are_same_shape(g, u);
+}
+
+void ggml_sycl_op_sigmoid_mul_add_fused(ggml_backend_sycl_context & ctx, ggml_tensor * u, ggml_tensor * mul,
+                                        ggml_tensor * add) {
+    scope_op_debug_print scope_dbg_print(__func__, add, /*num_src=*/2);
+    const float * g = (const float *) u->src[0]->data;
+    const float * v = (const float *) (mul->src[0] == u ? mul->src[1] : mul->src[0])->data;
+    const float * r = (const float *) (add->src[0] == mul ? add->src[1] : add->src[0])->data;
+    float       * o = (float *) add->data;
+    const int64_t k = ggml_nelements(add);
+    const int64_t n = add->ne[0];
+    queue_ptr main_stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    main_stream->parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((k + 255)/256)*256), sycl::range<1>(256)),
+                              [=](sycl::nd_item<1> it) {
+#pragma clang fp contract(off)
+        const int64_t q = (int64_t) it.get_global_id(0);
+        if (q >= k) {
+            return;
+        }
+        const float sg = op_sigmoid(g[q / n]);
+        const float p  = v[q] * sg;
+        o[q] = r[q] + p;
+    });
+}
+
 __dpct_inline__ float ggml_sycl_op_swiglu_oai_single(float x, float g, float alpha = 1.702f, float limit = 7.0f) {
     x = sycl::fmin(x, limit);
     g = sycl::fmax(sycl::fmin(g, limit), -limit);
