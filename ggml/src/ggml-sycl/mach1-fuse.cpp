@@ -81,6 +81,67 @@ static float mach1_sigmoid(float x) {
 
 
 //
+// the hc inject gate and the hc post that reads it: SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST without
+// comb, dst = x * f2*sigmoid(f1*g) + residual per (element, stream, token). The gate as in
+// mach1_fuse_scale_act; the post's multiply-add contracted as in dsv4-hc.cpp (built without
+// -fp-model=precise)
+//
+static int mach1_fuse_gate_hc_post(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i, float f1, float f2) {
+    if (i + 4 > cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * s2   = cgraph->nodes[i + 2];
+    ggml_tensor * post = cgraph->nodes[i + 3];
+    if (post->op != GGML_OP_DSV4_HC_POST || post->src[2] != s2 || post->src[3] != nullptr) {
+        return 0;
+    }
+    const ggml_tensor * g = cgraph->nodes[i]->src[0];
+    const ggml_tensor * x = post->src[0];
+    const ggml_tensor * r = post->src[1];
+    if (!mach1_f32c(g) || !mach1_f32c(x) || !mach1_f32c(r) || !mach1_f32c(post) || !mach1_f32c(s2)) {
+        return 0;
+    }
+    const int64_t n_embd = x->ne[0], n_tokens = x->ne[1], hc = r->ne[1];
+    if (s2->ne[0] != hc || s2->ne[1] != n_tokens || ggml_nelements(g) != hc*n_tokens ||
+        r->ne[0] != n_embd || r->ne[2] != n_tokens || ggml_nelements(post) != n_embd*hc*n_tokens) {
+        return 0;
+    }
+    const ggml_op ops[4]  = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
+    const int     outs[1] = { i + 3 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 4, ops, outs, 1)) {
+        return 0;
+    }
+    mach1_fuse_out fo(ctx, post, { g }, { x, r });
+    const float * gd = (const float *) g->data;
+    const float * xd = (const float *) x->data;
+    const float * rd = (const float *) r->data;
+    float       * yd = fo.ptr;
+    const int64_t nr = n_embd*hc*n_tokens;
+    ctx.stream()->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t)((nr + MACH1_FUSE_WG - 1)/MACH1_FUSE_WG)*MACH1_FUSE_WG),
+                          sycl::range<1>(MACH1_FUSE_WG)),
+        [=](sycl::nd_item<1> it) {
+            const int64_t ir = (int64_t) it.get_global_id(0);
+            if (ir >= nr) {
+                return;
+            }
+            const int64_t i0 = ir % n_embd;
+            const int64_t is = (ir / n_embd) % hc;
+            const int64_t t  = ir / (n_embd*hc);
+            const float   p  = mach1_sigmoid(gd[t*hc + is]*f1)*f2;
+            float sum;
+            {
+#pragma clang fp contract(fast)
+                sum = xd[t*n_embd + i0]*p;
+                sum += rd[t*hc*n_embd + is*n_embd + i0];
+            }
+            yd[ir] = sum;
+        });
+    fo.finish(ctx.stream());
+    return 3;
+}
+
+//
 // activation tails: SCALE -> SIGMOID -> SCALE (the hc inject) and SCALE -> SILU (the hc down)
 //
 static int mach1_fuse_scale_act(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
@@ -125,6 +186,12 @@ static int mach1_fuse_scale_act(ggml_backend_sycl_context & ctx, ggml_cgraph * c
     const ggml_tensor * src = s1->src[0];
     if (ggml_nelements(out) != ggml_nelements(src)) {
         return 0;
+    }
+    if (count == 3) {
+        const int taken = mach1_fuse_gate_hc_post(ctx, cgraph, i, f1, f2);
+        if (taken) {
+            return taken;
+        }
     }
     mach1_fuse_out fo(ctx, out, {}, { src });
     const float * xd = (const float *) src->data;
