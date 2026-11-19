@@ -208,16 +208,19 @@ static void mach1_rt_sg_stage(dpct::queue_ptr stream, const float * src, const f
 }
 
 // The same stage for a few tokens as two launches that spread over the device (the one above is
-// one work-group per token, on a single Xe core): the 2^k blocks, one sub-group each, into dst;
-// then the radix factor in place, one work-item per column b of a token taking its R values.
-// Same operations in the same order as mach1_rt_sg_stage, so the result is bit-identical.
+// one work-group per token, on a single Xe core): the 2^k blocks, one sub-group each, into dst
+// (or tmp); then the radix factor, in place with one work-item per column b of a token taking its R
+// values, or from tmp with one work-item per output (R times the work-items: the in-place pass has
+// only M of them). Same operations in the same order as mach1_rt_sg_stage, so the result is
+// bit-identical.
 template <bool OUT, int R, int E>
 static void mach1_rt_sg_stage_split(dpct::queue_ptr stream, const float * src, const float * side, float * dst,
-                                    const int nt, const float * src2) {
+                                    const int nt, const float * src2, float * tmp) {
     static_assert(R > 1, "the radix factor is what needs the second pass");
     constexpr int M = 16*E;
     constexpr int D = R*M;
     const float sc = sqrtf((float) D);
+    float * mid = tmp ? tmp : dst;
     stream->parallel_for(
         sycl::nd_range<1>(sycl::range<1>((size_t) nt*R*16), sycl::range<1>(16)),
         [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
@@ -227,7 +230,7 @@ static void mach1_rt_sg_stage_split(dpct::queue_ptr stream, const float * src, c
             const int lane = (int) it.get_local_id(0);
             const float * s  = src + (int64_t) t*D;
             const float * s2 = src2 ? src2 + (int64_t) t*D : nullptr;
-            float       * y  = dst + (int64_t) t*D;
+            float       * y  = mid + (int64_t) t*D;
 
             float v[E];
 #pragma unroll
@@ -242,6 +245,33 @@ static void mach1_rt_sg_stage_split(dpct::queue_ptr stream, const float * src, c
             }
         });
     constexpr int WG2 = 64;
+    if (tmp) {
+        const int n3 = nt*D;
+        stream->parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) (n3 + WG2 - 1)/WG2*WG2), sycl::range<1>(WG2)),
+            [=](sycl::nd_item<1> it) {
+                const int g = (int) it.get_global_id(0);
+                if (g >= n3) {
+                    return;
+                }
+                const int t = g / D;
+                const int i = g % D;
+                const int a = i / M;
+                const int b = i % M;
+                const float * x = tmp + (int64_t) t*D;
+                const uint32_t * H = R == 12 ? mach1_rt_h12 : mach1_rt_h20;
+                float acc = 0.0f;
+#pragma unroll
+                for (int c = 0; c < R; ++c) {
+                    const bool neg = OUT ? ((H[a] >> c) & 1u) != 0u : ((H[c] >> a) & 1u) != 0u;
+                    const float col = x[c*M + b];
+                    acc = neg ? acc - col : acc + col;
+                }
+                const float o = acc/sc;
+                dst[(int64_t) t*D + i] = OUT ? o*side[i] : o;
+            });
+        return;
+    }
     const int n2 = nt*M;
     stream->parallel_for(
         sycl::nd_range<1>(sycl::range<1>((size_t) (n2 + WG2 - 1)/WG2*WG2), sycl::range<1>(WG2)),
@@ -279,12 +309,12 @@ static void mach1_rt_sg_stage_split(dpct::queue_ptr stream, const float * src, c
 
 template <bool OUT, int R>
 static bool mach1_rt_sg_stage_r(dpct::queue_ptr stream, const float * src, const float * side, float * dst,
-                                const int M, const int nt, const float * src2) {
+                                const int M, const int nt, const float * src2, float * tmp) {
     if constexpr (R > 1) {
         if (nt <= MACH1_RT_SPLIT_MAX_NT) {
             switch (M) {
-                case 512:  mach1_rt_sg_stage_split<OUT, R, 32>(stream, src, side, dst, nt, src2); return true;
-                case 1024: mach1_rt_sg_stage_split<OUT, R, 64>(stream, src, side, dst, nt, src2); return true;
+                case 512:  mach1_rt_sg_stage_split<OUT, R, 32>(stream, src, side, dst, nt, src2, tmp); return true;
+                case 1024: mach1_rt_sg_stage_split<OUT, R, 64>(stream, src, side, dst, nt, src2, tmp); return true;
                 default:   break;
             }
         }
@@ -300,15 +330,16 @@ static bool mach1_rt_sg_stage_r(dpct::queue_ptr stream, const float * src, const
     }
 }
 
-// the sub-group stage when the shape allows it, else the work-group one
+// the sub-group stage when the shape allows it, else the work-group one; tmp (nt*d floats, or
+// null) lets the split stage take its radix pass out of place
 template <bool OUT>
 static void mach1_rt_stage_any(dpct::queue_ptr stream, const float * src, const float * side, float * dst,
-                               const int d, const int nt, const float * src2 = nullptr) {
+                               const int d, const int nt, const float * src2 = nullptr, float * tmp = nullptr) {
     const int R = mach1_rt_radix(d);
     // a power of two is one block for a single sub-group: past 128 the work-group stage is faster
-    const bool done = R == 1  ? d <= 128 && mach1_rt_sg_stage_r<OUT, 1> (stream, src, side, dst, d, nt, src2) :
-                      R == 12 ? mach1_rt_sg_stage_r<OUT, 12>(stream, src, side, dst, d/12, nt, src2) :
-                                mach1_rt_sg_stage_r<OUT, 20>(stream, src, side, dst, d/20, nt, src2);
+    const bool done = R == 1  ? d <= 128 && mach1_rt_sg_stage_r<OUT, 1> (stream, src, side, dst, d, nt, src2, tmp) :
+                      R == 12 ? mach1_rt_sg_stage_r<OUT, 12>(stream, src, side, dst, d/12, nt, src2, tmp) :
+                                mach1_rt_sg_stage_r<OUT, 20>(stream, src, side, dst, d/20, nt, src2, tmp);
     if (!done) {
         mach1_rt_stage<OUT>(stream, src, side, dst, d, nt, src2);
     }
@@ -925,12 +956,15 @@ void ggml_sycl_mach1_rt_mm(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 #else
     const bool gemm = false;
 #endif
-    // the GEMM leaves v as two halves (2*nt*m) for the output stage to add
-    ggml_sycl_pool_alloc<float> scr(ctx.pool(), (size_t) nt*n + (size_t) (gemm ? 2 : 1)*nt*m);
+    // the GEMM leaves v as two halves (2*nt*m) for the output stage to add; at decode the split
+    // stages take their radix pass out of place, through scr_t
+    const size_t nt_tmp = nt <= MACH1_RT_SPLIT_MAX_NT ? (size_t) nt*std::max(n, m) : 0;
+    ggml_sycl_pool_alloc<float> scr(ctx.pool(), (size_t) nt*n + (size_t) (gemm ? 2 : 1)*nt*m + nt_tmp);
     float * scr_u = scr.get();
     float * scr_v = scr.get() + (size_t) nt*n;
+    float * scr_t = nt_tmp ? scr_v + (size_t) (gemm ? 2 : 1)*nt*m : nullptr;
 
-    mach1_rt_stage_any<false>(stream, (const float *) x->data, (const float *) su->data, scr_u, n, nt);
+    mach1_rt_stage_any<false>(stream, (const float *) x->data, (const float *) su->data, scr_u, n, nt, nullptr, scr_t);
 #if GGML_SYCL_DNNL
     if (gemm) {
         mach1_rt_gemm(ctx, stream, (const uint16_t *) trellis->data, (const sycl::half *) tlut->data, scr_u, scr_v, n, m, nt);
@@ -943,5 +977,5 @@ void ggml_sycl_mach1_rt_mm(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     } else {
         mach1_rt_walk<MACH1_RT_TT>(stream, (const uint16_t *) trellis->data, (const sycl::half *) tlut->data, scr_u, scr_v, n, m, nt);
     }
-    mach1_rt_stage_any<true>(stream, scr_v, (const float *) sv->data, (float *) dst->data, m, nt);
+    mach1_rt_stage_any<true>(stream, scr_v, (const float *) sv->data, (float *) dst->data, m, nt, nullptr, scr_t);
 }
