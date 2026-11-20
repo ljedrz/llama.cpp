@@ -264,6 +264,11 @@ static inline bool ggml_sycl_xmx_supports_type(ggml_type type) {
     }
 }
 
+// types the XMX kernel reads in their stored layout, the weights are not reordered for it
+static inline bool ggml_sycl_xmx_plain_type(ggml_type type) {
+    return type == GGML_TYPE_NVFP4;
+}
+
 // the DPAS shapes and 2D block loads used by the XMX kernel are those of Xe2
 static inline bool ggml_sycl_xmx_supports_arch(gpu_arch arch) {
     return arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31 ||
@@ -272,7 +277,8 @@ static inline bool ggml_sycl_xmx_supports_arch(gpu_arch arch) {
 
 // fewest columns for which the XMX kernel is faster than the other kernels
 static inline int ggml_sycl_xmx_min_cols(ggml_type type) {
-    return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K ? 1 : 2;
+    return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_NVFP4 ? 1 :
+                                                                                                                  2;
 }
 
 static int g_all_sycl_device_count = -1;
@@ -369,6 +375,13 @@ ggml_sycl_device_info & ggml_sycl_info();
 static inline bool ggml_sycl_xmx_enabled(int device) {
     return g_ggml_sycl_enable_xmx_esimd && ggml_sycl_xmx_supports_arch(ggml_sycl_info().devices[device].hw_info.arch);
 }
+
+// Reports if the MUL_MAT dst of a plain type (ggml_sycl_xmx_plain_type) goes to the XMX kernel. The dispatch and the
+// kernel launch both ask: the activations are then quantized into the layout of that kernel, which no other reads.
+bool ggml_sycl_xmx_plain_usable(int                 device,
+                                const ggml_tensor * src0,
+                                const ggml_tensor * src1,
+                                const ggml_tensor * dst);
 
 static constexpr size_t SYCL_BUFFER_ALIGNMENT = 128;
 

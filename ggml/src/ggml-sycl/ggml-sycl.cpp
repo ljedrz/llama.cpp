@@ -5146,9 +5146,45 @@ static bool can_use_xmx_batch(int device, const ggml_tensor * src0, const ggml_t
 #endif // GGML_SYCL_MMVQ_HAS_XMX
 }
 
+// Weights of the types in ggml_sycl_xmx_plain_type() take the XMX kernel as they are stored: whole super-blocks per
+// row on a 64 byte aligned base (2D block loads). Rows under 64 bytes use the variant without 2D block loads, it is
+// not built for the wide tiles. A batch wider than MMVQ_MAX_BATCH_SIZE had its activations in floating point before,
+// it only comes here when the src1 precision request [TAG_GGML_PREC] allows q8. There is no column limit: for these
+// types the kernel is the fastest for wide batches too.
+bool ggml_sycl_xmx_plain_usable(int                 device,
+                                const ggml_tensor * src0,
+                                const ggml_tensor * src1,
+                                const ggml_tensor * dst) {
+#ifdef GGML_SYCL_MMVQ_HAS_XMX
+    if (!ggml_sycl_xmx_enabled(device) || !ggml_sycl_xmx_plain_type(src0->type) || src1->type != GGML_TYPE_F32 ||
+        dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (ggml_backend_buffer_is_sycl_split(src0->buffer) || !ggml_is_contiguous(src0) || src0->ne[2] != 1 ||
+        src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    const int64_t ncols = src1->ne[1];
+    if (src0->ne[0] % QK_K != 0 || (uintptr_t) src0->data % 64 != 0 || (src0->ne[0] < 4 * QK_K && ncols > 8)) {
+        return false;
+    }
+    if (ncols > MMVQ_MAX_BATCH_SIZE) {
+        const int32_t src1_prec = ggml_sycl_src1_prec(dst);
+        if (src1_prec != GGML_PREC_UNDEFINED && src1_prec < GGML_PREC_Q8) {
+            return false;
+        }
+    }
+    return true;
+#else
+    GGML_UNUSED_VARS(device, src0, src1, dst);
+    return false;
+#endif // GGML_SYCL_MMVQ_HAS_XMX
+}
+
 static bool can_use_mul_mat_vec_q(int device, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     return ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-           (src1->ne[1] <= MMVQ_MAX_BATCH_SIZE || can_use_xmx_batch(device, src0, src1));
+           (src1->ne[1] <= MMVQ_MAX_BATCH_SIZE || can_use_xmx_batch(device, src0, src1) ||
+            ggml_sycl_xmx_plain_usable(device, src0, src1, dst));
 }
 
 static bool can_use_mul_mat_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -5254,7 +5290,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     } else if (use_mul_mat_vec_q) {
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
         ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
-        if (extra && extra->optimized_feature.reorder) {
+        if ((extra && extra->optimized_feature.reorder) || ggml_sycl_xmx_plain_usable(ctx.device, src0, src1, dst)) {
             ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
         } else {
             ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
