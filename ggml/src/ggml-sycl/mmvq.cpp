@@ -2114,15 +2114,18 @@ static bool ggml_sycl_mul_mat_vec_q_xmx_type(ggml_type       type,
             XMX_RUN(xmx_traits_q6_k);
         case GGML_TYPE_Q8_0:
             XMX_RUN(xmx_traits_q8_0);
+        case GGML_TYPE_NVFP4:
+            XMX_RUN(xmx_traits_nvfp4);
         default:
             return false;
     }
 #    undef XMX_RUN
 }
 
-// multi-column XMX path for reordered weights, returns false when it does not apply
+// multi-column XMX path for reordered weights and for plain types, returns false when it does not apply
 static bool ggml_sycl_mul_mat_vec_q_xmx(int                 device,
                                         const ggml_tensor * src0,
+                                        const ggml_tensor * src1,
                                         const ggml_tensor * dst,
                                         const char *        src0_dd_i,
                                         const char *        src1_ddq_i,
@@ -2132,29 +2135,37 @@ static bool ggml_sycl_mul_mat_vec_q_xmx(int                 device,
                                         int64_t             src1_padded_col_size,
                                         dpct::queue_ptr     stream) {
     const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
-    if (!ggml_sycl_xmx_enabled(device) || !ggml_sycl_xmx_supports_type(src0->type) || !extra ||
-        !extra->optimized_feature.reorder) {
-        return false;
-    }
-    if (src1_ncols < ggml_sycl_xmx_min_cols(src0->type) || src1_ncols > g_ggml_sycl_xmx_max_cols) {
-        return false;
+    // the activations of a plain type that passes its check are in the layout of this kernel, there is no other taker
+    const bool plain = ggml_sycl_xmx_plain_usable(device, src0, src1, dst);
+    GGML_ASSERT(!plain || (src0_dd_i == (const char *) src0->data && src1_ncols == src1->ne[1]));
+    if (!plain) {
+        if (!ggml_sycl_xmx_enabled(device) || !ggml_sycl_xmx_supports_type(src0->type) || !extra ||
+            !extra->optimized_feature.reorder) {
+            return false;
+        }
+        if (src1_ncols < ggml_sycl_xmx_min_cols(src0->type) || src1_ncols > g_ggml_sycl_xmx_max_cols) {
+            return false;
+        }
     }
 
     const int ne00 = src0->ne[0];
     const int ldd  = dst->ne[0];
     if (!ggml_sycl_esimd::xmx_supported(src0_dd_i, ne00)) {
+        GGML_ASSERT(!plain);
         return false;
     }
 
     // rows under 64 bytes use the variant without 2D block loads, it is not built for the widest tile
     const bool short_rows = ne00 < 4 * QK_K;
     if (short_rows && src1_ncols > 8) {
+        GGML_ASSERT(!plain);
         return false;
     }
 
     const int stride_y_bytes = src1_padded_col_size * sizeof(block_q8_1) / QK8_1;
     // the 2D block loads of the activations need a 64 byte aligned base and a pitch of 16 bytes
     if ((uintptr_t) src1_ddq_i % 64 != 0 || stride_y_bytes % 16 != 0) {
+        GGML_ASSERT(!plain);
         return false;
     }
     return ggml_sycl_mul_mat_vec_q_xmx_type(src0->type, short_rows, src0_dd_i, nullptr, src1_ddq_i, dst_dd_i, ne00,
@@ -2215,7 +2226,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
     const int64_t row_diff = row_high - row_low;
 
 #ifdef GGML_SYCL_MMVQ_HAS_XMX
-    if (ggml_sycl_mul_mat_vec_q_xmx(ctx.device, src0, dst, src0_dd_i, src1_ddq_i, dst_dd_i, row_diff, src1_ncols,
+    if (ggml_sycl_mul_mat_vec_q_xmx(ctx.device, src0, src1, dst, src0_dd_i, src1_ddq_i, dst_dd_i, row_diff, src1_ncols,
                                     src1_padded_col_size, stream)) {
         return;
     }
