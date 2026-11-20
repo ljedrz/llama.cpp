@@ -6676,8 +6676,8 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
 
 // GET_ROWS(cache, ids) whose only reader is a cache-fused GATED_DELTA_NET, as its state: the gdn
 // reads the cache rows through ids and the GET_ROWS (a copy of the whole state) is not run. Only
-// for one sequence and no rollback slots, where the gdn's in-place update of the row it read is
-// safe: each work-item reads its part of the state before it writes the same part.
+// for one sequence, where the gdn's in-place update of the row it read is safe: each work-item
+// reads its part of the state before it writes that part, to one rollback slot or to several.
 struct ggml_sycl_gdn_state_rows {
     std::unordered_map<const ggml_tensor *, const ggml_tensor *> by_gdn;   // gdn -> GET_ROWS
     std::unordered_set<const ggml_tensor *>                      skip;     // the GET_ROWS nodes
@@ -6693,7 +6693,7 @@ static void ggml_sycl_find_gdn_state_rows(const ggml_cgraph * cgraph, ggml_sycl_
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * gdn = cgraph->nodes[i];
-        if (gdn->op != GGML_OP_GATED_DELTA_NET || ggml_get_op_params_i32(gdn, 0) != 1 || gdn->src[2]->ne[3] != 1) {
+        if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[2]->ne[3] != 1) {
             continue;
         }
         ggml_sycl_gated_delta_net_fused_cache tmp;
