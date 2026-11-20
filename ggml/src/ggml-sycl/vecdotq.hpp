@@ -1547,19 +1547,24 @@ vec_dot_iq2_xxs_q8_1(const void *__restrict__ vbq,
 
     const int ib32 = iqs;
     const uint16_t * q2 = bq2->qs + 4*ib32;
-    const uint8_t  * aux8 = (const uint8_t *)q2;
     const int8_t   * q8 = bq8_1[ib32].qs;
+    const uint32_t idx = q2[0] | (q2[1] << 16);
     uint32_t aux32 = q2[2] | (q2[3] << 16);
     int sumi = 0;
+#pragma unroll
     for (int l = 0; l < 4; ++l) {
-        const uint8_t * grid = (const uint8_t *)(iq2xxs_grid + aux8[l]);
-        const uint8_t  signs = ksigns_iq2xs[aux32 & 127];
-        for (int j = 0; j < 8; ++j) {
-            sumi += q8[j] * grid[j] * (signs & kmask_iq2xs[j] ? -1 : 1);
-        }
-        q8 += 8;
+        const uint32_t * grid = (const uint32_t *)(iq2xxs_grid + ((idx >> (8*l)) & 255));
+        const uint32_t  signs = ksigns_iq2xs[aux32 & 127];
+        // sign bit j of each half as the mask of its byte j; a grid byte is never 0, so negating one carries nothing over
+        const uint32_t m0 = (((signs & 15) * 0x00204081u) & 0x01010101u) * 0xFFu;
+        const uint32_t m1 = (((signs >> 4) * 0x00204081u) & 0x01010101u) * 0xFFu;
+        const int g0 = (int) ((grid[0] ^ m0) + (m0 & 0x01010101u));
+        const int g1 = (int) ((grid[1] ^ m1) + (m1 & 0x01010101u));
+        sumi = ggml_sycl_dp4a(g0, get_int_from_int8_aligned(q8, 2*l + 0), sumi);
+        sumi = ggml_sycl_dp4a(g1, get_int_from_int8_aligned(q8, 2*l + 1), sumi);
         aux32 >>= 7;
     }
+    GGML_UNUSED(kmask_iq2xs);
     const float d = (float)bq2->d * (0.5f + aux32) * bq8_1[ib32].ds[0] * 0.25f;
     return d * sumi;
 #else
