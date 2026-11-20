@@ -1546,7 +1546,9 @@ vec_dot_iq2_xxs_q8_1(const void *__restrict__ vbq,
 #pragma unroll
     for (int l = 0; l < 4; ++l) {
         const uint32_t * grid = (const uint32_t *)(iq2xxs_grid + ((idx >> (8*l)) & 255));
-        const uint32_t  signs = ksigns_iq2xs[aux32 & 127];
+        // ksigns_iq2xs[i] is i with its parity as bit 7
+        const uint32_t  s7    = aux32 & 127;
+        const uint32_t  signs = s7 | ((sycl::popcount(s7) & 1) << 7);
         // sign bit j of each half as the mask of its byte j; a grid byte is never 0, so negating one carries nothing over
         const uint32_t m0 = (((signs & 15) * 0x00204081u) & 0x01010101u) * 0xFFu;
         const uint32_t m1 = (((signs >> 4) * 0x00204081u) & 0x01010101u) * 0xFFu;
@@ -1556,6 +1558,7 @@ vec_dot_iq2_xxs_q8_1(const void *__restrict__ vbq,
         sumi = ggml_sycl_dp4a(g1, get_int_from_int8_aligned(q8, 2*l + 1), sumi);
         aux32 >>= 7;
     }
+    GGML_UNUSED(ksigns_iq2xs);
     GGML_UNUSED(kmask_iq2xs);
     const float d = (float)bq2->d * (0.5f + aux32) * bq8_1[ib32].ds[0] * 0.25f;
     return d * sumi;
