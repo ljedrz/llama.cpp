@@ -1019,6 +1019,94 @@ template <bool SR> struct xmx_traits_q8_0 : xmx_traits_base<SR, 16, xmx_scale_ki
     static ESIMD_INLINE simd<uint32_t, 128> unpack(const part_t & p, int g, int /*part*/) { return p.q[g]; }
 };
 
+// UE4M3 scale codes (one in the low byte of each lane) as float, with the 0.5 of the doubled E2M1 values
+ESIMD_INLINE simd<float, 16> xmx_ue4m3(const simd<uint32_t, 16> & x) {
+    using namespace sycl::ext::intel::esimd;
+    simd<uint32_t, 16> e = (x >> 3) & 15u;
+    simd<uint32_t, 16> m = x & 7u;
+    m.merge(m | 8u, e != 0u);
+    e.merge(simd<uint32_t, 16>(1u), e == 0u);
+    simd<uint32_t, 16> bits = (e + 116u) << 23;  // 2^(e - 11)
+    simd<float, 16>    f    = convert<float>(simd<int, 16>(m)) * simd<float, 16>(bits.template bit_cast_view<float>());
+    f.merge(simd<float, 16>(0.0f), x == 0x7Fu);
+    return f;
+}
+
+// NVFP4 in its stored layout, the weights are not reordered: a block of 64 is 9 dwords, the UE4M3 scales of its
+// four 16 wide sub-blocks and 32 bytes of E2M1 codes. Byte j of a sub-block holds weight j in its low nibble and
+// weight j + 8 in its high nibble, so a super-block is 4 blocks and every load stays dword aligned.
+template <bool SR> struct xmx_traits_nvfp4 : xmx_traits_base<SR, 7, xmx_scale_kind::split> {
+    static constexpr int sb_dwords = 4 * sizeof(block_nvfp4) / 4;
+
+    struct ctx : xmx_ctx_base {
+        const uint8_t * x;
+        unsigned        px;
+    };
+
+    static ESIMD_INLINE ctx make(const void * vx, int nrows, int bpr, int row0) {
+        ctx c;
+        xmx_ctx_init(c, nrows, bpr, row0);
+        c.x  = (const uint8_t *) vx;
+        c.px = xmx_pitch(bpr, 4 * sizeof(block_nvfp4));
+        return c;
+    }
+
+    // row scales of the 16 sub-blocks of a super-block
+    struct scales_t {
+        simd<float, 16> v[16];
+
+        ESIMD_INLINE simd<float, 16> get(int gr) { return v[gr]; }
+    };
+
+    static ESIMD_INLINE scales_t load_scales(const ctx & c, int sb, const simd<uint32_t, 16> & rows) {
+        using namespace sycl::ext::intel::esimd;
+        constexpr uint32_t bs = sizeof(block_nvfp4);
+        scales_t           s;
+        simd<uint32_t, 16> off = (rows * c.bpr + sb) * (4 * bs);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            simd<uint32_t, 16> w = gather<uint32_t, 16>((const uint32_t *) c.x, off + k * bs);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                s.v[4 * k + j] = xmx_ue4m3((w >> (8 * j)) & 0xFFu);
+            }
+        }
+        return s;
+    }
+
+    struct part_t {
+        simd<uint32_t, 128> a, b;  // codes of the two blocks of a part
+    };
+
+    static ESIMD_INLINE part_t load_part(const ctx & c, int sb, int part) {
+        part_t p;
+        p.a = xmx_load_t<8, SR>(c.x, c.px, c.h, sb * sb_dwords + (2 * part) * 9 + 1, c.row0);
+        p.b = xmx_load_t<8, SR>(c.x, c.px, c.h, sb * sb_dwords + (2 * part + 1) * 9 + 1, c.row0);
+        return p;
+    }
+
+    // E2M1 codes to int8 (the values doubled): 0 1 2 3 4 6 8 12, bit 3 is the sign. All byte wise within dwords.
+    static ESIMD_INLINE simd<uint32_t, 128> unpack(const part_t & p, int g, int /*part*/) {
+        simd<uint32_t, 128> blk = (g < 2) ? p.a : p.b;
+        simd<uint32_t, 64>  q   = blk.template select<64, 1>(64 * (g & 1));  // two sub-blocks, two dwords each
+        simd<uint32_t, 64>  lo  = q & 0x0F0F0F0Fu;
+        simd<uint32_t, 64>  hi  = (q >> 4) & 0x0F0F0F0Fu;
+        simd<uint32_t, 128> x;
+        x.template select<32, 1>(0)  = lo.template select<32, 1>(0);
+        x.template select<32, 1>(32) = hi.template select<32, 1>(0);
+        x.template select<32, 1>(64) = lo.template select<32, 1>(32);
+        x.template select<32, 1>(96) = hi.template select<32, 1>(32);
+
+        simd<uint32_t, 128> l  = x & 0x03030303u;
+        simd<uint32_t, 128> t2 = (l & (l << 1)) & 0x02020202u;
+        simd<uint32_t, 128> m2 = ((x >> 2) & 0x01010101u) * 0xFFu;
+        simd<uint32_t, 128> v  = l + (m2 & (l + t2 + 0x04040404u));
+        simd<uint32_t, 128> ms = ((x >> 3) & 0x01010101u) * 0xFFu;
+        // v - 2v where the sign is set, no borrow between bytes
+        return ((v | 0x80808080u) - ((v << 1) & ms)) ^ 0x80808080u;
+    }
+};
+
 template <bool SR> using xmx_traits_q4_k = xmx_traits_q45_k<false, SR>;
 template <bool SR> using xmx_traits_q5_k = xmx_traits_q45_k<true, SR>;
 
