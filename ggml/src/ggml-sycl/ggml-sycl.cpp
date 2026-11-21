@@ -5849,6 +5849,93 @@ static bool ggml_sycl_mul_mat_id_nvfp4_args(const ggml_tensor * dst, ggml_sycl_n
     return true;
 }
 
+// An NVFP4 MUL_MAT_ID of ggml_sycl_mul_mat_vec_nvfp4_id_f32() at node i with what follows it in build_moe_ffn():
+// - the per-expert scale of build_lora_mm_id(): RESHAPE, REPEAT, GET_ROWS, MUL
+// - then for the gate_up of a SiTU MoE the activation: two VIEWs of the halves, SCALE, TANH, SCALE and SIGMOID,
+//   MUL of the gate, SCALE, TANH, SCALE of the up, MUL
+// Runs them as one kernel and returns the number of nodes after i it took, 0 when the pattern does not match.
+static int ggml_sycl_fuse_nvfp4_moe(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor ** nodes = cgraph->nodes;
+    const int      n     = cgraph->n_nodes;
+    ggml_tensor *  mmid  = nodes[i];
+
+    ggml_sycl_nvfp4_id_args args;
+    if (!g_ggml_sycl_enable_fusion || mmid->op != GGML_OP_MUL_MAT_ID || !ggml_sycl_mul_mat_id_nvfp4_args(mmid, args) ||
+        i + 4 >= n) {
+        return 0;
+    }
+    ggml_tensor * rs  = nodes[i + 1];
+    ggml_tensor * rp  = nodes[i + 2];
+    ggml_tensor * gr  = nodes[i + 3];
+    ggml_tensor * mul = nodes[i + 4];
+    if (rs->op != GGML_OP_RESHAPE || rp->op != GGML_OP_REPEAT || gr->op != GGML_OP_GET_ROWS || mul->op != GGML_OP_MUL ||
+        rp->src[0] != rs || gr->src[0] != rp || gr->src[1] != mmid->src[2] || mul->src[0] != mmid || mul->src[1] != gr) {
+        return 0;
+    }
+    const ggml_tensor * w_s = rs->src[0];
+    if (w_s->type != GGML_TYPE_F32 || !ggml_is_contiguous(w_s) || ggml_nelements(w_s) != mmid->src[0]->ne[2]) {
+        return 0;
+    }
+
+    ggml_sycl_nvfp4_id_epilogue ep;
+    ep.expert_scale = (const float *) w_s->data;
+
+    std::vector<ggml_op> ops = { GGML_OP_MUL_MAT_ID, GGML_OP_RESHAPE, GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL };
+    ggml_tensor * out = mul;
+
+    const auto is_unary = [](const ggml_tensor * t, ggml_unary_op op) {
+        return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == op;
+    };
+    // SCALE by its op param with no bias
+    const auto is_scale = [](const ggml_tensor * t, const ggml_tensor * src, float & scale) {
+        if (t->op != GGML_OP_SCALE || t->src[0] != src || ggml_get_op_params_f32(t, 1) != 0.0f) {
+            return false;
+        }
+        scale = ggml_get_op_params_f32(t, 0);
+        return true;
+    };
+    // a half of the rows of mul with its strides
+    const auto is_half = [&](const ggml_tensor * t, int half) {
+        return t->op == GGML_OP_VIEW && t->src[0] == mul && t->ne[0] * 2 == mul->ne[0] && t->ne[1] == mul->ne[1] &&
+               t->ne[2] == mul->ne[2] && t->nb[1] == mul->nb[1] && t->nb[2] == mul->nb[2] &&
+               t->view_offs == (size_t) half * t->ne[0] * sizeof(float);
+    };
+
+    ggml_tensor ** s = nodes + i + 5;
+    if (i + 15 < n && is_half(s[0], 0) && is_scale(s[1], s[0], ep.situ[0]) && is_unary(s[2], GGML_UNARY_OP_TANH) &&
+        s[2]->src[0] == s[1] && is_scale(s[3], s[2], ep.situ[1]) && is_unary(s[4], GGML_UNARY_OP_SIGMOID) &&
+        s[4]->src[0] == s[0] && s[5]->op == GGML_OP_MUL && s[5]->src[0] == s[3] && s[5]->src[1] == s[4] &&
+        is_half(s[6], 1) && is_scale(s[7], s[6], ep.situ[2]) && is_unary(s[8], GGML_UNARY_OP_TANH) &&
+        s[8]->src[0] == s[7] && is_scale(s[9], s[8], ep.situ[3]) && s[10]->op == GGML_OP_MUL &&
+        s[10]->src[0] == s[5] && s[10]->src[1] == s[9] && ggml_is_contiguous(s[10])) {
+        ep.situ_enabled = true;
+        ops.insert(ops.end(), { GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
+                                GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL });
+        out = s[10];
+    }
+
+    const int out_idx = i + (int) ops.size() - 1;
+    if (nodes[out_idx] != out || !ggml_can_fuse_subgraph(cgraph, i, (int) ops.size(), ops.data(), &out_idx, 1)) {
+        return 0;
+    }
+    // the kernel writes out while it reads its inputs, but the allocator may have given out the memory of an input
+    // that the graph without the fusion had read by then
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    if (overlap(out, mmid->src[1]) || overlap(out, mmid->src[2])) {
+        return 0;
+    }
+
+    args.dst_row_stride   = out->nb[1];
+    args.dst_token_stride = out->nb[2];
+    ggml_sycl_mul_mat_vec_nvfp4_id_f32(mmid->src[0]->data, (const float *) mmid->src[1]->data,
+                                       (const int32_t *) mmid->src[2]->data, (float *) out->data, args, ep, ctx.stream());
+    return (int) ops.size() - 1;
+}
+
 // true when the device MoE schedule may handle this MUL_MAT_ID: enabled, prefill, and an
 // f32/i32 layout it accepts; ggml_sycl_grouped_dequant_gemm_device decides type and width
 static bool ggml_sycl_mul_mat_id_device_sched_eligible(const ggml_tensor * dst) {
@@ -5879,7 +5966,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     ggml_sycl_nvfp4_id_args nvfp4_args;
     if (ggml_sycl_mul_mat_id_nvfp4_args(dst, nvfp4_args)) {
         ggml_sycl_mul_mat_vec_nvfp4_id_f32(src0->data, (const float *) src1->data, (const int32_t *) ids->data,
-                                           (float *) dst->data, nvfp4_args, stream);
+                                           (float *) dst->data, nvfp4_args, {}, stream);
         return;
     }
 
@@ -6932,6 +7019,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 #endif
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            const int skip = ggml_sycl_fuse_nvfp4_moe(*sycl_ctx, cgraph, i);
+            if (skip > 0) {
+                i += skip;
+                continue;
+            }
+        }
         // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
         if (node->op == GGML_OP_GATED_DELTA_NET) {
             ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;

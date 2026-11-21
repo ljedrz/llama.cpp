@@ -2755,41 +2755,12 @@ static void launch_mul_mat_vec_q_moe(
 // GEMV of trellis-serve (xpu/csrc/inkling2_ops.sycl, MIT): a lane owns one 16 value sub-block per step and a sub-group
 // keeps RP rows in flight. The codes are decoded with integer ops into fp16, an SLM table was slower.
 // Every (token, slot) pair is its own GEMV: with few tokens the experts rarely repeat, so sharing loads buys little.
-template <int RP, int NSG>
-static void mul_mat_vec_nvfp4_id_f32(const uint8_t * __restrict__ vx_base, const char * __restrict__ y_base,
-                                     const int32_t * __restrict__ ids_base, char * __restrict__ dst_base,
-                                     const ggml_sycl_nvfp4_id_args args, const size_t row_stride,
-                                     const sycl::nd_item<3> & item) {
-    const auto sg    = item.get_sub_group();
-    const int  lane  = sg.get_local_linear_id();
-    const int  token = item.get_group(1) / args.n_ids;
-    const int  slot  = item.get_group(1) % args.n_ids;
-    const int  n0    = (item.get_group(2) * NSG + sg.get_group_linear_id()) * RP;
-    const int  i02   = ids_base[(size_t) token * args.ids_token_stride + slot];
-    const int  nrows = args.nrows;
 
-    float * dst = (float *) (dst_base + (size_t) token * args.dst_token_stride + (size_t) slot * args.dst_row_stride);
-    if (n0 >= nrows) {
-        return;
-    }
-    if (i02 == -1) { // skipped slot
-        if (lane == 0) {
-            for (int p = 0; p < RP && n0 + p < nrows; ++p) {
-                dst[n0 + p] = 0.0f;
-            }
-        }
-        return;
-    }
-
-    const float * y = (const float *) (y_base + (size_t) token * args.src1_token_stride + (size_t) slot * args.src1_row_stride);
-    const uint8_t * x[RP];
-#pragma unroll
-    for (int p = 0; p < RP; ++p) {
-        x[p] = vx_base + (size_t) i02 * args.expert_stride + (size_t) sycl::min(n0 + p, nrows - 1) * row_stride;
-    }
-
-    float acc[RP] = {};
-    const int n_sub = args.ncols / QK_NVFP4_SUB;
+// the lane partial sums of RP rows over y, not yet reduced over the sub-group
+template <int RP>
+static __dpct_inline__ void nvfp4_rows_dot(const uint8_t * const (&x)[RP], const float * __restrict__ y, const int ncols,
+                                           const int lane, float (&acc)[RP]) {
+    const int n_sub = ncols / QK_NVFP4_SUB;
     for (int g = lane; g < n_sub; g += WARP_SIZE) {
         float ys[QK_NVFP4_SUB];
 #pragma unroll
@@ -2821,35 +2792,101 @@ static void mul_mat_vec_nvfp4_id_f32(const uint8_t * __restrict__ vx_base, const
                 sum += wl.x() * ys[2 * h] + wl.y() * ys[2 * h + 1] + wh.x() * ys[2 * h + 8] + wh.y() * ys[2 * h + 9];
             }
             // kvalues_mxfp4 hold twice the E2M1 value, so an element is value * 2^14 * 2 * d
-            sum *= 0x1p15f;
-            acc[p] += sum * ggml_sycl_ue4m3_to_fp32_fast(b[s]);
+            acc[p] += sum * 0x1p15f * ggml_sycl_ue4m3_to_fp32_fast(b[s]);
         }
     }
+}
 
+// one GEMV per (token, slot): a sub-group takes RP rows, or with SITU the gate row r and the up row r + nrows/2 of
+// one output row r of the activation
+template <int RP, int NSG, bool SITU>
+static void mul_mat_vec_nvfp4_id_f32(const uint8_t * __restrict__ vx_base, const char * __restrict__ y_base,
+                                     const int32_t * __restrict__ ids_base, char * __restrict__ dst_base,
+                                     const ggml_sycl_nvfp4_id_args args, const ggml_sycl_nvfp4_id_epilogue ep,
+                                     const size_t row_stride, const sycl::nd_item<3> & item) {
+    static_assert(!SITU || RP == 2, "the SiTU epilogue pairs a gate and an up row");
+    const auto sg     = item.get_sub_group();
+    const int  lane   = sg.get_local_linear_id();
+    const int  token  = item.get_group(1) / args.n_ids;
+    const int  slot   = item.get_group(1) % args.n_ids;
+    const int  i02    = ids_base[(size_t) token * args.ids_token_stride + slot];
+    const int  nrows  = args.nrows;
+    const int  n_out  = SITU ? nrows / 2 : nrows;
+    const int  n0     = (item.get_group(2) * NSG + sg.get_group_linear_id()) * (SITU ? 1 : RP);
+
+    float * dst = (float *) (dst_base + (size_t) token * args.dst_token_stride + (size_t) slot * args.dst_row_stride);
+    if (n0 >= n_out) {
+        return;
+    }
+    if (i02 == -1) { // skipped slot
+        if (lane == 0) {
+            for (int p = 0; p < (SITU ? 1 : RP) && n0 + p < n_out; ++p) {
+                dst[n0 + p] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    const float *   y = (const float *) (y_base + (size_t) token * args.src1_token_stride + (size_t) slot * args.src1_row_stride);
+    const uint8_t * x[RP];
 #pragma unroll
     for (int p = 0; p < RP; ++p) {
-        const float sum = sycl::reduce_over_group(sg, acc[p], sycl::plus<float>());
-        if (lane == 0 && n0 + p < nrows) {
-            dst[n0 + p] = sum;
+        const int row = SITU ? n0 + p * n_out : sycl::min(n0 + p, nrows - 1);
+        x[p] = vx_base + (size_t) i02 * args.expert_stride + (size_t) row * row_stride;
+    }
+
+    float acc[RP] = {};
+    nvfp4_rows_dot<RP>(x, y, args.ncols, lane, acc);
+
+    const float es = ep.expert_scale ? ep.expert_scale[i02] : 1.0f;
+    float sum[RP];
+#pragma unroll
+    for (int p = 0; p < RP; ++p) {
+        sum[p] = sycl::reduce_over_group(sg, acc[p], sycl::plus<float>()) * es;
+    }
+    if (lane != 0) {
+        return;
+    }
+    if constexpr (SITU) {
+        const float g = sum[0];
+        const float u = sum[1];
+        dst[n0] = ep.situ[1] * sycl::tanh(ep.situ[0] * g) / (1.0f + sycl::exp(-g)) * ep.situ[3] * sycl::tanh(ep.situ[2] * u);
+    } else {
+#pragma unroll
+        for (int p = 0; p < RP; ++p) {
+            if (n0 + p < nrows) {
+                dst[n0 + p] = sum[p];
+            }
         }
     }
 }
 
 void ggml_sycl_mul_mat_vec_nvfp4_id_f32(const void * vx_base, const float * y, const int32_t * ids, float * dst,
-                                        const ggml_sycl_nvfp4_id_args & args, dpct::queue_ptr stream) {
+                                        const ggml_sycl_nvfp4_id_args & args, const ggml_sycl_nvfp4_id_epilogue & ep,
+                                        dpct::queue_ptr stream) {
     constexpr int RP  = 2;
     constexpr int NSG = 8;
 
     const size_t         row_stride = (size_t) (args.ncols / QK_NVFP4) * sizeof(block_nvfp4);
-    const int            n_tiles    = (args.nrows + NSG * RP - 1) / (NSG * RP);
-    const sycl::range<3> block_nums(1, (unsigned) (args.n_tokens * args.n_ids), (unsigned) n_tiles);
     const sycl::range<3> block_dims(1, 1, NSG * WARP_SIZE);
-    stream->parallel_for(
-        sycl::nd_range<3>(block_nums * block_dims, block_dims),
-        [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-            mul_mat_vec_nvfp4_id_f32<RP, NSG>((const uint8_t *) vx_base, (const char *) y, ids, (char *) dst, args,
-                                              row_stride, item);
-        });
+    const int rows_per_wg = ep.situ_enabled ? NSG : NSG * RP;
+    const int n_out       = ep.situ_enabled ? args.nrows / 2 : args.nrows;
+    const sycl::range<3> block_nums(1, (unsigned) (args.n_tokens * args.n_ids), (unsigned) ((n_out + rows_per_wg - 1) / rows_per_wg));
+    if (ep.situ_enabled) {
+        stream->parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                mul_mat_vec_nvfp4_id_f32<RP, NSG, true>((const uint8_t *) vx_base, (const char *) y, ids, (char *) dst,
+                                                        args, ep, row_stride, item);
+            });
+    } else {
+        stream->parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                mul_mat_vec_nvfp4_id_f32<RP, NSG, false>((const uint8_t *) vx_base, (const char *) y, ids, (char *) dst,
+                                                         args, ep, row_stride, item);
+            });
+    }
 }
 
 bool ggml_sycl_mul_mat_vec_q_id_supports_type(enum ggml_type src0_type) {
