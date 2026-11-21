@@ -131,7 +131,8 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
     // The GQA-optimized TILE variant handles a trailing partial chunk (out-of-bounds
     // checked iteration), so n_kv no longer needs to be a multiple of FATTN_KQ_STRIDE.
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f;
+    // the GQA kernels share one mask row per head group, so per-head masks (ne[2] > 1) cannot use them
+    bool gqa_opt_applies = gqa_ratio >= 2 && mask && mask->ne[2] == 1 && max_bias == 0.0f;
 
     // XMX-accelerated path: oneDNN SDPA (native F16 and dequant+non-F16).
     // ONEDNN requires min 32 query tokens — short-circuit decode to avoid
@@ -244,7 +245,9 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_NONE;
     }
 
-    if (mask && mask->ne[2] != 1) {
+    // VEC and TILE take per-head masks, but without XMX and GQA grouping they lose to the path without flash attention
+    // (prompts at long context 3x slower), so auto flash attention should not pick them unless asked to
+    if (mask && mask->ne[2] != 1 && !g_ggml_sycl_fa_head_mask) {
         return BEST_FATTN_KERNEL_NONE;
     }
 

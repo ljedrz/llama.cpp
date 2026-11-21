@@ -731,7 +731,8 @@ static void flash_attn_tile(const char *  Q,
     const sycl::half2 * V_h2 =
         (const sycl::half2 *) (V + nb23 * sequence + nb22 * (head0 / gqa_ratio));  // K and V have same shape
 
-    const sycl::half * maskh = mask ? (const sycl::half *) (mask + nb33 * (sequence % ne33)) : nullptr;
+    // per-head masks (ne32 > 1) only use ncols2 == 1
+    const sycl::half * maskh = mask ? (const sycl::half *) (mask + nb33 * (sequence % ne33) + (int64_t) nb32 * (head0 % ne32)) : nullptr;
 
     const int stride_K2   = nb11 / sizeof(sycl::half2);
     const int stride_V2   = nb21 / sizeof(sycl::half2);
@@ -1177,7 +1178,7 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
     const int gqa_limit = gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
     // n_kv need not be a multiple of FATTN_KQ_STRIDE: the kernel handles the trailing
     // partial chunk with the out-of-bounds checked iteration.
-    const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit;
+    const bool use_gqa_opt = mask && mask->ne[2] == 1 && max_bias == 0.0f && Q->ne[1] <= gqa_limit;
     GGML_SYCL_FA_TILE_DEBUG("[FA-TILE] DKQ=%d DV=%d gqa=%d q=%lld n_kv=%lld gqa_opt=%d\n",
                             DKQ, DV, gqa_ratio, (long long) Q->ne[1], (long long) K->ne[1], (int) use_gqa_opt);
 
