@@ -506,27 +506,37 @@ static bool get_rows_f32_vec4(const ggml_tensor * src0, const ggml_tensor * src1
     const bool aligned = ne00 % 4 == 0 && (uintptr_t) src0->data % 16 == 0 && (uintptr_t) dst->data % 16 == 0 &&
                          src0->nb[1] % 16 == 0 && src0->nb[2] % 16 == 0 && src0->nb[3] % 16 == 0 &&
                          dst->nb[1] % 16 == 0 && dst->nb[2] % 16 == 0 && dst->nb[3] % 16 == 0 &&
-                         src1->ne[3] == 1 && ne10*ne11*ne12 <= INT32_MAX && ne00/4 <= INT32_MAX;
-    if (!aligned) {
-        return false;
-    }
+                         src1->ne[3] == 1;
     const int64_t n4   = ne00/4;
     const int64_t rows = ne10*ne11*ne12;
+    constexpr int WG = 256;
+    // short rows (a few pieces) take one work-item per piece over all rows, long rows a work-group row per row
+    const bool    flat = n4 < WG;
+    const int64_t n_wi = flat ? (rows*n4 + WG - 1)/WG*WG : rows*((n4 + WG - 1)/WG*WG);
+    if (!aligned || n_wi > INT32_MAX) {
+        return false;
+    }
     const size_t s01 = src0->nb[1], s02 = src0->nb[2], s03 = src0->nb[3];
     const size_t d1 = dst->nb[1], d2 = dst->nb[2], d3 = dst->nb[3];
     const size_t s10 = src1->nb[0]/sizeof(int32_t), s11 = src1->nb[1]/sizeof(int32_t), s12 = src1->nb[2]/sizeof(int32_t);
     const char    * s0 = (const char *) src0->data;
     const int32_t * ix = (const int32_t *) src1->data;
     char          * d  = (char *) dst->data;
-    constexpr int WG = 256;
     stream->parallel_for(
-        sycl::nd_range<2>(sycl::range<2>((size_t) rows, (size_t) ((n4 + WG - 1)/WG)*WG), sycl::range<2>(1, WG)),
+        sycl::nd_range<2>(flat ? sycl::range<2>(1, (size_t) n_wi) : sycl::range<2>((size_t) rows, (size_t) (n_wi/rows)),
+                          sycl::range<2>(1, WG)),
         [=](sycl::nd_item<2> it) {
-            const int64_t j = (int64_t) it.get_global_id(1);
-            if (j >= n4) {
+            int64_t j = (int64_t) it.get_global_id(1);
+            int64_t r = (int64_t) it.get_group(0);
+            if (flat) {
+                if (j >= rows*n4) {
+                    return;
+                }
+                r = j / n4;
+                j = j % n4;
+            } else if (j >= n4) {
                 return;
             }
-            const int64_t r   = (int64_t) it.get_group(0);
             const int64_t i10 = r % ne10;
             const int64_t i11 = (r / ne10) % ne11;
             const int64_t i12 = r / (ne10*ne11);
