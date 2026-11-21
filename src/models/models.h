@@ -2659,6 +2659,7 @@ struct llama_model_inkling2 : public llama_model_base {
         graph(const llm_graph_params & params);
         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
+        // with scaled = false the result lacks the factor conv_scale(dynamic), for a consumer that absorbs it
         ggml_tensor * convolve(
                 ggml_tensor * cur,
                 ggml_tensor * weight,
@@ -2666,8 +2667,11 @@ struct llama_model_inkling2 : public llama_model_base {
                 ggml_tensor * state,
                 ggml_tensor * history,
                 llm_graph_input_rs * inp,
-                int64_t offset);
-        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
+                int64_t offset,
+                bool scaled = true);
+        float conv_scale(bool dynamic) const;
+        // message_norm is rms_norm(message)
+        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, ggml_tensor * message_norm, const loop_layer & loop, int ctrl);
 
     protected:
         // the helpers alone, a derived graph builds its own body
@@ -2676,7 +2680,7 @@ struct llama_model_inkling2 : public llama_model_base {
 
         // the inputs and the token embeddings
         ggml_tensor * build_inputs();
-        // cache slot il of physical layer ip; messages [LOOP_CTRL_COUNT, n_embd, n_tokens] are mixed into its inputs
+        // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] are mixed into its inputs
         ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
                 ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
         void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
@@ -2687,9 +2691,11 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
 
-        // the normalized state stacks of mix(), keyed by their tensors
-        ggml_tensor * mix_stack(const std::vector<ggml_tensor *> & list);
-        std::map<std::vector<ggml_tensor *>, ggml_tensor *> mix_stacks;
+        // each tensor is normalized once, each block prefix of a mix stacked once
+        ggml_tensor * rms(ggml_tensor * x);
+        ggml_tensor * stack(const std::vector<ggml_tensor *> & blocks);
+        std::map<ggml_tensor *, ggml_tensor *>                rms_cache;
+        std::map<std::vector<ggml_tensor *>, ggml_tensor *> stack_cache;
 
         std::map<int64_t, ggml_tensor *> zero_sinks; // by head count
     };
