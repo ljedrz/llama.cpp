@@ -4514,6 +4514,8 @@ ggml_tensor * llm_graph_context::build_attn(
         kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
     }
     cb(kq_mask, "kq_mask_rel_pos", il);
+    // before KQ: the gathered bias is freed before KQ is allocated, two n_kv x n_tokens x n_head tensors at a time
+    ggml_build_forward_expand(gf, kq_mask);
 
     return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);
 }
