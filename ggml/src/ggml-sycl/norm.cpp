@@ -272,12 +272,14 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
     }
 }
 
+// with w, a row is multiplied by w first (w is [ncols, nrows or 1], contiguous), the result by out_scale last
 template<int warp_size>
 static void l2_norm_f32(const float * x, float * dst, const int ncols,
     const int64_t src_stride_col, const int64_t src_stride_row, const int64_t src_stride_channel,
     const int64_t src_stride_sample, const int64_t dst_stride_col, const int64_t dst_stride_row,
     const int64_t dst_stride_channel, const int64_t dst_stride_sample, const float eps,
-    const sycl::nd_item<3>& item_ct1, float* s_sum, const int block_size) {
+    const sycl::nd_item<3>& item_ct1, float* s_sum, const int block_size,
+    const float * w = nullptr, const int64_t w_stride_row = 0, const float out_scale = 1.0f) {
 
     const int row     = item_ct1.get_group(2);
     const int channel = item_ct1.get_group(1);
@@ -286,11 +288,14 @@ static void l2_norm_f32(const float * x, float * dst, const int ncols,
 
     x   += sample*src_stride_sample + channel*src_stride_channel + row*src_stride_row;
     dst += sample*dst_stride_sample + channel*dst_stride_channel + row*dst_stride_row;
+    if (w) {
+        w += row*w_stride_row;
+    }
 
     float tmp = 0.0f; // partial sum for thread in warp
 
     for (int col = tid; col < ncols; col += block_size) {
-        const float xi = x[col * src_stride_col];
+        const float xi = w ? x[col * src_stride_col] * w[col] : x[col * src_stride_col];
         tmp += xi * xi;
     }
 
@@ -298,7 +303,8 @@ static void l2_norm_f32(const float * x, float * dst, const int ncols,
     const float scale = sycl::rsqrt(sycl::fmax(tmp, eps * eps));
 
     for (int col = tid; col < ncols; col += block_size) {
-        dst[col * dst_stride_col] = scale * x[col * src_stride_col];
+        const float xi = w ? x[col * src_stride_col] * w[col] : x[col * src_stride_col];
+        dst[col * dst_stride_col] = out_scale * (scale * xi);
     }
 }
 
@@ -593,7 +599,10 @@ static void l2_norm_f32_sycl(const float *   x,
                              const int64_t   dst_stride_sample,
                              const float     eps,
                              queue_ptr       stream,
-                             int             device) {
+                             int             device,
+                             const float *   w            = nullptr,
+                             const int64_t   w_stride_row = 0,
+                             const float     out_scale    = 1.0f) {
     const dpct::dim3 blocks_num(nrows, nchannels, nsamples);
 
     if (ncols < 1024) {
@@ -608,7 +617,7 @@ static void l2_norm_f32_sycl(const float *   x,
                         src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
                         dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
                         eps, item_ct1,
-                        nullptr, warp_size);
+                        nullptr, warp_size, w, w_stride_row, out_scale);
                 });
             });
     }
@@ -629,7 +638,7 @@ static void l2_norm_f32_sycl(const float *   x,
                     l2_norm_f32<warp_size>(x, dst, ncols,
                         src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
                         dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
-                        eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size);
+                        eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size, w, w_stride_row, out_scale);
                 });
             });
     }
@@ -1236,10 +1245,10 @@ void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context & ctx, ggml_tensor * d
 
 }
 
-void ggml_sycl_op_l2_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
-    const ggml_tensor * src0 = dst->src[0];
+static void ggml_sycl_op_l2_norm_impl(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * dst,
+                                      float * out, const ggml_tensor * w, float out_scale) {
     const float * src0_d = (const float *) src0->data;
-    float * dst_d = (float *) dst->data;
+    float * dst_d = out;
     dpct::queue_ptr     stream = ctx.stream();
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
@@ -1268,7 +1277,20 @@ void ggml_sycl_op_l2_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
       choose by hardware for better performance
     */
     l2_norm_f32_sycl<WARP_SIZE>(src0_d, dst_d, ne00, ne01, ne02, ne03,
-            ss0, ss1, ss2, ss3, ds0, ds1, ds2, ds3, eps, stream, ctx.device);
+            ss0, ss1, ss2, ss3, ds0, ds1, ds2, ds3, eps, stream, ctx.device,
+            w ? (const float *) w->data : nullptr, w && w->ne[1] > 1 ? w->ne[0] : 0, out_scale);
+}
+
+void ggml_sycl_op_l2_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
+    ggml_sycl_op_l2_norm_impl(ctx, dst->src[0], dst, (float *) dst->data, nullptr, 1.0f);
+}
+
+void ggml_sycl_op_l2_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * mul, ggml_tensor * l2, ggml_tensor * scale) {
+    const ggml_tensor * x = mul ? mul->src[0] : l2->src[0];
+    const ggml_tensor * w = mul ? mul->src[1] : nullptr;
+    // the output has the layout of the l2 norm, which the scale keeps
+    GGML_ASSERT(ggml_are_same_shape(scale, l2) && ggml_are_same_stride(scale, l2));
+    ggml_sycl_op_l2_norm_impl(ctx, x, l2, (float *) scale->data, w, ggml_get_op_params_f32(scale, 0));
 }
 
 // nodes[0..count) are independent, same-shape, same-eps, same-nb L2_NORM ops validated

@@ -35,6 +35,8 @@ void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context& ctx, ggml_tensor* dst
 void ggml_sycl_op_group_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst);
 
 void ggml_sycl_op_l2_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst);
+// SCALE(L2_NORM(x)) or SCALE(L2_NORM(MUL(x, w))) with w [ncols, nrows or 1] broadcast over the other dims, mul optional
+void ggml_sycl_op_l2_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * mul, ggml_tensor * l2, ggml_tensor * scale);
 
 #define GGML_SYCL_L2_BATCH_MAX 8
 void ggml_sycl_l2_norm_batch(ggml_backend_sycl_context & ctx, ggml_tensor ** nodes, int count);
