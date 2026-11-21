@@ -2756,6 +2756,30 @@ static void launch_mul_mat_vec_q_moe(
 // keeps RP rows in flight. The codes are decoded with integer ops into fp16, an SLM table was slower.
 // Every (token, slot) pair is its own GEMV: with few tokens the experts rarely repeat, so sharing loads buys little.
 
+// two E2M1 codes of q, at bits K and K + 16, as an fp16 pair: magnitude at bit 9 and sign at bit 15 of an fp16 is the
+// value times 2^-14 (subnormals too)
+template <int K> static __dpct_inline__ sycl::float2 nvfp4_pair(const uint32_t q) {
+    const uint32_t m = K <= 9 ? q << (9 - K) : q >> (K - 9);
+    const uint32_t s = q << (12 - K);
+    return sycl::bit_cast<sycl::half2>((m & 0x0E000E00u) | (s & 0x80008000u)).convert<float>();
+}
+
+// E2M1 dot of one 16 value sub-block (codes q0, q1) with ys, times 2^-14
+// byte j holds the values j (low nibble) and j + 8, so the codes 16 bits apart are the values (i, i + 2)
+static __dpct_inline__ float nvfp4_sub_dot(const uint32_t q0, const uint32_t q1, const float (&ys)[QK_NVFP4_SUB]) {
+    sycl::float2 w;
+    float        sum = 0.0f;
+    w = nvfp4_pair<0>(q0);  sum += w.x() * ys[0]  + w.y() * ys[2];
+    w = nvfp4_pair<4>(q0);  sum += w.x() * ys[8]  + w.y() * ys[10];
+    w = nvfp4_pair<8>(q0);  sum += w.x() * ys[1]  + w.y() * ys[3];
+    w = nvfp4_pair<12>(q0); sum += w.x() * ys[9]  + w.y() * ys[11];
+    w = nvfp4_pair<0>(q1);  sum += w.x() * ys[4]  + w.y() * ys[6];
+    w = nvfp4_pair<4>(q1);  sum += w.x() * ys[12] + w.y() * ys[14];
+    w = nvfp4_pair<8>(q1);  sum += w.x() * ys[5]  + w.y() * ys[7];
+    w = nvfp4_pair<12>(q1); sum += w.x() * ys[13] + w.y() * ys[15];
+    return sum;
+}
+
 // the lane partial sums of RP rows over y, not yet reduced over the sub-group
 template <int RP>
 static __dpct_inline__ void nvfp4_rows_dot(const uint8_t * const (&x)[RP], const float * __restrict__ y, const int ncols,
@@ -2779,20 +2803,8 @@ static __dpct_inline__ void nvfp4_rows_dot(const uint8_t * const (&x)[RP], const
             const uint8_t * b  = x[p] + boff;
             const uint32_t  q0 = *(const uint32_t *) (b + 4 + 8 * s);
             const uint32_t  q1 = *(const uint32_t *) (b + 8 + 8 * s);
-            // E2M1 magnitude at bit 9 and sign at bit 15 of an fp16 is the value times 2^-14 (subnormals too):
-            // in a pair of bytes the low nibbles are values (j, j + 1) and the high nibbles (j + 8, j + 9)
-            float sum = 0.0f;
-#pragma unroll
-            for (int h = 0; h < 4; ++h) {
-                const uint32_t q  = (h < 2 ? q0 : q1) >> (16 * (h % 2));
-                const uint32_t lo = ((q & 0x7u) << 9) | ((q & 0x8u) << 12) | ((q & 0x700u) << 17) | ((q & 0x800u) << 20);
-                const uint32_t hi = ((q & 0x70u) << 5) | ((q & 0x80u) << 8) | ((q & 0x7000u) << 13) | ((q & 0x8000u) << 16);
-                const sycl::float2 wl = sycl::bit_cast<sycl::half2>(lo).convert<float>();
-                const sycl::float2 wh = sycl::bit_cast<sycl::half2>(hi).convert<float>();
-                sum += wl.x() * ys[2 * h] + wl.y() * ys[2 * h + 1] + wh.x() * ys[2 * h + 8] + wh.y() * ys[2 * h + 9];
-            }
             // kvalues_mxfp4 hold twice the E2M1 value, so an element is value * 2^14 * 2 * d
-            acc[p] += sum * 0x1p15f * ggml_sycl_ue4m3_to_fp32_fast(b[s]);
+            acc[p] += nvfp4_sub_dot(q0, q1, ys) * 0x1p15f * ggml_sycl_ue4m3_to_fp32_fast(b[s]);
         }
     }
 }
