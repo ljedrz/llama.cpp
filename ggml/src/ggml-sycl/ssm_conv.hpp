@@ -23,3 +23,7 @@ struct ggml_sycl_conv_window_match {
 // Purely structural, so graph_optimize and the compute loop see the same answer.
 bool ggml_sycl_match_conv_window(const ggml_cgraph * cgraph, int node_idx, ggml_sycl_conv_window_match & m);
 void ggml_sycl_ssm_conv_window(ggml_backend_sycl_context & ctx, const ggml_sycl_conv_window_match & m);
+
+// out = res2 + scale*(res + conv), res2 optional; res, res2 and out are contiguous with the layout of dst
+void ggml_sycl_ssm_conv_residual(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const ggml_tensor * res, float scale,
+                                 const ggml_tensor * res2, ggml_tensor * out);

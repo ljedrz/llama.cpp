@@ -6021,6 +6021,91 @@ static int ggml_sycl_fuse_gate_mix(ggml_backend_sycl_context & ctx, ggml_cgraph 
     return idx[n_ops - 1] - i;
 }
 
+// SSM_CONV at node i with a residual: ADD of the conv and res (through a RESHAPE), then optionally SCALE and an ADD of
+// a second residual res2, as out = res2 + scale*(res + conv). Runs them as one kernel and returns the number of nodes
+// after i it took, 0 when the pattern does not match.
+static int ggml_sycl_fuse_ssm_conv_residual(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * conv = cgraph->nodes[i];
+    if (!g_ggml_sycl_enable_fusion || conv->op != GGML_OP_SSM_CONV || !ggml_is_contiguous(conv)) {
+        return 0;
+    }
+    // the operand of a binary node other than src, src reached through views only
+    const auto other = [](const ggml_tensor * node, const ggml_tensor * src) -> const ggml_tensor * {
+        for (int j = 0; j < 2; ++j) {
+            const ggml_tensor * t = node->src[j];
+            while (t && t != src && t->view_src && ggml_sycl_is_view_or_noop(t)) {
+                t = t->src[0];
+            }
+            if (t == src) {
+                return node->src[1 - j];
+            }
+        }
+        return nullptr;
+    };
+    // a residual with the layout of the conv output
+    const auto fits = [&](const ggml_tensor * t) {
+        return t && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] == conv->ne[0] &&
+               ggml_nelements(t) == ggml_nelements(conv);
+    };
+
+    // the chain: ADD, then SCALE, then ADD, each with the views before it
+    std::vector<int>     idx = { i };
+    std::vector<ggml_op> ops = { GGML_OP_SSM_CONV };
+    int                  n_chain[3] = {};
+    const ggml_tensor *  prev = conv;
+    const ggml_tensor *  res  = nullptr;
+    const ggml_tensor *  res2 = nullptr;
+    for (int step = 0, k = i + 1; step < 3; ++step, ++k) {
+        for (; k < cgraph->n_nodes && ggml_sycl_is_view_or_noop(cgraph->nodes[k]); ++k) {
+            idx.push_back(k);
+            ops.push_back(cgraph->nodes[k]->op);
+        }
+        ggml_tensor * t = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
+        if (!t || !fits(t)) {
+            break;
+        }
+        if (step == 1) {
+            if (t->op != GGML_OP_SCALE || t->src[0] != prev || ggml_get_op_params_f32(t, 1) != 0.0f) {
+                break;
+            }
+        } else {
+            const ggml_tensor * r = t->op == GGML_OP_ADD ? other(t, prev) : nullptr;
+            if (!fits(r)) {
+                break;
+            }
+            (step == 0 ? res : res2) = r;
+        }
+        idx.push_back(k);
+        ops.push_back(t->op);
+        n_chain[step] = (int) idx.size();
+        prev = t;
+    }
+
+    // the longest chain that can be fused
+    for (int step = 2; step >= 0; --step) {
+        const int n = n_chain[step];
+        if (n == 0 || !ggml_can_fuse_subgraph_ext(cgraph, idx.data(), n, ops.data(), &idx[n - 1], 1)) {
+            continue;
+        }
+        ggml_tensor *       out = cgraph->nodes[idx[n - 1]];
+        const float         sc  = step >= 1 ? ggml_get_op_params_f32(cgraph->nodes[idx[n_chain[1] - 1]], 0) : 1.0f;
+        const ggml_tensor * r2  = step == 2 ? res2 : nullptr;
+        // the kernel reads the conv input around the element it writes, and res and res2 at it
+        const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            const char * a0 = (const char *) a->data;
+            const char * b0 = (const char *) b->data;
+            return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+        };
+        if (overlap(out, conv->src[0]) || (overlap(out, res) && out->data != res->data) ||
+            (r2 && overlap(out, r2) && out->data != r2->data)) {
+            return 0;
+        }
+        ggml_sycl_ssm_conv_residual(ctx, conv, res, sc, r2, out);
+        return idx[n - 1] - i;
+    }
+    return 0;
+}
+
 // true when the device MoE schedule may handle this MUL_MAT_ID: enabled, prefill, and an
 // f32/i32 layout it accepts; ggml_sycl_grouped_dequant_gemm_device decides type and width
 static bool ggml_sycl_mul_mat_id_device_sched_eligible(const ggml_tensor * dst) {
@@ -7106,6 +7191,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 #endif
         if (node->op == GGML_OP_MUL_MAT) {
             const int skip = ggml_sycl_fuse_gate_mix(*sycl_ctx, cgraph, i);
+            if (skip > 0) {
+                i += skip;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_SSM_CONV) {
+            const int skip = ggml_sycl_fuse_ssm_conv_residual(*sycl_ctx, cgraph, i);
             if (skip > 0) {
                 i += skip;
                 continue;
