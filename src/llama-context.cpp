@@ -538,16 +538,15 @@ llama_context::llama_context(
     }
 
     // init the memory module
+    const llama_memory_params params_mem = {
+        /*.type_k    =*/ params.type_k,
+        /*.type_v    =*/ params.type_v,
+        /*.swa_full  =*/ params.swa_full,
+        /*.ctx_type  =*/ cparams.ctx_type,
+        /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+        /*.no_alloc  =*/ model.no_alloc(),
+    };
     if (!hparams.vocab_only) {
-        llama_memory_params params_mem = {
-            /*.type_k    =*/ params.type_k,
-            /*.type_v    =*/ params.type_v,
-            /*.swa_full  =*/ params.swa_full,
-            /*.ctx_type  =*/ cparams.ctx_type,
-            /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
-            /*.no_alloc  =*/ model.no_alloc(),
-        };
-
         memory.reset(model.create_memory(params_mem, cparams));
     }
 
@@ -619,7 +618,18 @@ llama_context::llama_context(
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
         }
 
+        const bool auto_fa = cparams.auto_fa;
+
         sched_reserve();
+
+        // the memory was made for flash attention (V not transposed), so without it every attention would copy V
+        if (auto_fa && !cparams.flash_attn && memory) {
+            LLAMA_LOG_INFO("%s: flash attention resolved to disabled, recreating the memory module for it\n", __func__);
+            memory.reset();
+            memory.reset(model.create_memory(params_mem, cparams));
+            sched_need_reserve = true;
+            sched_reserve();
+        }
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
