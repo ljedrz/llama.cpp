@@ -1,7 +1,11 @@
 #include "mmvf.hpp"
 
+#include <algorithm>
+
 static constexpr int MMVF_MAX_COLS = 8;
 static constexpr int MMVF_NSG      = 8; // sub-groups (dst rows) per work-group
+static constexpr int MMVF_GQA_RPS  = 16; // most rows per sub-group over short GQA rows
+static constexpr int MMVF_GQA_WG_R = 4;  // rows per work-group over long GQA rows
 
 // the columns of a work unit and its batch (b2, i13): the src1 columns, or with GQA the src1 channels that share
 // one src0 channel (then b2 is that src0 channel)
@@ -82,6 +86,157 @@ static void mul_mat_vec_f_kernel(const char * __restrict__ src0, const char * __
         if (lane == 0) {
             *(float *) (dst + row * sizeof(float) + j * a.sd_col + b2 * a.sd_b2 + i13 * a.nb3) = sum;
         }
+    }
+}
+
+// one token of GQA over short F16 rows (ne00 == NK*4*WARP_SIZE, the head size): a sub-group takes rps consecutive rows
+// with the query columns kept in registers; same lanes and reduction per row as mul_mat_vec_f_kernel
+template <int NCOLS, int NK>
+static void mul_mat_vec_f16_gqa_rows_kernel(const char * __restrict__ src0, const char * __restrict__ src1,
+                                            char * __restrict__ dst, const mmvf_args a, const int rps,
+                                            const sycl::nd_item<3> & item) {
+    const auto    sg   = item.get_sub_group();
+    const int     lane = (int) sg.get_local_linear_id();
+    const int64_t row0 = ((int64_t) item.get_group(1) * MMVF_NSG + sg.get_group_linear_id()) * rps;
+    if (row0 >= a.ne01) {
+        return;
+    }
+    const int64_t b2  = item.get_group(0) % a.nb2d;
+    const int64_t i13 = item.get_group(0) / a.nb2d;
+
+    float y[NK][NCOLS][4];
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        const float * yj = (const float *) (src1 + j * a.sy_col + b2 * a.sy_b2 + i13 * a.nb13);
+#pragma unroll
+        for (int i = 0; i < NK; ++i) {
+            const sycl::float4 u = *(const sycl::float4 *) (yj + 4 * lane + i * 4 * WARP_SIZE);
+            y[i][j][0] = u.x(); y[i][j][1] = u.y(); y[i][j][2] = u.z(); y[i][j][3] = u.w();
+        }
+    }
+
+    const char * x0   = src0 + (b2 / a.x_div) * a.nb02 + (i13 / a.r3) * a.nb03;
+    char *       d0   = dst + b2 * a.sd_b2 + i13 * a.nb3;
+    const int64_t row1 = sycl::min(row0 + rps, a.ne01);
+    for (int64_t row = row0; row < row1; ++row) {
+        const sycl::half * x = (const sycl::half *) (x0 + row * a.nb01);
+        float acc[NCOLS] = {};
+#pragma unroll
+        for (int i = 0; i < NK; ++i) {
+            const sycl::vec<uint16_t, 4> v = *(const sycl::vec<uint16_t, 4> *) (x + 4 * lane + i * 4 * WARP_SIZE);
+            float w[4];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                w[e] = (float) sycl::bit_cast<sycl::half>((uint16_t) v[e]);
+            }
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) {
+                acc[j] += w[0] * y[i][j][0] + w[1] * y[i][j][1] + w[2] * y[i][j][2] + w[3] * y[i][j][3];
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            const float sum = sycl::reduce_over_group(sg, acc[j], sycl::plus<float>());
+            if (lane == 0) {
+                *(float *) (d0 + row * sizeof(float) + j * a.sd_col) = sum;
+            }
+        }
+    }
+}
+
+template <int NCOLS, int NK>
+static void launch_mul_mat_vec_f16_gqa_rows(const char * src0, const char * src1, char * dst, const mmvf_args & a,
+                                            dpct::queue_ptr stream) {
+    // enough sub-groups for a few waves over the device, then more rows per sub-group
+    const int64_t units = a.ne01 * a.nb2d * a.ne13;
+    const int     rps   = (int) std::clamp<int64_t>(units / 8192, 1, MMVF_GQA_RPS);
+    const int64_t nsg   = (a.ne01 + rps - 1) / rps;
+    const sycl::range<3> block_nums(a.nb2d * a.ne13, (nsg + MMVF_NSG - 1) / MMVF_NSG, 1);
+    const sycl::range<3> block_dims(1, 1, MMVF_NSG * WARP_SIZE);
+    stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_f16_gqa_rows_kernel<NCOLS, NK>(src0, src1, dst, a, rps, item);
+                         });
+}
+
+// one token of GQA over long F16 rows (KQV over the transposed V cache): a work-group takes R rows, so the src1 columns
+// are loaded once for all of them
+template <int NCOLS, int R>
+static void mul_mat_vec_f16_gqa_wg_kernel(const char * __restrict__ src0, const char * __restrict__ src1,
+                                          char * __restrict__ dst, const mmvf_args a, const sycl::nd_item<3> & item) {
+    constexpr int stride = MMVF_NSG * WARP_SIZE;
+    const int     lane   = (int) item.get_local_linear_id();
+    const int64_t row0   = (int64_t) item.get_group(1) * R;
+    const int64_t b2     = item.get_group(0) % a.nb2d;
+    const int64_t i13    = item.get_group(0) / a.nb2d;
+
+    const char *  x0 = src0 + (b2 / a.x_div) * a.nb02 + (i13 / a.r3) * a.nb03;
+    const float * y[NCOLS];
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        y[j] = (const float *) (src1 + j * a.sy_col + b2 * a.sy_b2 + i13 * a.nb13);
+    }
+    const sycl::half * x[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        x[r] = (const sycl::half *) (x0 + sycl::min(row0 + r, a.ne01 - 1) * a.nb01);
+    }
+
+    float acc[R][NCOLS] = {};
+    for (int64_t k = 4 * lane; k < a.ne00; k += 4 * stride) {
+        sycl::float4 u[NCOLS];
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            u[j] = *(const sycl::float4 *) (y[j] + k);
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const sycl::vec<uint16_t, 4> v = *(const sycl::vec<uint16_t, 4> *) (x[r] + k);
+            float w[4];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                w[e] = (float) sycl::bit_cast<sycl::half>((uint16_t) v[e]);
+            }
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) {
+                acc[r][j] += w[0] * u[j].x() + w[1] * u[j].y() + w[2] * u[j].z() + w[3] * u[j].w();
+            }
+        }
+    }
+
+    char * d0 = dst + b2 * a.sd_b2 + i13 * a.nb3;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            const float sum = sycl::reduce_over_group(item.get_group(), acc[r][j], sycl::plus<float>());
+            if (lane == 0 && row0 + r < a.ne01) {
+                *(float *) (d0 + (row0 + r) * sizeof(float) + j * a.sd_col) = sum;
+            }
+        }
+    }
+}
+
+template <int NCOLS, int R>
+static void launch_mul_mat_vec_f16_gqa_wg(const char * src0, const char * src1, char * dst, const mmvf_args & a,
+                                          dpct::queue_ptr stream) {
+    const sycl::range<3> block_nums(a.nb2d * a.ne13, (a.ne01 + R - 1) / R, 1);
+    const sycl::range<3> block_dims(1, 1, MMVF_NSG * WARP_SIZE);
+    stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_f16_gqa_wg_kernel<NCOLS, R>(src0, src1, dst, a, item);
+                         });
+}
+
+template <int NK>
+static bool mul_mat_vec_f16_gqa_rows_switch(const char * src0, const char * src1, char * dst, const mmvf_args & a,
+                                            dpct::queue_ptr stream) {
+    switch (a.ncols) {
+        case 2: launch_mul_mat_vec_f16_gqa_rows<2, NK>(src0, src1, dst, a, stream); return true;
+        case 3: launch_mul_mat_vec_f16_gqa_rows<3, NK>(src0, src1, dst, a, stream); return true;
+        case 4: launch_mul_mat_vec_f16_gqa_rows<4, NK>(src0, src1, dst, a, stream); return true;
+        case 8: launch_mul_mat_vec_f16_gqa_rows<8, NK>(src0, src1, dst, a, stream); return true;
+        default: return false;
     }
 }
 
@@ -190,6 +345,29 @@ bool ggml_sycl_mul_mat_vec_f(ggml_backend_sycl_context & ctx, const ggml_tensor 
     const char * x = (const char *) src0->data;
     const char * y = (const char *) src1->data;
     char *       d = (char *) dst->data;
+    if (gqa && vec && src0->type == GGML_TYPE_F16) {
+        bool done = false;
+        switch (a.ne00) {
+            case 1 * 4 * WARP_SIZE: done = mul_mat_vec_f16_gqa_rows_switch<1>(x, y, d, a, stream); break;
+            case 2 * 4 * WARP_SIZE: done = mul_mat_vec_f16_gqa_rows_switch<2>(x, y, d, a, stream); break;
+            case 4 * 4 * WARP_SIZE: done = mul_mat_vec_f16_gqa_rows_switch<4>(x, y, d, a, stream); break;
+            default: break;
+        }
+        // the same few-rows-over-long-ones condition as ROW_WG below
+        if (!done && a.ne01 * a.nb2d * a.ne13 < 2048 && a.ne00 >= 512) {
+            done = true;
+            switch (a.ncols) {
+                case 2: launch_mul_mat_vec_f16_gqa_wg<2, MMVF_GQA_WG_R>(x, y, d, a, stream); break;
+                case 3: launch_mul_mat_vec_f16_gqa_wg<3, MMVF_GQA_WG_R>(x, y, d, a, stream); break;
+                case 4: launch_mul_mat_vec_f16_gqa_wg<4, MMVF_GQA_WG_R>(x, y, d, a, stream); break;
+                case 8: launch_mul_mat_vec_f16_gqa_wg<8, MMVF_GQA_WG_R>(x, y, d, a, stream); break;
+                default: done = false; break;
+            }
+        }
+        if (done) {
+            return true;
+        }
+    }
     switch (src0->type) {
         case GGML_TYPE_F32:  mul_mat_vec_f_switch<float>(x, y, d, a, vec, stream); break;
         case GGML_TYPE_F16:  mul_mat_vec_f_switch<sycl::half>(x, y, d, a, vec, stream); break;
