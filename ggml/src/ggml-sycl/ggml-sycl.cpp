@@ -2793,6 +2793,23 @@ static void scale_f32_sycl(const float *x, float *dst, const float scale, const 
 
 static void sum_rows_f32_sycl(const float *x, float *dst, const int ncols,
                               const int nrows, queue_ptr stream) {
+    // a few long rows, such as the logits of a sampler: a work-group per row instead of a sub-group
+    if (ncols >= 8192 && nrows < 256) {
+        constexpr int nth = 1024;
+        stream->parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) nrows * nth), sycl::range<1>(nth)),
+                             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                 const float * xr  = x + (size_t) item.get_group(0) * ncols;
+                                 float         sum = 0.0f;
+                                 for (int i = item.get_local_id(0); i < ncols; i += nth) {
+                                     sum += xr[i];
+                                 }
+                                 sum = sycl::reduce_over_group(item.get_group(), sum, sycl::plus<float>());
+                                 if (item.get_local_id(0) == 0) {
+                                     dst[item.get_group(0)] = sum;
+                                 }
+                             });
+        return;
+    }
     const sycl::range<3> block_dims(1, 1, WARP_SIZE);
     const sycl::range<3> block_nums(1, nrows, 1);
     stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
