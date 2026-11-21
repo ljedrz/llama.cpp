@@ -1499,7 +1499,9 @@ public:
             }
             i_block_beg[seq_id] = batch.size();
             for (int32_t i = 0; i < n_block_tokens; ++i) {
-                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, true);
+                // the recurrent head runs only up to the last output, and only positions up to n_max are read
+                const bool output = !has_rnn_context || i < i_draft_beg + params.n_max;
+                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, output);
                 if (context) {
                     batch.set_embd_state(idx, { context, 1, (size_t) n_embd_dec });
                 }
