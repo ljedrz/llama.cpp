@@ -59,10 +59,20 @@ struct ggml_sycl_nvfp4_id_args {
     size_t dst_token_stride;   // bytes between tokens
 };
 
+// what the GEMV applies to its rows before it writes them
+struct ggml_sycl_nvfp4_id_epilogue {
+    const float * expert_scale = nullptr; // [n_expert], times each row of the expert
+    // dst row r = situ[1]*tanh(situ[0]*g)*sigmoid(g) * situ[3]*tanh(situ[2]*u) of the gate row g = r and the up
+    // row u = r + nrows/2, dst holds nrows/2 rows per (token, slot)
+    bool  situ_enabled = false;
+    float situ[4]      = {};
+};
+
 // NVFP4 MoE expert GEMV on f32 src1 in the standard block layout, one GEMV per (token, slot) pair.
 // Needs ncols % QK_NVFP4 == 0, vx_base 4 byte aligned, y and the src1 strides 16 byte aligned.
 void ggml_sycl_mul_mat_vec_nvfp4_id_f32(const void * vx_base, const float * y, const int32_t * ids, float * dst,
-                                        const ggml_sycl_nvfp4_id_args & args, dpct::queue_ptr stream);
+                                        const ggml_sycl_nvfp4_id_args & args, const ggml_sycl_nvfp4_id_epilogue & ep,
+                                        dpct::queue_ptr stream);
 
 // Reorder (SoA) variant of the fused MoE expert GEMV.
 // vx_base: each expert slice (stride expert_weight_stride == src0->nb[2]) is a self-contained reorder/SoA layout.
