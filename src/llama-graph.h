@@ -337,6 +337,9 @@ public:
 
     void set_input_rep(const llama_memory_recurrent_context * mctx, const llama_ubatch * ubatch);
 
+    // the rollback slots of the conv state stores in reverse order, built by the first store of the graph
+    ggml_tensor * s_slot_rev = nullptr; // I32 [n_rs_seq + 1]
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
