@@ -758,6 +758,11 @@ struct ggml_backend_sycl_buffer_context {
     host_staging staging;
     bool is_usm_system;
 
+    // device scratch and its pinned host copy for gathered reads, allocated on first use
+    static constexpr size_t gather_size = 16*1024*1024;
+    void * gather_dev  = nullptr;
+    void * gather_host = nullptr;
+
     ggml_backend_sycl_buffer_context(int device, void * dev_ptr, queue_ptr stream, bool is_usm_system) :
         device(device), dev_ptr(dev_ptr), stream(stream), is_usm_system(is_usm_system) {
             check_allow_gpu_index(device);
@@ -781,6 +786,16 @@ struct ggml_backend_sycl_buffer_context {
 
     ~ggml_backend_sycl_buffer_context() {
         drop_host_staging();
+        if (gather_dev != nullptr || gather_host != nullptr) {
+            ggml_sycl_set_device(device);
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+            if (gather_dev != nullptr) {
+                sycl::free(gather_dev, *stream);
+            }
+            if (gather_host != nullptr) {
+                sycl::free(gather_host, *stream);
+            }
+        }
         if (dev_ptr != nullptr) {
             ggml_sycl_set_device(device);
             if (is_usm_system)
@@ -982,6 +997,160 @@ static void ggml_backend_sycl_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
         ctx->staging.events[slot]    = stream->memcpy(dst + i0 * size, stage, n * size);
         ctx->staging.submitted[slot] = true;
     }
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
+// Reads (TO_DEVICE false) or writes n pieces with one wait per 16 MiB. Consecutive pieces of one tensor with equal
+// sizes and constant strides on both sides are a run of rows: the state of a transposed V cache is a row of a few bytes
+// per channel and cell range. Small rows go through a device scratch with one kernel and one copy, large ones directly.
+template <bool TO_DEVICE>
+static void ggml_backend_sycl_buffer_copy_tensor_n(ggml_backend_buffer_t buffer, const ggml_tensor * const * tensors,
+                                                   const void * const * data, const size_t * offsets,
+                                                   const size_t * sizes, size_t n_tensors) {
+    struct row_run {
+        char *       dev;
+        size_t       stride_dev;
+        size_t       size;
+        size_t       n;
+        char *       host;
+        size_t       stride_host;
+        size_t       scratch; // offset in the scratch
+    };
+    constexpr size_t large = 64*1024;
+
+    ggml_backend_sycl_buffer_context * ctx = (ggml_backend_sycl_buffer_context *) buffer->context;
+    ggml_sycl_set_device(ctx->device);
+    queue_ptr stream = ctx->stream;
+
+    const size_t cap = ctx->gather_size;
+    if (ctx->gather_dev == nullptr) {
+        ctx->gather_dev  = sycl::malloc_device(cap, *stream);
+        ctx->gather_host = sycl::malloc_host(cap + cap / 8, *stream);
+    }
+    const bool can_gather = ctx->gather_dev != nullptr && ctx->gather_host != nullptr;
+
+    std::vector<row_run> batch;
+    size_t               batch_bytes = 0;
+    // runs are described in the pinned memory after the data, which the kernel reads in place
+    const size_t max_runs = (cap / 8) / sizeof(row_run);
+
+    const auto flush = [&]() {
+        if (batch.empty()) {
+            return;
+        }
+        row_run * runs = (row_run *) ((char *) ctx->gather_host + cap);
+        std::copy(batch.begin(), batch.end(), runs);
+        char *       scratch = (char *) ctx->gather_dev;
+        const size_t n_runs  = batch.size();
+        if constexpr (TO_DEVICE) {
+            for (const row_run & r : batch) {
+                for (size_t row = 0; row < r.n; ++row) {
+                    memcpy((char *) ctx->gather_host + r.scratch + row * r.size, r.host + row * r.stride_host, r.size);
+                }
+            }
+            stream->memcpy(scratch, ctx->gather_host, batch_bytes);
+        }
+        stream->parallel_for(sycl::nd_range<1>(sycl::range<1>(n_runs * 256), sycl::range<1>(256)),
+                             [=](sycl::nd_item<1> item) {
+                                 const row_run & r     = runs[item.get_group(0)];
+                                 const size_t    total = r.n * r.size;
+                                 for (size_t k = item.get_local_id(0); k < total; k += 256) {
+                                     const size_t row = k / r.size;
+                                     const size_t col = k - row * r.size;
+                                     if constexpr (TO_DEVICE) {
+                                         r.dev[row * r.stride_dev + col] = scratch[r.scratch + k];
+                                     } else {
+                                         scratch[r.scratch + k] = r.dev[row * r.stride_dev + col];
+                                     }
+                                 }
+                             });
+        if constexpr (!TO_DEVICE) {
+            stream->memcpy(ctx->gather_host, scratch, batch_bytes);
+        }
+        SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+        if constexpr (!TO_DEVICE) {
+            for (const row_run & r : batch) {
+                for (size_t row = 0; row < r.n; ++row) {
+                    memcpy(r.host + row * r.stride_host, (const char *) ctx->gather_host + r.scratch + row * r.size, r.size);
+                }
+            }
+        }
+        batch.clear();
+        batch_bytes = 0;
+    };
+
+    for (size_t i = 0; i < n_tensors;) {
+        row_run r = { (char *) tensors[i]->data + offsets[i], 0, sizes[i], 1, (char *) data[i], 0, 0 };
+        if (i + 1 < n_tensors && tensors[i + 1] == tensors[i] && sizes[i + 1] == r.size && offsets[i + 1] > offsets[i] &&
+            (const char *) data[i + 1] > r.host) {
+            const size_t stride_dev  = offsets[i + 1] - offsets[i];
+            const size_t stride_host = (const char *) data[i + 1] - r.host;
+            size_t       n           = 1;
+            while (i + n < n_tensors && tensors[i + n] == tensors[i] && sizes[i + n] == r.size &&
+                   offsets[i + n] == offsets[i] + n * stride_dev && (const char *) data[i + n] == r.host + n * stride_host) {
+                ++n;
+            }
+            r.stride_dev  = stride_dev;
+            r.stride_host = stride_host;
+            r.n           = n;
+        }
+        if (r.size == 0) {
+            i += r.n;
+            continue;
+        }
+        if (!can_gather || r.size >= large) {
+            for (size_t row = 0; row < r.n; ++row) {
+                if constexpr (TO_DEVICE) {
+                    // through the staging of set_tensor, ordered on the same queue
+                    ggml_backend_sycl_buffer_set_tensor(buffer, const_cast<ggml_tensor *>(tensors[i + row]),
+                                                        r.host + row * r.stride_host, offsets[i + row], r.size);
+                } else {
+                    stream->memcpy(r.host + row * r.stride_host, r.dev + row * r.stride_dev, r.size);
+                }
+            }
+            i += r.n;
+            continue;
+        }
+        i += r.n;
+        // split the run so that a part fits the scratch
+        while (r.n > 0) {
+            if (batch_bytes + r.size > cap || batch.size() == max_runs) {
+                flush();
+            }
+            const size_t n = std::min(r.n, (cap - batch_bytes) / r.size);
+            row_run part   = r;
+            part.n         = n;
+            part.scratch   = batch_bytes;
+            batch.push_back(part);
+            batch_bytes += n * r.size;
+            r.dev  += n * r.stride_dev;
+            r.host += n * r.stride_host;
+            r.n    -= n;
+        }
+    }
+    flush();
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+}
+
+static void ggml_backend_sycl_buffer_get_tensor_n(ggml_backend_buffer_t buffer, const ggml_tensor * const * tensors,
+                                                  void * const * data, const size_t * offsets, const size_t * sizes,
+                                                  size_t n_tensors) try {
+    ggml_backend_sycl_buffer_copy_tensor_n<false>(buffer, tensors, (const void * const *) data, offsets, sizes, n_tensors);
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
+static void ggml_backend_sycl_buffer_set_tensor_n(ggml_backend_buffer_t buffer, ggml_tensor * const * tensors,
+                                                  const void * const * data, const size_t * offsets, const size_t * sizes,
+                                                  size_t n_tensors) try {
+    ggml_backend_sycl_buffer_copy_tensor_n<true>(buffer, (const ggml_tensor * const *) tensors, data, offsets, sizes, n_tensors);
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -1212,8 +1381,8 @@ static const ggml_backend_buffer_i ggml_backend_sycl_buffer_interface = {
     /* .cpy_tensor      = */ ggml_backend_sycl_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_sycl_buffer_clear,
     /* .reset           = */ ggml_backend_sycl_buffer_reset,
-    /* .set_tensor_n    = */ NULL,
-    /* .get_tensor_n    = */ NULL,
+    /* .set_tensor_n    = */ ggml_backend_sycl_buffer_set_tensor_n,
+    /* .get_tensor_n    = */ ggml_backend_sycl_buffer_get_tensor_n,
     /* .cpy_tensor_n    = */ NULL,
 };
 
