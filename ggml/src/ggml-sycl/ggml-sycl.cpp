@@ -6210,6 +6210,44 @@ static int ggml_sycl_fuse_depth_mix(ggml_backend_sycl_context & ctx, ggml_cgraph
     return idx[n - 1] - i;
 }
 
+// L2_NORM then SCALE at node i, optionally after a MUL by a [ncols, nrows or 1] weight: the scaled L2 clips of
+// Inkling 2. Returns the number of nodes after i it took, 0 when the pattern does not match.
+static int ggml_sycl_fuse_l2_norm(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * node = cgraph->nodes[i];
+    const bool    mul  = node->op == GGML_OP_MUL;
+    if (!g_ggml_sycl_enable_fusion || (!mul && node->op != GGML_OP_L2_NORM) || i + (mul ? 2 : 1) >= cgraph->n_nodes) {
+        return 0;
+    }
+    const bool ok = mul ? ggml_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_L2_NORM, GGML_OP_SCALE }) :
+                          ggml_can_fuse(cgraph, i, { GGML_OP_L2_NORM, GGML_OP_SCALE });
+    if (!ok) {
+        return 0;
+    }
+    ggml_tensor * l2 = cgraph->nodes[i + (mul ? 1 : 0)];
+    ggml_tensor * sc = cgraph->nodes[i + (mul ? 2 : 1)];
+    const ggml_tensor * x = mul ? node->src[0] : l2->src[0];
+    if (x->type != GGML_TYPE_F32 || l2->type != GGML_TYPE_F32 || sc->type != GGML_TYPE_F32 || sc->src[0] != l2 ||
+        ggml_get_op_params_f32(sc, 1) != 0.0f || !ggml_are_same_stride(sc, l2) || l2->src[0] != (mul ? node : x)) {
+        return 0;
+    }
+    if (mul) {
+        const ggml_tensor * w = node->src[1];
+        if (w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || w->ne[0] != x->ne[0] ||
+            (w->ne[1] != 1 && w->ne[1] != x->ne[1]) || w->ne[2] != 1 || w->ne[3] != 1 || !ggml_are_same_shape(node, x)) {
+            return 0;
+        }
+    }
+    // a row is read twice before and while it is written: only an exact alias of the input is safe
+    const char * x0 = (const char *) x->data;
+    const char * o0 = (const char *) sc->data;
+    if (x0 < o0 + ggml_nbytes(sc) && o0 < x0 + ggml_nbytes(x) && (x0 != o0 || !ggml_are_same_stride(x, sc))) {
+        return 0;
+    }
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    ggml_sycl_op_l2_norm_fused(ctx, mul ? node : nullptr, l2, sc);
+    return mul ? 2 : 1;
+}
+
 // true when the device MoE schedule may handle this MUL_MAT_ID: enabled, prefill, and an
 // f32/i32 layout it accepts; ggml_sycl_grouped_dequant_gemm_device decides type and width
 static bool ggml_sycl_mul_mat_id_device_sched_eligible(const ggml_tensor * dst) {
@@ -7276,6 +7314,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 #endif
         if (node->op == GGML_OP_MUL_MAT) {
             const int skip = ggml_sycl_fuse_gate_mix(*sycl_ctx, cgraph, i);
+            if (skip > 0) {
+                i += skip;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_MUL || node->op == GGML_OP_L2_NORM) {
+            const int skip = ggml_sycl_fuse_l2_norm(*sycl_ctx, cgraph, i);
             if (skip > 0) {
                 i += skip;
                 continue;
