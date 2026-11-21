@@ -116,6 +116,7 @@ int g_ggml_sycl_enable_fusion = 1;
 int g_ggml_sycl_fuse_conv_window = 1;
 int g_ggml_sycl_enable_esimd = 1;
 int g_ggml_sycl_mmid_esimd = 1;
+int g_ggml_sycl_nvfp4_moe_f32 = 1;
 int g_ggml_sycl_mmvq_wide = 1;
 int g_ggml_sycl_enable_xmx_esimd = 1;
 int g_ggml_sycl_xmx_max_cols = GGML_SYCL_XMX_MAX_COLS_DEFAULT;
@@ -452,6 +453,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_fuse_conv_window = ggml_sycl_get_env("GGML_SYCL_FUSE_CONV_WINDOW", 1);
         g_ggml_sycl_enable_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_ESIMD", 1);
         g_ggml_sycl_mmid_esimd = ggml_sycl_get_env("GGML_SYCL_MMID_ESIMD", 1);
+        g_ggml_sycl_nvfp4_moe_f32 = ggml_sycl_get_env("GGML_SYCL_NVFP4_MOE_F32", 1);
         g_ggml_sycl_mmvq_wide = ggml_sycl_get_env("GGML_SYCL_MMVQ_WIDE", 1);
         g_ggml_sycl_enable_xmx_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_XMX_ESIMD", 1);
         g_ggml_sycl_xmx_max_cols = std::max(0, ggml_sycl_get_env("GGML_SYCL_XMX_MAX_COLS", GGML_SYCL_XMX_MAX_COLS_DEFAULT));
@@ -588,6 +590,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_XMX_GATHER_TYPES: %d\n", g_ggml_sycl_xmx_gather_types);
         GGML_LOG_INFO("  GGML_SYCL_MMID_SCHED: %d\n", g_ggml_sycl_mmid_sched);
         GGML_LOG_INFO("  GGML_SYCL_MMID_ESIMD: %d\n", g_ggml_sycl_mmid_esimd);
+        GGML_LOG_INFO("  GGML_SYCL_NVFP4_MOE_F32: %d\n", g_ggml_sycl_nvfp4_moe_f32);
         GGML_LOG_INFO("  GGML_SYCL_XMX_GATHER_SHAPES: %d\n", g_ggml_sycl_xmx_gather_shapes);
         GGML_LOG_INFO("  GGML_SYCL_DYNAMIC_PRECISION: %s\n",
                       ggml_sycl_dynamic_precision_names[g_ggml_sycl_dynamic_precision]);
@@ -5806,6 +5809,38 @@ static void mmid_counting_sort_rows(
     routed_row_src.resize(expert_row_offsets[n_as]);
 }
 
+// NVFP4 experts of up to this many tokens take one GEMV per (token, slot) pair on the f32 activations
+static constexpr int64_t GGML_SYCL_NVFP4_ID_MAX_TOKENS = 8;
+
+// true when ggml_sycl_mul_mat_vec_nvfp4_id_f32() handles this MUL_MAT_ID, args is then filled
+static bool ggml_sycl_mul_mat_id_nvfp4_args(const ggml_tensor * dst, ggml_sycl_nvfp4_id_args & args) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+    if (!g_ggml_sycl_nvfp4_moe_f32 || src0->type != GGML_TYPE_NVFP4 || src1->type != GGML_TYPE_F32 ||
+        dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if (ggml_backend_buffer_is_sycl_split(src0->buffer) || !ggml_is_contiguous(src0) || src0->ne[0] % QK_NVFP4 != 0 ||
+        (uintptr_t) src0->data % 4 != 0) {
+        return false;
+    }
+    const int64_t n_ids    = ids->ne[0];
+    const int64_t n_tokens = ids->ne[1];
+    if (n_tokens > GGML_SYCL_NVFP4_ID_MAX_TOKENS || src1->ne[0] != src0->ne[0] || src1->ne[2] != n_tokens ||
+        src1->ne[3] != 1 || (src1->ne[1] != 1 && src1->ne[1] != n_ids) || dst->ne[1] != n_ids || dst->ne[2] != n_tokens) {
+        return false;
+    }
+    if (src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) || ids->nb[0] != sizeof(int32_t) ||
+        ids->nb[1] % sizeof(int32_t) != 0 || (uintptr_t) src1->data % 16 != 0 || src1->nb[1] % 16 != 0 ||
+        src1->nb[2] % 16 != 0) {
+        return false;
+    }
+    args = { (int) src0->ne[0], (int) src0->ne[1], (int) n_ids, (int) n_tokens, src0->nb[2], ids->nb[1] / sizeof(int32_t),
+             src1->ne[1] == 1 ? 0 : src1->nb[1], src1->nb[2], dst->nb[1], dst->nb[2] };
+    return true;
+}
+
 // true when the device MoE schedule may handle this MUL_MAT_ID: enabled, prefill, and an
 // f32/i32 layout it accepts; ggml_sycl_grouped_dequant_gemm_device decides type and width
 static bool ggml_sycl_mul_mat_id_device_sched_eligible(const ggml_tensor * dst) {
@@ -5832,6 +5867,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
+
+    ggml_sycl_nvfp4_id_args nvfp4_args;
+    if (ggml_sycl_mul_mat_id_nvfp4_args(dst, nvfp4_args)) {
+        ggml_sycl_mul_mat_vec_nvfp4_id_f32(src0->data, (const float *) src1->data, (const int32_t *) ids->data,
+                                           (float *) dst->data, nvfp4_args, stream);
+        return;
+    }
 
     if (ne12 == 1) {
         if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
@@ -7093,6 +7135,10 @@ static bool ggml_sycl_mul_mat_id_needs_sync(ggml_backend_sycl_context * ctx, con
     const ggml_tensor * ids = dst->src[2];
     if (!src0 || !src1 || !ids || ggml_backend_buffer_is_sycl_split(src0->buffer)) {
         return true;
+    }
+    ggml_sycl_nvfp4_id_args nvfp4_args;
+    if (ggml_sycl_mul_mat_id_nvfp4_args(dst, nvfp4_args)) {
+        return false;
     }
     const bool reordered = src0->extra && ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder;
     if (ggml_sycl_mul_mat_id_mmvq_eligible(src0, src1, ids, dst)) {
