@@ -1076,8 +1076,11 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     auto * context = column(f_rnn, 0);
     auto * tie_rank = ggml_arange(ctx0, 0, hparams.n_vocab_unpadded, 1);
     tie_rank = ggml_scale_bias(ctx0, tie_rank, -1.0f, hparams.n_vocab_unpadded);
+    // a draft asks for a prefix of each block: the positions past it are never read, so their heads are skipped
+    const int64_t n_out  = (int64_t) n_outputs/nb;
+    const int64_t n_head = n_out >= 2 && n_out <= block && n_out*nb == (int64_t) n_outputs ? n_out : block;
     auto * prev = ids;
-    for (int64_t i = 1; i < block; ++i) {
+    for (int64_t i = 1; i < n_head; ++i) {
         auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), column(base, i), context);
         logits = ggml_concat(ctx0, logits, col, 1);
         // Select the first maximum, independent of backend argmax tie order.
@@ -1086,7 +1089,7 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         auto * is_max = ggml_scale_bias(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ggml_repeat(ctx0, maximum, valid), valid)), -1.0f, 1.0f);
         prev = ggml_argmax(ctx0, ggml_mul(ctx0, is_max, tie_rank));
     }
-    logits = ggml_reshape_3d(ctx0, logits, logits->ne[0], nb, block);
-    logits = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, logits, 0, 2, 1, 3)), logits->ne[0], n_tokens);
-    res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, logits, hparams.n_vocab_unpadded, n_tokens, logits->nb[1], 0));
+    logits = ggml_reshape_3d(ctx0, logits, logits->ne[0], nb, n_head);
+    logits = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, logits, 0, 2, 1, 3)), logits->ne[0], n_head*nb);
+    res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, logits, hparams.n_vocab_unpadded, n_head*nb, logits->nb[1], 0));
 }
