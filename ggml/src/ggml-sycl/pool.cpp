@@ -152,6 +152,38 @@ void ggml_sycl_op_pool2d(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
         });
 }
 
+// one work-group per output, for few outputs with long windows (a max over a whole row)
+template <typename Ti, typename To>
+static void pool1d_ncw_wg_kernel(
+        const int iw, const int ow,
+        const int k, const int s,
+        const int p,
+        const Ti * src, To * dst, const enum ggml_op_pool op,
+        const sycl::nd_item<1> & item) {
+    const int  idx    = item.get_group(0);
+    const int  nc     = idx / ow;
+    const int  cur_ow = idx % ow;
+    const Ti * i_ptr  = src + (size_t) nc * iw;
+    const int  start  = cur_ow * s - p;
+    const int  b      = sycl::max(0, start);
+    const int  e      = sycl::min(iw, start + k);
+
+    To res = op == GGML_OP_POOL_MAX ? (To) -FLT_MAX : (To) 0;
+    for (int j = b + (int) item.get_local_id(0); j < e; j += (int) item.get_local_range(0)) {
+        const To cur = i_ptr[j];
+        res = op == GGML_OP_POOL_MAX ? sycl::max(res, cur) : res + cur;
+    }
+    const auto grp = item.get_group();
+    res = op == GGML_OP_POOL_MAX ? sycl::reduce_over_group(grp, res, sycl::maximum<To>()) :
+                                   sycl::reduce_over_group(grp, res, sycl::plus<To>());
+    if (item.get_local_id(0) == 0) {
+        if (op == GGML_OP_POOL_AVG) {
+            res = (e - b > 0) ? res / (e - b) : (To) 0;
+        }
+        dst[(size_t) nc * ow + cur_ow] = res;
+    }
+}
+
 void ggml_sycl_op_pool1d(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
@@ -171,6 +203,18 @@ void ggml_sycl_op_pool1d(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const int64_t NC = dst->ne[3] * dst->ne[2] * dst->ne[1];
 
     const int parallel_elements = NC * OW;
+
+    // a work-item per output leaves the device idle when there are few outputs, each a long serial loop
+    if ((op == GGML_OP_POOL_MAX || op == GGML_OP_POOL_AVG) && k0 >= 4096 && parallel_elements <= 4096) {
+        const size_t wg = std::min<size_t>(1024, ggml_sycl_info().max_work_group_sizes[ctx.device]);
+        main_stream->parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) parallel_elements * wg), sycl::range<1>(wg)),
+            [=](sycl::nd_item<1> item) {
+                pool1d_ncw_wg_kernel(IW, OW, k0, s0, p0, src0_dd, dst_dd, op, item);
+            });
+        return;
+    }
+
     const int num_blocks = (parallel_elements + SYCL_POOL1D_BLOCK_SIZE - 1) / SYCL_POOL1D_BLOCK_SIZE;
     sycl::range<3> block_nums(1, 1, num_blocks);
     main_stream->parallel_for(
