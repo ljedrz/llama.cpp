@@ -46,6 +46,24 @@ bool ggml_sycl_mul_mat_vec_q_id(
     size_t             src1_row_stride,      // 0 = shared src1, else per-expert stride in bytes
     dpct::queue_ptr    stream);
 
+struct ggml_sycl_nvfp4_id_args {
+    int    ncols;
+    int    nrows;
+    int    n_ids;              // expert slots per token
+    int    n_tokens;
+    size_t expert_stride;      // bytes between experts
+    size_t ids_token_stride;   // elements between the ids of two tokens
+    size_t src1_row_stride;    // bytes between slots, 0 = one src1 row per token
+    size_t src1_token_stride;  // bytes between tokens
+    size_t dst_row_stride;     // bytes between slots
+    size_t dst_token_stride;   // bytes between tokens
+};
+
+// NVFP4 MoE expert GEMV on f32 src1 in the standard block layout, one GEMV per (token, slot) pair.
+// Needs ncols % QK_NVFP4 == 0, vx_base 4 byte aligned, y and the src1 strides 16 byte aligned.
+void ggml_sycl_mul_mat_vec_nvfp4_id_f32(const void * vx_base, const float * y, const int32_t * ids, float * dst,
+                                        const ggml_sycl_nvfp4_id_args & args, dpct::queue_ptr stream);
+
 // Reorder (SoA) variant of the fused MoE expert GEMV.
 // vx_base: each expert slice (stride expert_weight_stride == src0->nb[2]) is a self-contained reorder/SoA layout.
 // vy: src1 quantized with quantize_and_reorder_q8_1_soa (per-row SoA). Returns false if src0_type isn't handled.
