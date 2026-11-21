@@ -1814,7 +1814,13 @@ ESIMD_INLINE void dequantize_mul_mat_vec_q8_0_reorder_esimd(
                                 d_a + base_a + b, d_b + base_b + b, has_b, y_vec, acc_a, acc_b);
     }
 
-    // Distribute remaining blocks across the work-group.
+    // then shorter stripes, and the remaining blocks one at a time
+    for (; ib + WG * 4 <= nblk_row; ib += WG * 4) {
+        const int b = ib + tid * 4;
+        simd<float, 128> y_vec = block_load<float, 128>(y + (size_t) b * QK8_0);
+        q8_0_mac_stripe<4>(qs_a + (base_a + b) * QK8_0, qs_b + (base_b + b) * QK8_0,
+                           d_a + base_a + b, d_b + base_b + b, has_b, y_vec, acc_a, acc_b);
+    }
     for (int b = ib + tid; b < nblk_row; b += WG) {
         simd<float, 32> y_vec = block_load<float, 32>(y + (size_t) b * QK8_0);
         q8_0_mac_stripe<1>(qs_a + (base_a + b) * QK8_0, qs_b + (base_b + b) * QK8_0,
