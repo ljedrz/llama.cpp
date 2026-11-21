@@ -548,6 +548,67 @@ static bool get_rows_f32_vec4(const ggml_tensor * src0, const ggml_tensor * src1
     return true;
 }
 
+// a work-item per (k, q) reads the n_head biases of its distance in one go and writes one value per head, so the
+// writes of a sub-group are contiguous in k
+template <typename mask_t, typename dst_t, bool vec4>
+static void rel_bias_mask_sycl(const ggml_sycl_rel_bias_mask_args & a, queue_ptr stream) {
+    constexpr int wg = 256;
+    const sycl::range<2> grid(a.n_tok, (a.n_kv + wg - 1) / wg * wg);
+    const ggml_sycl_rel_bias_mask_args p = a;
+    stream->parallel_for(sycl::nd_range<2>(grid, sycl::range<2>(1, wg)), [=](sycl::nd_item<2> it) {
+        const int64_t k = it.get_global_id(1);
+        const int64_t q = it.get_global_id(0);
+        if (k >= p.n_kv) {
+            return;
+        }
+        const int32_t i   = *(const int32_t *) (p.idx + k*p.ib0 + q*p.ib1);
+        const char *  row = p.table + i*p.tb1 + q*p.tb2;
+        const float   m   = (float) *(const mask_t *) (p.mask + k*p.mb0 + q*p.mb1);
+        dst_t *       d   = (dst_t *) (p.dst + q*p.db1) + k;
+        const size_t  ds  = p.db2 / sizeof(dst_t);
+        if constexpr (vec4) {
+            for (int64_t h = 0; h < p.n_head; h += 4) {
+                const sycl::float4 b = *(const sycl::float4 *) (row + h*sizeof(float));
+                d[(h + 0)*ds] = (dst_t) (b.x() + m);
+                d[(h + 1)*ds] = (dst_t) (b.y() + m);
+                d[(h + 2)*ds] = (dst_t) (b.z() + m);
+                d[(h + 3)*ds] = (dst_t) (b.w() + m);
+            }
+        } else {
+            for (int64_t h = 0; h < p.n_head; ++h) {
+                d[h*ds] = (dst_t) (*(const float *) (row + h*p.tb0) + m);
+            }
+        }
+    });
+}
+
+template <typename mask_t, typename dst_t>
+static void rel_bias_mask_sycl(const ggml_sycl_rel_bias_mask_args & a, queue_ptr stream) {
+    const bool vec4 = a.n_head % 4 == 0 && a.tb0 == sizeof(float) && a.tb1 % 16 == 0 && a.tb2 % 16 == 0 &&
+                      (uintptr_t) a.table % 16 == 0;
+    if (vec4) {
+        rel_bias_mask_sycl<mask_t, dst_t, true>(a, stream);
+    } else {
+        rel_bias_mask_sycl<mask_t, dst_t, false>(a, stream);
+    }
+}
+
+void ggml_sycl_rel_bias_mask(const ggml_sycl_rel_bias_mask_args & a, queue_ptr stream) {
+    if (a.mask_f16) {
+        if (a.dst_f16) {
+            rel_bias_mask_sycl<sycl::half, sycl::half>(a, stream);
+        } else {
+            rel_bias_mask_sycl<sycl::half, float>(a, stream);
+        }
+    } else {
+        if (a.dst_f16) {
+            rel_bias_mask_sycl<float, sycl::half>(a, stream);
+        } else {
+            rel_bias_mask_sycl<float, float>(a, stream);
+        }
+    }
+}
+
 void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(dst->src[1]->type == GGML_TYPE_I32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_I32 );

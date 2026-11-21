@@ -6434,6 +6434,96 @@ static int ggml_sycl_fuse_l2_norm(ggml_backend_sycl_context & ctx, ggml_cgraph *
     return mul ? 2 : 1;
 }
 
+// GET_ROWS of a per-query bias table [n_head, n_dist, n_tok], PERMUTE to [n_kv, n_tok, n_head], ADD of the KQ mask (F16 mask cast first, sum cast to F16 after: optional).
+// The ADD reads the permuted bias at a stride of n_head floats; one kernel writes contiguous rows instead. Returns the number of nodes after i it took.
+static int ggml_sycl_fuse_rel_bias_mask(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    if (!g_ggml_sycl_enable_fusion || i + 3 >= cgraph->n_nodes) {
+        return 0;
+    }
+    // a cast lists itself as src[1], which counts as a use
+    const auto single_use = [&](int j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        return (t->flags & GGML_TENSOR_FLAG_COMPUTE) && !(t->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+               ggml_node_get_use_count(cgraph, j) - (t->src[1] == t) == 1;
+    };
+    ggml_tensor * gr = cgraph->nodes[i];
+    ggml_tensor * rs = cgraph->nodes[i + 1];
+    ggml_tensor * pm = cgraph->nodes[i + 2];
+    if (gr->op != GGML_OP_GET_ROWS || rs->op != GGML_OP_RESHAPE || rs->src[0] != gr || pm->op != GGML_OP_PERMUTE ||
+        pm->src[0] != rs || !single_use(i) || !single_use(i + 1) || !single_use(i + 2)) {
+        return 0;
+    }
+    int j = i + 3;
+    ggml_tensor * mc = nullptr;
+    if (cgraph->nodes[j]->op == GGML_OP_CPY) {
+        mc = cgraph->nodes[j];
+        if (mc->src[1] != mc || !single_use(j) || ++j >= cgraph->n_nodes) {
+            return 0;
+        }
+    }
+    ggml_tensor * add = cgraph->nodes[j];
+    if (add->op != GGML_OP_ADD || add->src[0] != pm || (mc && add->src[1] != mc) ||
+        !(add->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        return 0;
+    }
+    ggml_tensor * oc = nullptr;
+    if (j + 1 < cgraph->n_nodes && cgraph->nodes[j + 1]->op == GGML_OP_CPY && cgraph->nodes[j + 1]->src[0] == add &&
+        cgraph->nodes[j + 1]->src[1] == cgraph->nodes[j + 1] && cgraph->nodes[j + 1]->type == GGML_TYPE_F16 && single_use(j)) {
+        oc = cgraph->nodes[j + 1];
+    }
+    ggml_tensor *       out   = oc ? oc : add;
+    const ggml_tensor * table = gr->src[0];
+    const ggml_tensor * idx   = gr->src[1];
+    const ggml_tensor * mask  = mc ? mc->src[0] : add->src[1];
+    const int64_t       n_head = table->ne[0];
+    const int64_t       n_kv   = idx->ne[0];
+    const int64_t       n_tok  = idx->ne[1];
+    if (table->type != GGML_TYPE_F32 || table->ne[2] != n_tok || table->ne[3] != 1 || idx->type != GGML_TYPE_I32 ||
+        idx->ne[2] != 1 || idx->ne[3] != 1 || gr->type != GGML_TYPE_F32 || rs->ne[3] != 1 ||
+        pm->ne[0] != n_kv || pm->ne[1] != n_tok || pm->ne[2] != n_head || pm->ne[3] != 1 ||
+        pm->nb[0] != gr->nb[1] || pm->nb[1] != gr->nb[2] || pm->nb[2] != gr->nb[0]) {
+        return 0;
+    }
+    if (mask->ne[0] != n_kv || (mask->ne[1] != n_tok && mask->ne[1] != 1) || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+        mask->type != (mc ? GGML_TYPE_F16 : GGML_TYPE_F32) || (mc && (mc->type != GGML_TYPE_F32 || !ggml_are_same_shape(mc, mask)))) {
+        return 0;
+    }
+    if (add->type != GGML_TYPE_F32 || !ggml_are_same_shape(add, pm) || !ggml_is_contiguous(out) ||
+        (oc && !ggml_are_same_shape(oc, add))) {
+        return 0;
+    }
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    if (overlap(out, idx) || overlap(out, mask)) {
+        return 0;
+    }
+    // the output often gets the memory of the table, which the unfused graph had read by then: write the result to
+    // the GET_ROWS output (no longer needed, at least as large) and copy it over
+    char * dst = (char *) out->data;
+    if (overlap(out, table)) {
+        if (overlap(gr, table) || overlap(gr, idx) || overlap(gr, mask) || overlap(gr, out) || ggml_nbytes(gr) < ggml_nbytes(out)) {
+            return 0;
+        }
+        dst = (char *) gr->data;
+    }
+
+    const ggml_sycl_rel_bias_mask_args a = {
+        (const char *) table->data, (const char *) idx->data, (const char *) mask->data, dst,
+        n_head, n_kv, n_tok, table->nb[0], table->nb[1], table->nb[2], idx->nb[0], idx->nb[1],
+        mask->nb[0], mask->ne[1] == 1 ? 0 : mask->nb[1], out->nb[1], out->nb[2], mask->type == GGML_TYPE_F16, out->type == GGML_TYPE_F16,
+    };
+    scope_op_debug_print scope_dbg_print(__func__, out, /*num_src=*/2, " : rel bias mask");
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    ggml_sycl_rel_bias_mask(a, ctx.stream());
+    if (dst != out->data) {
+        SYCL_CHECK(CHECK_TRY_ERROR(ctx.stream()->memcpy(out->data, dst, ggml_nbytes(out))));
+    }
+    return (oc ? j + 1 : j) - i;
+}
+
 // true when the device MoE schedule may handle this MUL_MAT_ID: enabled, prefill, and an
 // f32/i32 layout it accepts; ggml_sycl_grouped_dequant_gemm_device decides type and width
 static bool ggml_sycl_mul_mat_id_device_sched_eligible(const ggml_tensor * dst) {
@@ -7507,6 +7597,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         if (node->op == GGML_OP_MUL || node->op == GGML_OP_L2_NORM) {
             const int skip = ggml_sycl_fuse_l2_norm(*sycl_ctx, cgraph, i);
+            if (skip > 0) {
+                i += skip;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_GET_ROWS) {
+            const int skip = ggml_sycl_fuse_rel_bias_mask(*sycl_ctx, cgraph, i);
             if (skip > 0) {
                 i += skip;
                 continue;
