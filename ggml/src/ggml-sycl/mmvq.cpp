@@ -2751,6 +2751,107 @@ static void launch_mul_mat_vec_q_moe(
     });
 }
 
+// NVFP4 MoE expert GEMV on f32 activations, in the stored block layout. Layout of the work after the NVFP4 expert
+// GEMV of trellis-serve (xpu/csrc/inkling2_ops.sycl, MIT): a lane owns one 16 value sub-block per step, a sub-group
+// keeps RP rows in flight, and an SLM table decodes a code byte to its two values.
+// Every (token, slot) pair is its own GEMV: with few tokens the experts rarely repeat, so sharing loads buys little.
+template <int RP, int NSG>
+static void mul_mat_vec_nvfp4_id_f32(const uint8_t * __restrict__ vx_base, const char * __restrict__ y_base,
+                                     const int32_t * __restrict__ ids_base, char * __restrict__ dst_base,
+                                     const ggml_sycl_nvfp4_id_args args, const size_t row_stride,
+                                     const sycl::float2 * __restrict__ lut, const sycl::nd_item<3> & item) {
+    const auto sg    = item.get_sub_group();
+    const int  lane  = sg.get_local_linear_id();
+    const int  token = item.get_group(1) / args.n_ids;
+    const int  slot  = item.get_group(1) % args.n_ids;
+    const int  n0    = (item.get_group(2) * NSG + sg.get_group_linear_id()) * RP;
+    const int  i02   = ids_base[(size_t) token * args.ids_token_stride + slot];
+    const int  nrows = args.nrows;
+
+    float * dst = (float *) (dst_base + (size_t) token * args.dst_token_stride + (size_t) slot * args.dst_row_stride);
+    if (n0 >= nrows) {
+        return;
+    }
+    if (i02 == -1) { // skipped slot
+        if (lane == 0) {
+            for (int p = 0; p < RP && n0 + p < nrows; ++p) {
+                dst[n0 + p] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    const float * y = (const float *) (y_base + (size_t) token * args.src1_token_stride + (size_t) slot * args.src1_row_stride);
+    const uint8_t * x[RP];
+#pragma unroll
+    for (int p = 0; p < RP; ++p) {
+        x[p] = vx_base + (size_t) i02 * args.expert_stride + (size_t) sycl::min(n0 + p, nrows - 1) * row_stride;
+    }
+
+    float acc[RP] = {};
+    const int n_sub = args.ncols / QK_NVFP4_SUB;
+    for (int g = lane; g < n_sub; g += WARP_SIZE) {
+        float ys[QK_NVFP4_SUB];
+#pragma unroll
+        for (int v = 0; v < QK_NVFP4_SUB / 4; ++v) {
+            const sycl::float4 t = *(const sycl::float4 *) (y + g * QK_NVFP4_SUB + 4 * v);
+            ys[4 * v + 0] = t.x();
+            ys[4 * v + 1] = t.y();
+            ys[4 * v + 2] = t.z();
+            ys[4 * v + 3] = t.w();
+        }
+        // sub-block g % 4 of block g / 4: scale byte d[g % 4], 8 code bytes at qs + 8 * (g % 4)
+        const int boff = (g / 4) * (int) sizeof(block_nvfp4);
+        const int s    = g % 4;
+#pragma unroll
+        for (int p = 0; p < RP; ++p) {
+            const uint8_t * b  = x[p] + boff;
+            const uint32_t  q0 = *(const uint32_t *) (b + 4 + 8 * s);
+            const uint32_t  q1 = *(const uint32_t *) (b + 8 + 8 * s);
+            float sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                // byte j holds value j in the low nibble and value j + 8 in the high nibble
+                const sycl::float2 w = lut[((j < 4 ? q0 : q1) >> (8 * (j % 4))) & 0xFF];
+                sum += w.x() * ys[j] + w.y() * ys[j + 8];
+            }
+            acc[p] += sum * ggml_sycl_ue4m3_to_fp32_fast(b[s]);
+        }
+    }
+
+#pragma unroll
+    for (int p = 0; p < RP; ++p) {
+        const float sum = sycl::reduce_over_group(sg, acc[p], sycl::plus<float>());
+        if (lane == 0 && n0 + p < nrows) {
+            dst[n0 + p] = sum;
+        }
+    }
+}
+
+void ggml_sycl_mul_mat_vec_nvfp4_id_f32(const void * vx_base, const float * y, const int32_t * ids, float * dst,
+                                        const ggml_sycl_nvfp4_id_args & args, dpct::queue_ptr stream) {
+    constexpr int RP  = 4;
+    constexpr int NSG = 8;
+
+    const size_t         row_stride = (size_t) (args.ncols / QK_NVFP4) * sizeof(block_nvfp4);
+    const int            n_tiles    = (args.nrows + NSG * RP - 1) / (NSG * RP);
+    const sycl::range<3> block_nums(1, (unsigned) (args.n_tokens * args.n_ids), (unsigned) n_tiles);
+    const sycl::range<3> block_dims(1, 1, NSG * WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<sycl::float2, 1> lut(sycl::range<1>(256), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                for (int i = item.get_local_linear_id(); i < 256; i += NSG * WARP_SIZE) {
+                    lut[i] = sycl::float2(kvalues_mxfp4[i & 0xF], kvalues_mxfp4[i >> 4]);
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+                mul_mat_vec_nvfp4_id_f32<RP, NSG>((const uint8_t *) vx_base, (const char *) y, ids, (char *) dst, args,
+                                                  row_stride, &lut[0], item);
+            });
+    });
+}
+
 bool ggml_sycl_mul_mat_vec_q_id_supports_type(enum ggml_type src0_type) {
     switch (src0_type) {
         case GGML_TYPE_Q4_0:
