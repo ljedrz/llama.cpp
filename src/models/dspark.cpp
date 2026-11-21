@@ -230,6 +230,8 @@ void llama_model_dflash::load_tensors_inkling2() {
     dspark_joint_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_JOINT_PROJ, "bias"), {3*rank}, 0);
     dspark_hidden_out = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT, "weight"), {rank, n_embd}, 0);
     dspark_hidden_out_b = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT, "bias"), {n_embd}, 0);
+    dspark_head_logits = create_tensor(tn(LLM_TENSOR_DSPARK_HEAD_LOGITS, "weight"), {rank, hparams.n_vocab_padded}, TENSOR_NOT_REQUIRED);
+    dspark_head_logits_b = create_tensor(tn(LLM_TENSOR_DSPARK_HEAD_LOGITS, "bias"), {hparams.n_vocab_padded}, dspark_head_logits ? 0 : TENSOR_NOT_REQUIRED);
     for (int i = 0; i < n_layer; ++i) {
         auto & l = layers[i];
         const int64_t hd = hparams.n_embd_head_k(i);
@@ -963,9 +965,15 @@ static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_mode
     auto * candidate = ggml_tanh(ctx0, chunk(1));
     state = ggml_add(ctx0, candidate, ggml_mul(ctx0, gate, ggml_sub(ctx0, state, candidate)));
     auto * latent = ggml_tanh(ctx0, chunk(2));
-    auto * correction = ggml_add(ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
-    auto * bias = g.build_lora_mm(target.output, correction, target.output_s);
-    ggml_prec_set_acc(bias, GGML_PREC_F32);
+    ggml_tensor * bias;
+    if (model.dspark_head_logits) {
+        // output . (hidden_out . latent + b) with the products of the weights folded, [n_vocab, rank] instead of [n_vocab, n_embd]
+        bias = ggml_add(ctx0, g.build_lora_mm(model.dspark_head_logits, latent), model.dspark_head_logits_b);
+    } else {
+        auto * correction = ggml_add(ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
+        bias = g.build_lora_mm(target.output, correction, target.output_s);
+        ggml_prec_set_acc(bias, GGML_PREC_F32);
+    }
     if (bias->ne[0] != base->ne[0]) {
         bias = ggml_cont(ctx0, ggml_view_2d(ctx0, bias, base->ne[0], bias->ne[1], bias->nb[1], 0));
     }
