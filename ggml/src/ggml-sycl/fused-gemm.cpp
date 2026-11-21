@@ -404,6 +404,7 @@ template <> struct fg_block_traits<block_q3_K>    { static constexpr int qk = QK
 template <> struct fg_block_traits<block_q4_K>    { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_q5_K>    { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_q6_K>    { static constexpr int qk = QK_K; };
+template <> struct fg_block_traits<block_nvfp4>   { static constexpr int qk = QK_NVFP4; };
 
 // The A stages below are the dequantize_block_iq* kernels rewritten for one k step. There a
 // work-item handled one quarter (il) of one 32-wide sub-block (ib); here one lane produces the
@@ -687,6 +688,24 @@ static __dpct_inline__ void fg_decode_q6_K(const uint8_t * __restrict__ ql, cons
         const int   q0 = (((q[l] >> (4 * (r / 2))) & 0xF) | (((hb[l] >> (2 * r)) & 3) << 4)) - 32;
         const int   q1 = (((q[l + 1] >> (4 * (r / 2))) & 0xF) | (((hb[l + 1] >> (2 * r)) & 3) << 4)) - 32;
         a[j] = E::make(dl * q0, dl * q1);
+    }
+}
+
+// nvfp4: k step kb is sub-blocks 2 * (kb % 2) and + 1 of block kb / 2. A 16 value sub-block keeps
+// values 0..7 in the low nibbles of its 8 bytes and values 8..15 in the high nibbles.
+template <typename E>
+static __dpct_inline__ void fg_stage_a(const block_nvfp4 * __restrict__ xrow, const int kb, typename E::pair * a) {
+    const block_nvfp4 * blk = xrow + kb / 2;
+#pragma unroll
+    for (int s = 0; s < 2; ++s) {
+        const int       sub = 2 * (kb % 2) + s;
+        const float     d   = ggml_sycl_ue4m3_to_fp32_fast(blk->d[sub]);
+        const uint8_t * q   = blk->qs + sub * (QK_NVFP4_SUB / 2);
+#pragma unroll
+        for (int j = 0; j < QK_NVFP4_SUB / 2; j += 2) {
+            a[8 * s + j / 2]     = E::make(d * kvalues_mxfp4[q[j] & 0xf], d * kvalues_mxfp4[q[j + 1] & 0xf]);
+            a[8 * s + j / 2 + 4] = E::make(d * kvalues_mxfp4[q[j] >> 4], d * kvalues_mxfp4[q[j + 1] >> 4]);
+        }
     }
 }
 
@@ -1057,12 +1076,12 @@ static void grouped_gemm_pack_b(const float * y, typename S::tsb * packed, const
     });
 }
 
-// q8_0 and the k-quants take only the grouped path. The plain kernel decodes A again for every BN columns
+// q8_0, the k-quants and nvfp4 take only the grouped path. The plain kernel decodes A again for every BN columns
 // of a dense batch, and for these formats that costs more than the one dequantization of the library GEMM.
 template <typename T> static constexpr bool fg_plain_ok() {
     return !std::is_same_v<T, block_q8_0> && !std::is_same_v<T, block_q2_K> && !std::is_same_v<T, block_q3_K> &&
            !std::is_same_v<T, block_q4_K> && !std::is_same_v<T, block_q5_K> &&
-           !std::is_same_v<T, block_q6_K>;
+           !std::is_same_v<T, block_q6_K> && !std::is_same_v<T, block_nvfp4>;
 }
 
 template <typename T, bool R> struct fg_tag {
@@ -1100,6 +1119,7 @@ template <typename F> static bool fg_visit_type(ggml_type type, bool reordered, 
         case GGML_TYPE_Q4_K:    return fg_visit_layout<block_q4_K>(reordered, f);
         case GGML_TYPE_Q5_K:    return fg_visit_layout<block_q5_K>(reordered, f);
         case GGML_TYPE_Q6_K:    return fg_visit_layout<block_q6_K>(reordered, f);
+        case GGML_TYPE_NVFP4:   return fg_visit_layout<block_nvfp4>(reordered, f);
         default:                return false;
     }
 }
