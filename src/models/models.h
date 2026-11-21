@@ -2697,6 +2697,9 @@ struct llama_model_inkling2 : public llama_model_base {
         std::map<ggml_tensor *, ggml_tensor *>                rms_cache;
         std::map<std::vector<ggml_tensor *>, ggml_tensor *> stack_cache;
 
+        // the looped layers share the padded relative-position bias of a layer
+        std::map<ggml_tensor *, ggml_tensor *> rel_bias_cache;
+
         std::map<int64_t, ggml_tensor *> zero_sinks; // by head count
     };
 

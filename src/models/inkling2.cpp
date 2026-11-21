@@ -342,10 +342,13 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     ggml_tensor * inputs[3] = {cur, cur, cur};
     if (layer.attn_res_query) {
         ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
-        for (int j = 0; j < 3; ++j) {
+        if (mixed->ne[1] == 1) {
             // a SWA layer mixes one input for Q, K and V
-            inputs[j] = is_swa && j > 0 ? inputs[0] :
-                ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], j*mixed->nb[1]));
+            inputs[0] = inputs[1] = inputs[2] = ggml_reshape_2d(ctx0, mixed, n_embd, n_tokens);
+        } else {
+            for (int j = 0; j < 3; ++j) {
+                inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], j*mixed->nb[1]));
+            }
         }
     }
 
@@ -398,7 +401,11 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
-        ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+        ggml_tensor *& rel_bias = rel_bias_cache[layer.attn_rel_bias];
+        if (!rel_bias) {
+            rel_bias = ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0);
+        }
+        ggml_tensor * table = ggml_mul_mat(ctx0, rel_bias, Rcur);
 
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
         table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
