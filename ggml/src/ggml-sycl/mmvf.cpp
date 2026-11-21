@@ -197,3 +197,67 @@ bool ggml_sycl_mul_mat_vec_f(ggml_backend_sycl_context & ctx, const ggml_tensor 
     }
     return true;
 }
+
+// a sub-group per row r: f = wf[r].g and u = wu[r].g, then dst = (x - tanh(f)*x) + tanh(u)*m
+template <int NCOLS>
+static void gate_mix_f32_kernel(const ggml_sycl_gate_mix_args a, const sycl::nd_item<3> & item) {
+    const auto    sg   = item.get_sub_group();
+    const int     lane = sg.get_local_linear_id();
+    const int64_t row  = (int64_t) item.get_group(2) * MMVF_NSG + sg.get_group_linear_id();
+    if (row >= a.nrows) {
+        return;
+    }
+    const float * wf = (const float *) (a.wf + row * a.nb_w);
+    const float * wu = (const float *) (a.wu + row * a.nb_w);
+
+    float accf[NCOLS] = {};
+    float accu[NCOLS] = {};
+    for (int64_t k = 4 * lane; k < a.k; k += 4 * WARP_SIZE) {
+        const sycl::float4 f = *(const sycl::float4 *) (wf + k);
+        const sycl::float4 u = *(const sycl::float4 *) (wu + k);
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            const sycl::float4 g = *(const sycl::float4 *) ((const float *) (a.g + j * a.nb_g) + k);
+            accf[j] += f.x() * g.x() + f.y() * g.y() + f.z() * g.z() + f.w() * g.w();
+            accu[j] += u.x() * g.x() + u.y() * g.y() + u.z() * g.z() + u.w() * g.w();
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        const float f = sycl::reduce_over_group(sg, accf[j], sycl::plus<float>());
+        const float u = sycl::reduce_over_group(sg, accu[j], sycl::plus<float>());
+        if (lane == j % WARP_SIZE) {
+            const float x = *((const float *) (a.x + j * a.nb_x) + row);
+            const float m = *((const float *) (a.m + j * a.nb_m) + row);
+            *((float *) (a.dst + j * a.nb_d) + row) = (x - sycl::tanh(f) * x) + sycl::tanh(u) * m;
+        }
+    }
+}
+
+template <int NCOLS> static void launch_gate_mix_f32(const ggml_sycl_gate_mix_args & a, dpct::queue_ptr stream) {
+    const sycl::range<3> block_dims(1, 1, MMVF_NSG * WARP_SIZE);
+    const sycl::range<3> block_nums(1, 1, (a.nrows + MMVF_NSG - 1) / MMVF_NSG);
+    stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             gate_mix_f32_kernel<NCOLS>(a, item);
+                         });
+}
+
+bool ggml_sycl_gate_mix_f32_supported(int64_t k, int64_t ncols) {
+    return k % (4 * WARP_SIZE) == 0 && ncols >= 1 && ncols <= MMVF_MAX_COLS;
+}
+
+void ggml_sycl_gate_mix_f32(const ggml_sycl_gate_mix_args & a, dpct::queue_ptr stream) {
+    switch (a.ncols) {
+        case 1: launch_gate_mix_f32<1>(a, stream); break;
+        case 2: launch_gate_mix_f32<2>(a, stream); break;
+        case 3: launch_gate_mix_f32<3>(a, stream); break;
+        case 4: launch_gate_mix_f32<4>(a, stream); break;
+        case 5: launch_gate_mix_f32<5>(a, stream); break;
+        case 6: launch_gate_mix_f32<6>(a, stream); break;
+        case 7: launch_gate_mix_f32<7>(a, stream); break;
+        case 8: launch_gate_mix_f32<8>(a, stream); break;
+        default: GGML_ABORT("unsupported column count %d", (int) a.ncols);
+    }
+}

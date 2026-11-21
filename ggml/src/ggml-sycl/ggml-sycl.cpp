@@ -5936,6 +5936,91 @@ static int ggml_sycl_fuse_nvfp4_moe(ggml_backend_sycl_context & ctx, ggml_cgraph
     return (int) ops.size() - 1;
 }
 
+static bool ggml_sycl_is_view_or_noop(const ggml_tensor * t);
+
+// A gate of two F32 MUL_MATs on one input g at node i, the form of the Inkling 2 loop controllers:
+//   (x - tanh(wf*g)*x) + tanh(wu*g)*m
+// as MUL_MAT(wf), TANH, MUL, SUB, MUL_MAT(wu), TANH, MUL, ADD, with views between them. Runs them as one kernel and
+// returns the number of nodes after i it took, 0 when the pattern does not match.
+static int ggml_sycl_fuse_gate_mix(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    constexpr int n_ops = 8;
+    static const ggml_op ops[n_ops] = { GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL,   GGML_OP_SUB,
+                                        GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL,   GGML_OP_ADD };
+    if (!g_ggml_sycl_enable_fusion) {
+        return 0;
+    }
+    int           idx[n_ops];
+    ggml_tensor * t[n_ops];
+    for (int j = 0, k = i; j < n_ops; ++j, ++k) {
+        while (k < cgraph->n_nodes && ggml_sycl_is_view_or_noop(cgraph->nodes[k]) && k - i < 2 * n_ops) {
+            ++k;
+        }
+        if (k >= cgraph->n_nodes || cgraph->nodes[k]->op != ops[j]) {
+            return 0;
+        }
+        idx[j] = k;
+        t[j]   = cgraph->nodes[k];
+    }
+    ggml_tensor * mf  = t[0];
+    ggml_tensor * mu  = t[4];
+    ggml_tensor * out = t[7];
+    const ggml_tensor * g = mf->src[1];
+    const ggml_tensor * x = t[2]->src[1];
+    const ggml_tensor * m = t[6]->src[1];
+    if (ggml_get_unary_op(t[1]) != GGML_UNARY_OP_TANH || ggml_get_unary_op(t[5]) != GGML_UNARY_OP_TANH ||
+        t[1]->src[0] != mf || t[2]->src[0] != t[1] || t[3]->src[0] != x || t[3]->src[1] != t[2] || mu->src[1] != g ||
+        t[5]->src[0] != mu || t[6]->src[0] != t[5] || t[7]->src[0] != t[3] || t[7]->src[1] != t[6]) {
+        return 0;
+    }
+    const ggml_tensor * wf = mf->src[0];
+    const ggml_tensor * wu = mu->src[0];
+    const int64_t       k  = wf->ne[0];
+    const int64_t       nr = wf->ne[1];
+    const int64_t       nc = g->ne[1];
+    if (wf->type != GGML_TYPE_F32 || wu->type != GGML_TYPE_F32 || !ggml_are_same_shape(wf, wu) || wf->nb[1] != wu->nb[1] ||
+        !ggml_is_contiguous(wf) || !ggml_is_contiguous(wu) || wf->ne[2] != 1 || wf->ne[3] != 1 ||
+        !ggml_sycl_gate_mix_f32_supported(k, nc) || (uintptr_t) wf->data % 16 || (uintptr_t) wu->data % 16 ||
+        wf->nb[1] % 16 || ggml_backend_buffer_is_sycl_split(wf->buffer) || ggml_backend_buffer_is_sycl_split(wu->buffer)) {
+        return 0;
+    }
+    if (g->type != GGML_TYPE_F32 || g->ne[0] != k || g->ne[2] != 1 || g->ne[3] != 1 || g->nb[0] != sizeof(float) ||
+        (uintptr_t) g->data % 16 || g->nb[1] % 16) {
+        return 0;
+    }
+    // x, m and the output: [nr, nc] F32 with contiguous rows
+    for (const ggml_tensor * v : { x, m, (const ggml_tensor *) out }) {
+        if (v->type != GGML_TYPE_F32 || v->ne[0] != nr || v->ne[1] != nc || v->ne[2] != 1 || v->ne[3] != 1 ||
+            v->nb[0] != sizeof(float)) {
+            return 0;
+        }
+    }
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idx, n_ops, ops, &idx[n_ops - 1], 1)) {
+        return 0;
+    }
+    // the allocator may give out the memory of g, x or m once the graph without the fusion had read them; a lane
+    // reads x and m at the element it writes, so only an exact alias of those is safe
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    const auto same = [&](const ggml_tensor * a) {
+        return a->data == out->data && a->nb[1] == out->nb[1];
+    };
+    if (overlap(out, g) || (overlap(out, x) && !same(x)) || (overlap(out, m) && !same(m))) {
+        return 0;
+    }
+
+    const ggml_sycl_gate_mix_args a = {
+        (const char *) wf->data, (const char *) wu->data, (const char *) g->data, (const char *) x->data,
+        (const char *) m->data, (char *) out->data, k, nr, nc, wf->nb[1], g->nb[1], x->nb[1], m->nb[1], out->nb[1],
+    };
+    scope_op_debug_print scope_dbg_print(__func__, out, /*num_src=*/2, " : gate mix");
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    ggml_sycl_gate_mix_f32(a, ctx.stream());
+    return idx[n_ops - 1] - i;
+}
+
 // true when the device MoE schedule may handle this MUL_MAT_ID: enabled, prefill, and an
 // f32/i32 layout it accepts; ggml_sycl_grouped_dequant_gemm_device decides type and width
 static bool ggml_sycl_mul_mat_id_device_sched_eligible(const ggml_tensor * dst) {
@@ -7019,6 +7104,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 #endif
+        if (node->op == GGML_OP_MUL_MAT) {
+            const int skip = ggml_sycl_fuse_gate_mix(*sycl_ctx, cgraph, i);
+            if (skip > 0) {
+                i += skip;
+                continue;
+            }
+        }
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int skip = ggml_sycl_fuse_nvfp4_moe(*sycl_ctx, cgraph, i);
             if (skip > 0) {
