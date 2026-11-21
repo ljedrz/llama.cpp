@@ -261,3 +261,122 @@ void ggml_sycl_gate_mix_f32(const ggml_sycl_gate_mix_args & a, dpct::queue_ptr s
         default: GGML_ABORT("unsupported column count %d", (int) a.ncols);
     }
 }
+
+// a work-group per (query, token): the scores of the states, their softmax, and the weighted sum of the states
+// a work-item keeps EPT values of each state in registers, so the states are read once
+static constexpr int DEPTH_MIX_NTH = 512;
+static constexpr int DEPTH_MIX_EPT = 6;
+
+template <int NS>
+static void depth_mix_f32_kernel(const ggml_sycl_depth_mix_args a, float * partial, const sycl::nd_item<3> & item) {
+    constexpr int nsg  = DEPTH_MIX_NTH / WARP_SIZE;
+    const auto    sg   = item.get_sub_group();
+    const int     tid  = item.get_local_linear_id();
+    const int     lane = sg.get_local_linear_id();
+    const int     isg  = sg.get_group_linear_id();
+    const int64_t q    = item.get_group(2) % a.nq;
+    const int64_t t    = item.get_group(2) / a.nq;
+
+    const float * qv = (const float *) (a.query + q * a.nb_q1);
+
+    float v[NS][DEPTH_MIX_EPT];
+    float score[NS] = {};
+#pragma unroll
+    for (int s = 0; s < NS; ++s) {
+        if (s < a.ns) {
+            const float * st = s < a.ns - 1 ? (const float *) (a.prev + s * a.nb_p1 + t * a.nb_p2) :
+                                              (const float *) (a.last + t * a.nb_l2);
+#pragma unroll
+            for (int i = 0; i < DEPTH_MIX_EPT; ++i) {
+                const int64_t e = tid + i * DEPTH_MIX_NTH;
+                v[s][i] = e < a.n ? st[e] : 0.0f;
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < DEPTH_MIX_EPT; ++i) {
+        const int64_t e  = tid + i * DEPTH_MIX_NTH;
+        const float   qe = e < a.n ? qv[e] : 0.0f;
+#pragma unroll
+        for (int s = 0; s < NS; ++s) {
+            if (s < a.ns) {
+                score[s] += qe * v[s][i];
+            }
+        }
+    }
+    // the scores of the sub-groups, then their sums in every work-item
+#pragma unroll
+    for (int s = 0; s < NS; ++s) {
+        if (s < a.ns) {
+            score[s] = sycl::reduce_over_group(sg, score[s], sycl::plus<float>());
+            if (lane == 0) {
+                partial[isg * NS + s] = score[s];
+            }
+        }
+    }
+    sycl::group_barrier(item.get_group());
+    float smax = -INFINITY;
+#pragma unroll
+    for (int s = 0; s < NS; ++s) {
+        if (s < a.ns) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < nsg; ++j) {
+                sum += partial[j * NS + s];
+            }
+            score[s] = sum * a.scale;
+            smax     = sycl::fmax(smax, score[s]);
+        }
+    }
+    float ssum = 0.0f;
+#pragma unroll
+    for (int s = 0; s < NS; ++s) {
+        if (s < a.ns) {
+            score[s] = sycl::exp(score[s] - smax);
+            ssum += score[s];
+        }
+    }
+    const float inv = 1.0f / ssum;
+
+    float * dst = (float *) (a.dst + q * a.nb_d1 + t * a.nb_d2);
+#pragma unroll
+    for (int i = 0; i < DEPTH_MIX_EPT; ++i) {
+        const int64_t e = tid + i * DEPTH_MIX_NTH;
+        if (e < a.n) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int s = 0; s < NS; ++s) {
+                if (s < a.ns) {
+                    acc += v[s][i] * (score[s] * inv);
+                }
+            }
+            dst[e] = acc;
+        }
+    }
+}
+
+bool ggml_sycl_depth_mix_f32_supported(int64_t n, int64_t ns) {
+    return n <= (int64_t) DEPTH_MIX_NTH * DEPTH_MIX_EPT && ns >= 1 && ns <= 16;
+}
+
+void ggml_sycl_depth_mix_f32(const ggml_sycl_depth_mix_args & a, dpct::queue_ptr stream) {
+    const sycl::range<3> block_dims(1, 1, DEPTH_MIX_NTH);
+    const sycl::range<3> block_nums(1, 1, a.nq * a.nt);
+    const auto           launch = [&](auto ns) {
+        constexpr int NS = decltype(ns)::value;
+        stream->submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<float, 1> partial(sycl::range<1>(DEPTH_MIX_NTH / WARP_SIZE * NS), cgh);
+            cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                             [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                 depth_mix_f32_kernel<NS>(a, get_pointer(partial), item);
+                             });
+        });
+    };
+    if (a.ns <= 4) {
+        launch(std::integral_constant<int, 4>());
+    } else if (a.ns <= 8) {
+        launch(std::integral_constant<int, 8>());
+    } else {
+        launch(std::integral_constant<int, 16>());
+    }
+}

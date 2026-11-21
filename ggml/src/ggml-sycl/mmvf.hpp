@@ -25,4 +25,19 @@ struct ggml_sycl_gate_mix_args {
 bool ggml_sycl_gate_mix_f32_supported(int64_t k, int64_t ncols);
 void ggml_sycl_gate_mix_f32(const ggml_sycl_gate_mix_args & a, dpct::queue_ptr stream);
 
+// attention over ns states of n values with nq learned queries, for nt tokens: the states are ns - 1 rows of prev and
+// one of last, dst[:, q, t] = sum_s softmax_s(scale * query[:, q].state[s, t]) state[s, t]. Strides are in bytes.
+struct ggml_sycl_depth_mix_args {
+    const char * prev;
+    const char * last;
+    const char * query;
+    char *       dst;
+    int64_t      n, ns, nq, nt;
+    float        scale;
+    size_t       nb_p1, nb_p2, nb_l2, nb_q1, nb_d1, nb_d2;
+};
+
+bool ggml_sycl_depth_mix_f32_supported(int64_t n, int64_t ns);
+void ggml_sycl_depth_mix_f32(const ggml_sycl_depth_mix_args & a, dpct::queue_ptr stream);
+
 #endif // GGML_SYCL_MMVF_HPP

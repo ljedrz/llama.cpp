@@ -6078,6 +6078,116 @@ static int ggml_sycl_fuse_ssm_conv_residual(ggml_backend_sycl_context & ctx, ggm
     return 0;
 }
 
+// Attention over a stack of states with learned queries at the CONCAT of node i, the form of the Inkling 2 depth mixing:
+//   states = CONCAT(prev, last) along dim 1, scores = query.states, SOFT_MAX, then states^T as a CONT of a TRANSPOSE
+//   times the weights; with one query the scores are MUL_MAT(query, states) and a RESHAPE, with more
+//   MUL_MAT(states, REPEAT(query)).
+// Runs them as one kernel and returns the number of nodes after i it took, 0 when the pattern does not match.
+static int ggml_sycl_fuse_depth_mix(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * c = cgraph->nodes[i];
+    if (!g_ggml_sycl_enable_fusion || c->op != GGML_OP_CONCAT || ggml_get_op_params_i32(c, 0) != 1 ||
+        c->type != GGML_TYPE_F32 || c->ne[3] != 1 || !ggml_sycl_depth_mix_f32_supported(c->ne[0], c->ne[1])) {
+        return 0;
+    }
+    const ggml_tensor * prev = c->src[0];
+    const ggml_tensor * last = c->src[1];
+    for (const ggml_tensor * t : { prev, last }) {
+        if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float) || t->ne[0] != c->ne[0] || t->ne[2] != c->ne[2] ||
+            t->ne[3] != 1) {
+            return 0;
+        }
+    }
+    if (last->ne[1] != 1) {
+        return 0;
+    }
+
+    // the nodes after the CONCAT, views included
+    std::vector<int>     idx = { i };
+    std::vector<ggml_op> ops = { GGML_OP_CONCAT };
+    std::vector<int>     compute;
+    for (int k = i + 1; k < cgraph->n_nodes && compute.size() < 5 && k - i < 16; ++k) {
+        ggml_tensor * t = cgraph->nodes[k];
+        idx.push_back(k);
+        ops.push_back(t->op);
+        if (!ggml_sycl_is_view_or_noop(t)) {
+            compute.push_back(k);
+        }
+    }
+    const auto node = [&](size_t j) { return j < compute.size() ? cgraph->nodes[compute[j]] : nullptr; };
+    // src through views only
+    const auto via_views = [](const ggml_tensor * t, const ggml_tensor * src) {
+        while (t && t != src && t->view_src && ggml_sycl_is_view_or_noop(t)) {
+            t = t->src[0];
+        }
+        return t == src;
+    };
+
+    ggml_tensor * ct = node(0);
+    if (!ct || ct->op != GGML_OP_CONT || ct->src[0]->op != GGML_OP_TRANSPOSE || ct->src[0]->src[0] != c) {
+        return 0;
+    }
+    const bool    multi = node(1) && node(1)->op == GGML_OP_REPEAT;
+    ggml_tensor * sc    = node(multi ? 2 : 1);
+    ggml_tensor * sm    = node(multi ? 3 : 2);
+    ggml_tensor * o     = node(multi ? 4 : 3);
+    if (!o || sc->op != GGML_OP_MUL_MAT || sm->op != GGML_OP_SOFT_MAX || o->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    const ggml_tensor * query;
+    if (multi) {
+        query = node(1)->src[0];
+        if (sc->src[0] != c || sc->src[1] != node(1)) {
+            return 0;
+        }
+    } else {
+        query = sc->src[0];
+        if (sc->src[1] != c || query->ne[1] != 1) {
+            return 0;
+        }
+    }
+    if (!via_views(sm->src[0], sc) || sm->src[1] || sm->src[2] || ggml_get_op_params_f32(sm, 1) != 0.0f ||
+        o->src[0] != ct || o->src[1] != sm) {
+        return 0;
+    }
+    const int64_t nq = query->ne[1];
+    if (query->type != GGML_TYPE_F32 || query->ne[0] != c->ne[0] || query->nb[0] != sizeof(float) || query->ne[2] != 1 ||
+        o->type != GGML_TYPE_F32 || o->ne[0] != c->ne[0] || o->ne[1] != nq || o->ne[2] != c->ne[2] ||
+        o->nb[0] != sizeof(float)) {
+        return 0;
+    }
+
+    const int n = (int) (std::find(idx.begin(), idx.end(), compute[multi ? 4 : 3]) - idx.begin()) + 1;
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idx.data(), n, ops.data(), &idx[n - 1], 1)) {
+        return 0;
+    }
+    // A work-group reads all its states before the reductions and then each value of a state at the index it writes,
+    // so the output may alias a state row of its own token: last with the same layout, or with one work-group a row of
+    // prev. Other work-groups may still read the states while one writes.
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    const bool one_wg   = nq == 1 && c->ne[2] == 1;
+    const bool ok_last  = !overlap(o, last) || (nq == 1 && o->data == last->data && o->nb[2] == last->nb[2]);
+    const bool ok_prev  = !overlap(o, prev) ||
+                          (one_wg && (char *) o->data >= (char *) prev->data &&
+                           ((char *) o->data - (char *) prev->data) % prev->nb[1] == 0);
+    if (!ok_last || !ok_prev) {
+        return 0;
+    }
+
+    const ggml_sycl_depth_mix_args a = {
+        (const char *) prev->data, (const char *) last->data, (const char *) query->data, (char *) o->data,
+        c->ne[0], c->ne[1], nq, c->ne[2], ggml_get_op_params_f32(sm, 0),
+        prev->nb[1], prev->nb[2], last->nb[2], query->nb[1], o->nb[1], o->nb[2],
+    };
+    scope_op_debug_print scope_dbg_print(__func__, o, /*num_src=*/2, " : depth mix");
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    ggml_sycl_depth_mix_f32(a, ctx.stream());
+    return idx[n - 1] - i;
+}
+
 // true when the device MoE schedule may handle this MUL_MAT_ID: enabled, prefill, and an
 // f32/i32 layout it accepts; ggml_sycl_grouped_dequant_gemm_device decides type and width
 static bool ggml_sycl_mul_mat_id_device_sched_eligible(const ggml_tensor * dst) {
@@ -7144,6 +7254,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 #endif
         if (node->op == GGML_OP_MUL_MAT) {
             const int skip = ggml_sycl_fuse_gate_mix(*sycl_ctx, cgraph, i);
+            if (skip > 0) {
+                i += skip;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_CONCAT) {
+            const int skip = ggml_sycl_fuse_depth_mix(*sycl_ctx, cgraph, i);
             if (skip > 0) {
                 i += skip;
                 continue;
