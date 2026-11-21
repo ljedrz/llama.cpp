@@ -6510,13 +6510,20 @@ static int ggml_sycl_fuse_rel_bias_mask(ggml_backend_sycl_context & ctx, ggml_cg
         return 0;
     }
     // the output often gets the memory of the table, which the unfused graph had read by then: write the result to
-    // the GET_ROWS output (no longer needed, at least as large) and copy it over
+    // the GET_ROWS or the ADD output (neither is needed any more) and copy it over
     char * dst = (char *) out->data;
     if (overlap(out, table)) {
-        if (overlap(gr, table) || overlap(gr, idx) || overlap(gr, mask) || overlap(gr, out) || ggml_nbytes(gr) < ggml_nbytes(out)) {
+        dst = nullptr;
+        for (const ggml_tensor * t : { (const ggml_tensor *) gr, (const ggml_tensor *) add }) {
+            if (t != out && !overlap(t, table) && !overlap(t, idx) && !overlap(t, mask) && !overlap(t, out) &&
+                ggml_nbytes(t) >= ggml_nbytes(out)) {
+                dst = (char *) t->data;
+                break;
+            }
+        }
+        if (!dst) {
             return 0;
         }
-        dst = (char *) gr->data;
     }
 
     const ggml_sycl_rel_bias_mask_args a = {
