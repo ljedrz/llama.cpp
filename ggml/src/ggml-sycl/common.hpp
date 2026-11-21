@@ -98,6 +98,7 @@ enum ggml_sycl_xmx_gather_type {
     GGML_SYCL_XMX_GATHER_Q6_K     = 1 << 12,
     GGML_SYCL_XMX_GATHER_Q2_K     = 1 << 13,
     GGML_SYCL_XMX_GATHER_Q3_K     = 1 << 14,
+    GGML_SYCL_XMX_GATHER_NVFP4    = 1 << 15,
 };
 static constexpr int GGML_SYCL_XMX_GATHER_TYPES_DEFAULT = ~0;
 extern int g_ggml_sycl_xmx_gather_types;
@@ -1199,6 +1200,12 @@ static T block_reduce(T val, T * shared_vals, int block_size_template) {
         return block_reduce_policy<reduce_method_t, T, warp_size>::reduce(tmp);
     }
     return val;
+}
+
+// ggml_sycl_ue4m3_to_fp32() with the exponent built in the float bits, no pow
+static __dpct_inline__ float ggml_sycl_ue4m3_to_fp32_fast(uint8_t x) {
+    const uint32_t e = (x >> 3) & 0xF;
+    return x == 0x7F ? 0.0f : e ? sycl::bit_cast<float>(((e + 119) << 23) | ((uint32_t) (x & 7) << 20)) : (x & 7) * 0x1p-10f;
 }
 
 static __dpct_inline__ float ggml_sycl_ue4m3_to_fp32(uint8_t x) {
