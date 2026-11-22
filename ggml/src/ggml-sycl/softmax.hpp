@@ -18,6 +18,8 @@
 #define SYCL_SOFT_MAX_BLOCK_SIZE 1024
 
 void ggml_sycl_op_soft_max(ggml_backend_sycl_context &ctx, ggml_tensor *dst);
+// the same, with the result written as F16 to dst16 instead of dst (dst can still serve as scratch for long rows)
+void ggml_sycl_op_soft_max_f16(ggml_backend_sycl_context & ctx, ggml_tensor * dst, sycl::half * dst16);
 
 void ggml_sycl_op_soft_max_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 

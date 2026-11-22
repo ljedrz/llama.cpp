@@ -6540,6 +6540,48 @@ static int ggml_sycl_fuse_rel_bias_mask(ggml_backend_sycl_context & ctx, ggml_cg
     return (oc ? j + 1 : j) - i;
 }
 
+// SOFT_MAX whose only consumer is the batched F16 mat-mul (KQV over the V cache): that path converts src1 to F16 first,
+// so the softmax writes F16 into the buffer the conversion would have used. Returns the number of nodes after i it took.
+static int ggml_sycl_fuse_soft_max_mul_mat(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    if (!g_ggml_sycl_enable_fusion) {
+        return 0;
+    }
+    ggml_tensor * sm = cgraph->nodes[i];
+    int           j  = i + 1;
+    while (j < cgraph->n_nodes && ggml_sycl_is_view_or_noop(cgraph->nodes[j])) {
+        ++j;
+    }
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor *       mm   = cgraph->nodes[j];
+    const ggml_tensor * src0 = mm->src[0];
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != sm || !(mm->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+        (sm->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1) {
+        return 0;
+    }
+    // the conditions under which ggml_sycl_mul_mat takes the batched path for this pair
+    if (sm->type != GGML_TYPE_F32 || !ggml_is_contiguous(sm) || sm->ne[1] <= 8 || sm->ne[2] * sm->ne[3] <= 1 ||
+        src0->type != GGML_TYPE_F16 || ggml_is_transposed(src0) || ggml_backend_buffer_is_sycl_split(src0->buffer) ||
+        mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) ||
+        ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return 0;
+    }
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    ggml_sycl_pool_alloc<sycl::half> sm_f16(ctx.pool(), ggml_nelements(sm));
+    ggml_sycl_op_soft_max_f16(ctx, sm, sm_f16.get());
+
+    ggml_tensor sm16 = *sm;
+    sm16.type  = GGML_TYPE_F16;
+    sm16.data  = sm_f16.get();
+    sm16.nb[0] = sizeof(sycl::half);
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        sm16.nb[d] = sm16.nb[d - 1] * sm16.ne[d - 1];
+    }
+    ggml_sycl_mul_mat_batched_sycl(ctx, src0, &sm16, mm);
+    return j - i;
+}
+
 // true when the device MoE schedule may handle this MUL_MAT_ID: enabled, prefill, and an
 // f32/i32 layout it accepts; ggml_sycl_grouped_dequant_gemm_device decides type and width
 static bool ggml_sycl_mul_mat_id_device_sched_eligible(const ggml_tensor * dst) {
@@ -7632,6 +7674,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         if (node->op == GGML_OP_MUL || node->op == GGML_OP_L2_NORM) {
             const int skip = ggml_sycl_fuse_l2_norm(*sycl_ctx, cgraph, i);
+            if (skip > 0) {
+                i += skip;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_SOFT_MAX) {
+            const int skip = ggml_sycl_fuse_soft_max_mul_mat(*sycl_ctx, cgraph, i);
             if (skip > 0) {
                 i += skip;
                 continue;
