@@ -6639,8 +6639,14 @@ static int ggml_sycl_fuse_soft_max_mul_mat(ggml_backend_sycl_context & ctx, ggml
         (sm->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1) {
         return 0;
     }
-    // the conditions under which ggml_sycl_mul_mat takes the batched path for this pair
-    if (sm->type != GGML_TYPE_F32 || !ggml_is_contiguous(sm) || sm->ne[1] <= 8 || sm->ne[2] * sm->ne[3] <= 1 ||
+    // the conditions under which ggml_sycl_mul_mat takes the batched path for this pair: one column goes to the p021 or
+    // vec_nc kernels; 2-8 columns to mmvf unless it declines (see ggml_sycl_mul_mat_vec_f)
+    const int64_t ncols         = sm->ne[1];
+    const bool    mmvf_declines = !g_ggml_sycl_mmvf || ggml_is_contiguous(src0) || ggml_nbytes(src0) > 4*1024*1024;
+    if (ncols < 2 || (ncols <= 8 && !mmvf_declines)) {
+        return 0;
+    }
+    if (sm->type != GGML_TYPE_F32 || !ggml_is_contiguous(sm) || sm->ne[2] * sm->ne[3] <= 1 ||
         src0->type != GGML_TYPE_F16 || ggml_is_transposed(src0) || ggml_backend_buffer_is_sycl_split(src0->buffer) ||
         mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) ||
         ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
