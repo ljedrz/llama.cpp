@@ -40,6 +40,14 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst);
 
 size_t ggml_sycl_flash_attn_ext_get_alloc_size(const ggml_tensor * dst);
 
+// the indexed bias of a flash attention node (src[6], src[7]): bias[kv, q, h] = table[pos[kv, q], h, q]
+struct ggml_sycl_fattn_rel_bias {
+    const char *    table = nullptr;  // null: no bias
+    const int32_t * pos   = nullptr;
+    int64_t         tb1 = 0, tb2 = 0; // table strides in bytes (along the head and the query); distances are contiguous
+    int64_t         pb0 = 0, pb1 = 0; // pos strides in elements (along kv and the query)
+};
+
 void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
 #endif // GGML_SYCL_FATTN_HPP

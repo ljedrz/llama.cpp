@@ -21,6 +21,7 @@
 #include "fattn-onednn.hpp"
 #include "fattn-sparse.hpp"
 #include "fattn-dpas.hpp"
+#include "getrows.hpp"
 
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
     {                                                                                                            \
@@ -102,10 +103,12 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_ONEDNN   = 150, // oneDNN SDPA: native F16 (PR #25222)
     BEST_FATTN_KERNEL_TILE     = 200,
     BEST_FATTN_KERNEL_MKL      = 300,
+    BEST_FATTN_KERNEL_REL_MASK = 400, // relative-position bias: the per-head mask materialized, then a kernel that takes it
 };
 
 
-static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+// head_mask_ok: a per-head mask (ne[2] > 1) may go to the kernels that index it (VEC, TILE, MKL)
+static best_fattn_kernel ggml_sycl_get_best_fattn_kernel_impl(const int device, const ggml_tensor * dst, const bool head_mask_ok) {
 #ifndef SYCL_FLASH_ATTN
     GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
@@ -247,7 +250,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
     // VEC and TILE take per-head masks, but without XMX and GQA grouping they lose to the path without flash attention
     // (prompts at long context 3x slower), so auto flash attention should not pick them unless asked to
-    if (mask && mask->ne[2] != 1 && !g_ggml_sycl_fa_head_mask) {
+    if (mask && mask->ne[2] != 1 && !head_mask_ok) {
         return BEST_FATTN_KERNEL_NONE;
     }
 
@@ -298,6 +301,103 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
+// a shallow copy of a node with a relative-position bias that takes the materialized per-head mask instead
+static ggml_tensor ggml_sycl_fattn_rel_mask_node(const ggml_tensor * dst, ggml_tensor & mask_h, void * data) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * mask = dst->src[3];
+    mask_h       = mask ? *mask : ggml_tensor{};
+    mask_h.type  = GGML_TYPE_F16;
+    mask_h.ne[0] = dst->src[1]->ne[1];
+    mask_h.ne[1] = Q->ne[1];
+    mask_h.ne[2] = Q->ne[2];
+    mask_h.ne[3] = 1;
+    mask_h.nb[0] = 2;
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        mask_h.nb[i] = mask_h.nb[i - 1] * mask_h.ne[i - 1];
+    }
+    mask_h.data     = data;
+    mask_h.view_src = nullptr;
+
+    ggml_tensor node = *dst;
+    node.src[3] = &mask_h;
+    node.src[6] = nullptr;
+    node.src[7] = nullptr;
+    ggml_set_op_params_i32(&node, 5, 0);
+    return node;
+}
+
+// indexed bias (src[6], src[7]): only kernels that apply it or take the materialized per-head mask, never
+// DPAS, oneDNN, the sparse gather or the grouped TILE variants, which would ignore it
+static best_fattn_kernel ggml_sycl_get_best_fattn_kernel_rel(const int device, const ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    float max_bias = 0.0f, logit_softcap = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (!g_ggml_sycl_enable_flash_attention || !g_ggml_sycl_fa_rel || max_bias != 0.0f || dst->src[5] ||
+        (mask && (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1)) || Q->ne[3] != 1 || K->ne[3] != 1) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
+    // MKL applies the bias in its softmax: prompts over long caches
+    const int  gqa_ratio = Q->ne[2] / K->ne[2];
+    const bool f16_kv    = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+                           K->nb[1] % (K->ne[0] * 2) == 0 && V->nb[1] % (V->ne[0] * 2) == 0;
+    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && f16_kv && gqa_ratio >= 2 && Q->ne[0] >= 64 && Q->ne[0] <= 512 &&
+        Q->ne[0] % 64 == 0 && Q->ne[0] == V->ne[0] && Q->ne[1] >= 32 && K->ne[1] >= 1024 && logit_softcap == 0.0f) {
+        return BEST_FATTN_KERNEL_MKL;
+    }
+
+    ggml_tensor       mask_h;
+    const ggml_tensor node = ggml_sycl_fattn_rel_mask_node(dst, mask_h, nullptr);
+    const auto        k    = ggml_sycl_get_best_fattn_kernel_impl(device, &node, true);
+    return (k == BEST_FATTN_KERNEL_VEC || k == BEST_FATTN_KERNEL_TILE || k == BEST_FATTN_KERNEL_MKL) ?
+               BEST_FATTN_KERNEL_REL_MASK : BEST_FATTN_KERNEL_NONE;
+}
+
+static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+    if (ggml_flash_attn_ext_has_indexed_bias(dst)) {
+        return ggml_sycl_get_best_fattn_kernel_rel(device, dst);
+    }
+    return ggml_sycl_get_best_fattn_kernel_impl(device, dst, g_ggml_sycl_fa_head_mask);
+}
+
+static void ggml_sycl_flash_attn_ext_run(ggml_backend_sycl_context & ctx, ggml_tensor * dst, best_fattn_kernel fk);
+
+// writes mask + bias as an F16 per-head mask into the pool, then runs the kernel the normal selector picks for it
+static void ggml_sycl_flash_attn_ext_rel_mask(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * table = dst->src[6];
+    const ggml_tensor * pos   = dst->src[7];
+    const int64_t n_kv = dst->src[1]->ne[1], n_tok = Q->ne[1], n_head = Q->ne[2];
+
+    ggml_sycl_pool_alloc<sycl::half> buf(ctx.pool(), n_kv * n_tok * n_head);
+    ggml_tensor mask_h;
+    ggml_tensor node = ggml_sycl_fattn_rel_mask_node(dst, mask_h, buf.get());
+
+    // without a mask, the bias goes over a zero mask: an all-zero F16 row of n_kv
+    ggml_sycl_pool_alloc<sycl::half> zero(ctx.pool());
+    const char * m_data = mask ? (const char *) mask->data : nullptr;
+    size_t       m_nb1  = mask ? mask->nb[1] : 0;
+    if (!mask) {
+        zero.alloc(n_kv);
+        ctx.stream()->memset(zero.get(), 0, n_kv * sizeof(sycl::half));
+        m_data = (const char *) zero.get();
+    }
+    const ggml_sycl_rel_bias_mask_args a = {
+        (const char *) table->data, (const char *) pos->data, m_data, (char *) buf.get(),
+        n_head, n_kv, n_tok, table->nb[1], table->nb[0], table->nb[2], pos->nb[0], pos->nb[1],
+        sizeof(sycl::half), m_nb1, mask_h.nb[1], mask_h.nb[2], true, true,
+    };
+    ggml_sycl_rel_bias_mask(a, ctx.stream());
+
+    ggml_sycl_flash_attn_ext_run(ctx, &node, ggml_sycl_get_best_fattn_kernel_impl(ctx.device, &node, true));
+}
+
 void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_sycl_set_device(ctx.device);
 
@@ -318,7 +418,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
     }
 
     // sparse nodes are gathered down to n_kv_max rows and re-dispatched here
-    if (ggml_sycl_flash_attn_ext_sparse(ctx, dst)) {
+    if (!ggml_flash_attn_ext_has_indexed_bias(dst) && ggml_sycl_flash_attn_ext_sparse(ctx, dst)) {
         return;
     }
 
@@ -354,30 +454,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
                 (long long)V_dbg->ne[1]);
     }
 
-    const best_fattn_kernel fk = ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst);
-    switch (fk) {
-        case BEST_FATTN_KERNEL_NONE:
-            GGML_ABORT("Not support Flash-Attention");
-        case BEST_FATTN_KERNEL_ONEDNN:
-            // guarded: ggml_sycl_flash_attn_ext_onednn() is only defined under GGML_SYCL_DNNL;
-            // the reference must be compiled out here or the GGML_SYCL_DNNL=0 build fails to link.
-#if GGML_SYCL_DNNL
-            ggml_sycl_flash_attn_ext_onednn(ctx, dst);
-#endif
-            break;
-        case BEST_FATTN_KERNEL_TILE:
-            ggml_sycl_flash_attn_ext_tile(ctx, dst);
-            break;
-        case BEST_FATTN_KERNEL_VEC:
-            ggml_sycl_flash_attn_ext_vec(ctx, dst);
-            break;
-        case BEST_FATTN_KERNEL_DPAS:
-            ggml_sycl_flash_attn_ext_dpas(ctx, dst);
-            break;
-        case BEST_FATTN_KERNEL_MKL:
-            ggml_sycl_flash_attn_ext_mkl(ctx, dst);
-            break;
-    }
+    ggml_sycl_flash_attn_ext_run(ctx, dst, ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst));
 
     // --- Output fingerprint (GGML_SYCL_MKL_FA_DIAG=1) ---
     // Copy first 64 float output values to host for fingerprinting.
@@ -423,6 +500,35 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
         }
     }
 
+}
+
+static void ggml_sycl_flash_attn_ext_run(ggml_backend_sycl_context & ctx, ggml_tensor * dst, best_fattn_kernel fk) {
+    switch (fk) {
+        case BEST_FATTN_KERNEL_NONE:
+            GGML_ABORT("Not support Flash-Attention");
+        case BEST_FATTN_KERNEL_ONEDNN:
+            // guarded: ggml_sycl_flash_attn_ext_onednn() is only defined under GGML_SYCL_DNNL;
+            // the reference must be compiled out here or the GGML_SYCL_DNNL=0 build fails to link.
+#if GGML_SYCL_DNNL
+            ggml_sycl_flash_attn_ext_onednn(ctx, dst);
+#endif
+            break;
+        case BEST_FATTN_KERNEL_TILE:
+            ggml_sycl_flash_attn_ext_tile(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_VEC:
+            ggml_sycl_flash_attn_ext_vec(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_DPAS:
+            ggml_sycl_flash_attn_ext_dpas(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_MKL:
+            ggml_sycl_flash_attn_ext_mkl(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_REL_MASK:
+            ggml_sycl_flash_attn_ext_rel_mask(ctx, dst);
+            break;
+    }
 }
 
 bool ggml_sycl_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
