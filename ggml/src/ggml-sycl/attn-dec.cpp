@@ -17,7 +17,7 @@ template <typename F> struct attn_dec_kernel {
 
 // one work-group per (chunk of n_kv, KV head): the scores of the NQ query vectors of that head over the chunk, their
 // max and exp-sum, and the unnormalized sum of V rows weighted by them, written as a partial for the combine kernel
-template <int D, int NQ, typename mask_t>
+template <int D, int NQ, typename mask_t, bool VROWS>
 static void attn_dec_chunk(const ggml_sycl_attn_dec_args a, const int C, float * part, float * slm,
                            const sycl::nd_item<3> & item) {
     constexpr int NI = D / (WARP_SIZE * 8);  // 16-byte K loads per lane and row
@@ -84,11 +84,18 @@ static void attn_dec_chunk(const ggml_sycl_attn_dec_args a, const int C, float *
     // the mask, then max and exp-sum per query; a chunk that is masked out entirely gets weight 0 (max -inf, sum 0)
     for (int j = sgi; j < NQ; j += ATTN_DEC_NSG) {
         const char * mrow = a.mask ? a.mask + c0 * a.m_nb0 + (j / G) * a.m_nb1 + ((hkv * G + j % G) % a.mask_heads) * a.m_nb2 : nullptr;
+        const float *   rt = a.rel_table ? (const float *) (a.rel_table + (hkv * G + j % G) * a.r_tb1 + (j / G) * a.r_tb2) : nullptr;
+        const int32_t * rp = a.rel_table ? a.rel_pos + c0 * a.r_pb0 + (j / G) * a.r_pb1 : nullptr;
         float m = -INFINITY;
         for (int kk = lane; kk < cn; kk += WARP_SIZE) {
             float s = sc[j * C + kk];
             if (mrow) {
                 s += (float) *(const mask_t *) (mrow + kk * a.m_nb0);
+            }
+            if (rt) {
+                s += rt[rp[kk * a.r_pb0]];
+            }
+            if (mrow || rt) {
                 sc[j * C + kk] = s;
             }
             m = sycl::max(m, s);
@@ -109,6 +116,68 @@ static void attn_dec_chunk(const ggml_sycl_attn_dec_args a, const int C, float *
     }
     item.barrier(sycl::access::fence_space::local_space);
 
+    if constexpr (VROWS) {
+        // V rows per position (flash attention layout): a lane owns 2 output values, S sub-groups cover a row and the
+        // PG groups of them take every PG-th position, 8 positions per iteration so their loads overlap
+        constexpr int S  = D / (2 * WARP_SIZE);
+        constexpr int PG = ATTN_DEC_NSG / S;
+        constexpr int U  = 8;
+        static_assert(PG == 1 || PG == 2, "position groups");
+        const int    pgrp = sgi / S;
+        const int    d    = (sgi % S) * 2 * WARP_SIZE + lane * 2;
+        const char * vb   = a.v + hkv * a.v_nb2 + c0 * a.v_nb1 + d * sizeof(sycl::half);
+        float acc[NQ][2] = {};
+        for (int kk0 = pgrp; kk0 < cn; kk0 += PG * U) {
+            uint32_t vv[U];
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int kk = sycl::min(kk0 + u * PG, cn - 1);
+                vv[u] = *(const uint32_t *) (vb + kk * a.v_nb1);
+            }
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int kk = kk0 + u * PG;
+                if (kk < cn) {
+                    const float w0 = (float) sycl::bit_cast<sycl::half>((uint16_t) (vv[u] & 0xffff));
+                    const float w1 = (float) sycl::bit_cast<sycl::half>((uint16_t) (vv[u] >> 16));
+#pragma unroll
+                    for (int j = 0; j < NQ; ++j) {
+                        const float p = sc[j * C + kk];
+                        acc[j][0] += w0 * p;
+                        acc[j][1] += w1 * p;
+                    }
+                }
+            }
+        }
+        if constexpr (PG == 2) {
+            // the second position group hands its sums to the first through local memory (NQ*D <= NQ*C)
+            item.barrier(sycl::access::fence_space::local_space);
+            if (pgrp == 1) {
+#pragma unroll
+                for (int j = 0; j < NQ; ++j) {
+                    sc[j * D + d]     = acc[j][0];
+                    sc[j * D + d + 1] = acc[j][1];
+                }
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+            if (pgrp == 0) {
+#pragma unroll
+                for (int j = 0; j < NQ; ++j) {
+                    acc[j][0] += sc[j * D + d];
+                    acc[j][1] += sc[j * D + d + 1];
+                }
+            }
+        }
+        if (pgrp == 0) {
+#pragma unroll
+            for (int j = 0; j < NQ; ++j) {
+                const int64_t h = hkv * G + j % G;
+                float *       o = part + ((split * a.n_head + h) * a.n_tok + j / G) * (D + 2);
+                o[d]     = acc[j][0];
+                o[d + 1] = acc[j][1];
+            }
+        }
+    } else {
     // the weighted sum of V: V^T rows are contiguous in kv, 8 positions per lane, ATTN_DEC_R rows per pass
     const char * vb = a.v + hkv * a.v_nb2 + c0 * sizeof(sycl::half);
     constexpr int rows_sg = D / ATTN_DEC_NSG;
@@ -148,6 +217,7 @@ static void attn_dec_chunk(const ggml_sycl_attn_dec_args a, const int C, float *
                 }
             }
         }
+    }
     }
     if (item.get_local_linear_id() < NQ) {
         const int     j = (int) item.get_local_linear_id();
@@ -196,10 +266,10 @@ static void attn_dec_combine(const ggml_sycl_attn_dec_args a, const int64_t n_sp
     for (int64_t s = 0; s < n_split; ++s) {
         acc += w[s] * p0[s * stride + lid];
     }
-    a.dst[(h * a.n_tok + t) * D + lid] = acc / l;
+    a.dst[h * a.o_h + t * a.o_t + lid] = acc / l;
 }
 
-template <int D, int NQ, typename mask_t>
+template <int D, int NQ, typename mask_t, bool VROWS>
 static void attn_dec_launch(ggml_backend_sycl_context & ctx, const ggml_sycl_attn_dec_args & a) {
     // chunks of a multiple of 128 positions, about 2048 work-groups over the KV heads
     const int64_t c_slm   = ((int64_t) ggml_sycl_info().devices[ctx.device].smpbo / sizeof(float) - 2 * NQ) / NQ / 128 * 128;
@@ -218,7 +288,7 @@ static void attn_dec_launch(ggml_backend_sycl_context & ctx, const ggml_sycl_att
         stream->submit([&](sycl::handler & cgh) {
             sycl::local_accessor<float, 1> slm(sycl::range<1>(NQ * C + 2 * NQ), cgh);
             auto f = [=](sycl::nd_item<3> item) {
-                attn_dec_chunk<D, NQ, mask_t>(p, Ci, part_d, slm.get_multi_ptr<sycl::access::decorated::no>().get(),
+                attn_dec_chunk<D, NQ, mask_t, VROWS>(p, Ci, part_d, slm.get_multi_ptr<sycl::access::decorated::no>().get(),
                                               item);
             };
             cgh.parallel_for(sycl::nd_range<3>(grid * block, block), attn_dec_kernel<decltype(f)>{ f });
@@ -236,18 +306,18 @@ static void attn_dec_launch(ggml_backend_sycl_context & ctx, const ggml_sycl_att
     }
 }
 
-template <int D, typename mask_t>
+template <int D, typename mask_t, bool VROWS>
 static bool attn_dec_switch_nq(ggml_backend_sycl_context & ctx, const ggml_sycl_attn_dec_args & a, int64_t nq) {
     switch (nq) {
-        case 1:  attn_dec_launch<D, 1, mask_t>(ctx, a);  return true;
-        case 2:  attn_dec_launch<D, 2, mask_t>(ctx, a);  return true;
-        case 3:  attn_dec_launch<D, 3, mask_t>(ctx, a);  return true;
-        case 4:  attn_dec_launch<D, 4, mask_t>(ctx, a);  return true;
-        case 6:  attn_dec_launch<D, 6, mask_t>(ctx, a);  return true;
-        case 8:  attn_dec_launch<D, 8, mask_t>(ctx, a);  return true;
-        case 9:  attn_dec_launch<D, 9, mask_t>(ctx, a);  return true;
-        case 12: attn_dec_launch<D, 12, mask_t>(ctx, a); return true;
-        case 16: attn_dec_launch<D, 16, mask_t>(ctx, a); return true;
+        case 1:  attn_dec_launch<D, 1, mask_t, VROWS>(ctx, a);  return true;
+        case 2:  attn_dec_launch<D, 2, mask_t, VROWS>(ctx, a);  return true;
+        case 3:  attn_dec_launch<D, 3, mask_t, VROWS>(ctx, a);  return true;
+        case 4:  attn_dec_launch<D, 4, mask_t, VROWS>(ctx, a);  return true;
+        case 6:  attn_dec_launch<D, 6, mask_t, VROWS>(ctx, a);  return true;
+        case 8:  attn_dec_launch<D, 8, mask_t, VROWS>(ctx, a);  return true;
+        case 9:  attn_dec_launch<D, 9, mask_t, VROWS>(ctx, a);  return true;
+        case 12: attn_dec_launch<D, 12, mask_t, VROWS>(ctx, a); return true;
+        case 16: attn_dec_launch<D, 16, mask_t, VROWS>(ctx, a); return true;
         default: return false;
     }
 }
@@ -260,10 +330,18 @@ bool ggml_sycl_attn_dec_supported(int64_t D, int64_t nq) {
 void ggml_sycl_attn_dec(ggml_backend_sycl_context & ctx, const ggml_sycl_attn_dec_args & a) {
     const int64_t nq = a.n_tok * (a.n_head / a.n_head_kv);
     bool          ok = false;
-    if (a.D == 128) {
-        ok = a.mask_f16 ? attn_dec_switch_nq<128, sycl::half>(ctx, a, nq) : attn_dec_switch_nq<128, float>(ctx, a, nq);
+    if (a.v_rows) {
+        // flash attention: the mask is F16
+        GGML_ASSERT(!a.mask || a.mask_f16);
+        if (a.D == 128) {
+            ok = attn_dec_switch_nq<128, sycl::half, true>(ctx, a, nq);
+        } else if (a.D == 256) {
+            ok = attn_dec_switch_nq<256, sycl::half, true>(ctx, a, nq);
+        }
+    } else if (a.D == 128) {
+        ok = a.mask_f16 ? attn_dec_switch_nq<128, sycl::half, false>(ctx, a, nq) : attn_dec_switch_nq<128, float, false>(ctx, a, nq);
     } else if (a.D == 256) {
-        ok = a.mask_f16 ? attn_dec_switch_nq<256, sycl::half>(ctx, a, nq) : attn_dec_switch_nq<256, float>(ctx, a, nq);
+        ok = a.mask_f16 ? attn_dec_switch_nq<256, sycl::half, false>(ctx, a, nq) : attn_dec_switch_nq<256, float, false>(ctx, a, nq);
     }
     GGML_ASSERT(ok);
 }
