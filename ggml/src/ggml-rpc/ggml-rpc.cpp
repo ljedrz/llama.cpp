@@ -3113,7 +3113,10 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
+    // the remote backend may not apply the relative-position bias of flash attention, and this side cannot ask yet
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[6] != nullptr) {
+        return false;
+    }
     //TODO: call the remote backend and cache the results
     return true;
 }
