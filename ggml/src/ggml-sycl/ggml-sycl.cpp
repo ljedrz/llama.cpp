@@ -112,7 +112,7 @@ int g_ggml_sycl_fa_onednn_max_kv = 0;
 int g_ggml_sycl_enable_mkl_fa = 1;
 int g_ggml_sycl_fa_dpas = 1;
 int g_ggml_sycl_fa_head_mask = 0;
-int g_ggml_sycl_fa_rel = 0;
+int g_ggml_sycl_fa_rel = 1;
 int g_ggml_sycl_memtrace = 0;
 int g_ggml_sycl_memtrace_step = 64;
 int g_ggml_sycl_enable_vmm = 1;
@@ -453,7 +453,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_enable_mkl_fa = ggml_sycl_get_env("GGML_SYCL_ENABLE_MKL_FA", 1);
         g_ggml_sycl_fa_dpas = ggml_sycl_get_env("GGML_SYCL_FA_DPAS", 1);
         g_ggml_sycl_fa_head_mask = ggml_sycl_get_env("GGML_SYCL_FA_HEAD_MASK", 0);
-        g_ggml_sycl_fa_rel = ggml_sycl_get_env("GGML_SYCL_FA_REL", 0);
+        g_ggml_sycl_fa_rel = ggml_sycl_get_env("GGML_SYCL_FA_REL", 1);
         g_ggml_sycl_memtrace = ggml_sycl_get_env("GGML_SYCL_MEMTRACE", 0);
         g_ggml_sycl_memtrace_step = ggml_sycl_get_env("GGML_SYCL_MEMTRACE_STEP", 64);
         g_ggml_sycl_enable_vmm = ggml_sycl_get_env("GGML_SYCL_ENABLE_VMM", 1);
@@ -6644,6 +6644,9 @@ static int ggml_sycl_fuse_attn_dec(ggml_backend_sycl_context & ctx, ggml_cgraph 
     a.m_nb2      = mask ? mask->nb[2] : 0;
     a.scale      = scale;
     a.mask_f16   = mask && mask->type == GGML_TYPE_F16;
+    a.v_rows     = false;
+    a.o_t        = D;
+    a.o_h        = D * n_tok;
     scope_op_debug_print scope_dbg_print(__func__, kqv, /*num_src=*/2, " : attn dec");
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
     ggml_sycl_attn_dec(ctx, a);

@@ -15006,6 +15006,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 2056, 3, 129, false));
     test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 2048, 256, 1025, true));
+    // other token counts, head sizes and GQA ratios of the few-token kernel: 6, 4, 3, 16 and 12 query vectors per KV head
+    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 2056, 2, 1025, true));
+    test_cases.emplace_back(new test_flash_attn_ext_rel(256, 4, 4, 2056, 1, 513, true));
+    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 4, 1, 2056, 3, 1025, true));
+    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 4, 4, 2056, 4, 1025, false));
+    test_cases.emplace_back(new test_flash_attn_ext_rel(256, 4, 4, 2056, 3, 513, true));
 
     // attention without flash attention for a few tokens: GQA 3 with per-head and shared masks, other head sizes and ratios
     for (int64_t n_tok : { 1, 2, 3 }) {
