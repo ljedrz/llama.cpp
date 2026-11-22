@@ -4707,6 +4707,82 @@ struct test_add_unary_mul : public test_case {
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
+// attention without flash attention as the graph builds it: MUL_MAT(K, q) -> SOFT_MAX(mask, sinks) -> MUL_MAT(V^T, p),
+// with GQA and a mask that is per head or shared, which backends may run as one kernel for a few tokens
+struct test_attn_kq_softmax_kqv : public test_case {
+    const int64_t   hs, n_kv, n_tok, n_head_kv, gqa, mask_heads;
+    const ggml_type type_mask;
+    const bool      sinks;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ATTN_KQ_SOFTMAX_KQV";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    std::string vars() override {
+        return VARS_TO_STR8(hs, n_kv, n_tok, n_head_kv, gqa, mask_heads, type_mask, sinks);
+    }
+
+    test_attn_kq_softmax_kqv(int64_t hs = 128, int64_t n_kv = 2056, int64_t n_tok = 3, int64_t n_head_kv = 8, int64_t gqa = 3,
+                             int64_t mask_heads = 24, ggml_type type_mask = GGML_TYPE_F32, bool sinks = true)
+        : hs(hs), n_kv(n_kv), n_tok(n_tok), n_head_kv(n_head_kv), gqa(gqa), mask_heads(mask_heads), type_mask(type_mask), sinks(sinks) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_head = n_head_kv * gqa;
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, n_tok, n_head);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hs, n_kv, n_head_kv);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_kv, hs, n_head_kv);
+        ggml_set_name(v, "v");
+        ggml_tensor * m = ggml_new_tensor_3d(ctx, type_mask, n_kv, n_tok, mask_heads);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
+        ggml_tensor * p  = ggml_soft_max_ext(ctx, kq, m, 1.0f/sqrtf((float) hs), 0.0f);
+        if (sinks) {
+            ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_head);
+            ggml_set_name(s, "s");
+            ggml_soft_max_add_sinks(p, s);
+        }
+        ggml_tensor * out = ggml_mul_mat(ctx, v, p);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else if (strcmp(t->name, "m") == 0) {
+                // a bias plus a masked tail that differs by head and token, long enough to cover whole chunks
+                std::vector<float> data(ggml_nelements(t));
+                for (int64_t h = 0; h < t->ne[2]; ++h) {
+                    for (int64_t i = 0; i < t->ne[1]; ++i) {
+                        const int64_t n_vis = n_kv - (n_kv/3)*(h % 3) - 7*i;
+                        for (int64_t j = 0; j < t->ne[0]; ++j) {
+                            data[(h*t->ne[1] + i)*t->ne[0] + j] = j < n_vis ? 0.25f*((j + 5*i + 3*h) % 9 - 4) : -INFINITY;
+                        }
+                    }
+                }
+                if (t->type == GGML_TYPE_F16) {
+                    std::vector<ggml_fp16_t> d16(data.size());
+                    ggml_fp32_to_fp16_row(data.data(), d16.data(), data.size());
+                    ggml_backend_tensor_set(t, d16.data(), 0, d16.size()*sizeof(ggml_fp16_t));
+                } else {
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_snake_fuse : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;   // [T, C, D2, D3]
@@ -13306,6 +13382,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // attention without flash attention for a few tokens: GQA 3 with per-head and shared masks, other head sizes and ratios
+    for (int64_t n_tok : { 1, 2, 3 }) {
+        for (int64_t mask_heads : { 24, 1 }) {
+            test_cases.emplace_back(new test_attn_kq_softmax_kqv(128, 2056, n_tok, 8, 3, mask_heads, GGML_TYPE_F32, true));
+        }
+    }
+    test_cases.emplace_back(new test_attn_kq_softmax_kqv(128, 2056, 3, 8, 3, 24, GGML_TYPE_F16, true));
+    test_cases.emplace_back(new test_attn_kq_softmax_kqv(128, 4096, 1, 8, 3, 24, GGML_TYPE_F32, false));
+    test_cases.emplace_back(new test_attn_kq_softmax_kqv(256, 2056, 1, 4, 4, 1,  GGML_TYPE_F16, false));
+    test_cases.emplace_back(new test_attn_kq_softmax_kqv(128, 2056, 3, 4, 1, 4,  GGML_TYPE_F32, true));
+    // the other query vector counts per KV head: 1, 2, 8, 12, 16
+    test_cases.emplace_back(new test_attn_kq_softmax_kqv(128, 2056, 1, 4, 1, 4,  GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_attn_kq_softmax_kqv(128, 2056, 2, 4, 1, 1,  GGML_TYPE_F16, false));
+    test_cases.emplace_back(new test_attn_kq_softmax_kqv(128, 2056, 2, 8, 4, 32, GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_attn_kq_softmax_kqv(128, 2056, 4, 8, 3, 24, GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_attn_kq_softmax_kqv(128, 2056, 4, 8, 4, 1,  GGML_TYPE_F16, true));
 
     // per-head masks (a relative-position bias folded into the mask, e.g. Inkling 2): 24 Q heads over 8 KV heads
     for (int kv : { 1024, 4096, }) {
