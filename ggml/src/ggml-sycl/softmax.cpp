@@ -47,6 +47,7 @@ static void soft_max_f32(const float *         x,
                          const T *             mask,
                          const float *         sinks,
                          float *               dst,
+                         sycl::half *          dst16,
                          const soft_max_params p,
                          uint8_t *             dpct_local) {
     auto      item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -77,6 +78,7 @@ static void soft_max_f32(const float *         x,
     x    += int64_t(rowx)*ncols;
     mask += (i11*p.nb11 + i12*p.nb12 + i13*p.nb13) / sizeof(T) * (mask != nullptr);
     dst  += int64_t(rowx)*ncols;
+    dst16 += dst16 ? int64_t(rowx)*ncols : 0;
 
     const int warp_id = item_ct1.get_local_id(2) / WARP_SIZE;
     const int lane_id = item_ct1.get_local_id(2) % WARP_SIZE;
@@ -166,7 +168,11 @@ static void soft_max_f32(const float *         x,
             return;
         }
 
-        dst[col] = vals[col] * inv_sum;
+        if (dst16) {
+            dst16[col] = (sycl::half) (vals[col] * inv_sum);
+        } else {
+            dst[col] = vals[col] * inv_sum;
+        }
     }
 }
 #ifdef __clang__
@@ -201,6 +207,7 @@ static void launch_soft_max_kernels(const float *           x,
                                     const T *               mask,
                                     const float *           sinks,
                                     float *                 dst,
+                                    sycl::half *            dst16,
                                     const soft_max_params & p,
                                     dpct::queue_ptr         stream,
                                     dpct::dim3              block_dims,
@@ -220,7 +227,7 @@ static void launch_soft_max_kernels(const float *           x,
                     [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
                         WARP_SIZE)]] {
                         soft_max_f32<true, ncols, block>(
-                            x, mask, sinks, dst, p,
+                            x, mask, sinks, dst, dst16, p,
                             dpct_local_acc_ct1
                                 .get_multi_ptr<sycl::access::decorated::no>()
                                 .get());
@@ -246,7 +253,7 @@ static void launch_soft_max_kernels(const float *           x,
             [=](sycl::nd_item<3> item_ct1)
                 [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                     soft_max_f32<true, 0, 0>(
-                        x, mask, sinks, dst, p,
+                        x, mask, sinks, dst, dst16, p,
                         dpct_local_acc_ct1
                             .get_multi_ptr<sycl::access::decorated::no>()
                             .get());
@@ -257,7 +264,7 @@ static void launch_soft_max_kernels(const float *           x,
 
 template <typename T>
 static void soft_max_f32_sycl(const float *x, const T *mask,
-                              const float *sinks, float *dst,
+                              const float *sinks, float *dst, sycl::half *dst16,
                               const soft_max_params &params,
                               dpct::queue_ptr stream, int device) {
     int nth = WARP_SIZE;
@@ -277,7 +284,7 @@ static void soft_max_f32_sycl(const float *x, const T *mask,
 
     if (nbytes_shared <= smpbo && ncols_x <= max_block_size) {
         launch_soft_max_kernels<32, 64, 128, 256, 512, 1024, 2048, 4096>(
-            x, mask, sinks, dst, params, stream, block_dims, block_nums,
+            x, mask, sinks, dst, dst16, params, stream, block_dims, block_nums,
             nbytes_shared);
     } else {
         const size_t nbytes_shared_low = WARP_SIZE * sizeof(float);
@@ -291,7 +298,7 @@ static void soft_max_f32_sycl(const float *x, const T *mask,
                 [=](sycl::nd_item<3> item_ct1)
                     [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                     soft_max_f32<false, 0, 0>(
-                        x, mask, sinks, dst, params,
+                        x, mask, sinks, dst, dst16, params,
                         dpct_local_acc_ct1
                             .get_multi_ptr<sycl::access::decorated::no>()
                             .get());
@@ -318,8 +325,8 @@ static void soft_max_back_f32_sycl(const float *   grad,
                          });
 }
 
-void ggml_sycl_op_soft_max(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
-    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
+void ggml_sycl_op_soft_max_f16(ggml_backend_sycl_context & ctx, ggml_tensor * dst, sycl::half * dst16) {
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2, dst16 ? " : f16 out" : "");
 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -387,12 +394,16 @@ void ggml_sycl_op_soft_max(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 
     if (use_f16) {
         soft_max_f32_sycl(src0_d, (const sycl::half *)src1_d,
-                          (const float *)src2_d, dst_d, params, stream,
+                          (const float *)src2_d, dst_d, dst16, params, stream,
                           ctx.device);
     } else {
         soft_max_f32_sycl(src0_d, (const float *)src1_d, (const float *)src2_d,
-                          dst_d, params, stream, ctx.device);
+                          dst_d, dst16, params, stream, ctx.device);
     }
+}
+
+void ggml_sycl_op_soft_max(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    ggml_sycl_op_soft_max_f16(ctx, dst, nullptr);
 }
 
 void ggml_sycl_op_soft_max_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
