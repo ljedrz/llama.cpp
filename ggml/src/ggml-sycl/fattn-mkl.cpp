@@ -131,6 +131,7 @@ static void mkl_fa_online_softmax_chunk(
     int kvh_head,
     const sycl::half * mask_data, int64_t mask_head_stride,
     int64_t mask_row_stride, int mask_n_heads,
+    const ggml_sycl_fattn_rel_bias & rel,
     float logit_softcap, int64_t wg_size,
     const sycl::event & dep_event) {
 
@@ -164,6 +165,9 @@ static void mkl_fa_online_softmax_chunk(
                     mask_h   = mask_data + (int64_t)m_head * mask_head_stride;
                     m_stride = mask_row_stride;
                 }
+                // relative-position bias of this query and head: table[rel_pos[kv, q_row], h, q_row]
+                const float *   rel_t = rel.table ? (const float *) (rel.table + (int64_t) (kvh_head + gqa_group) * rel.tb1 + q_row * rel.tb2) : nullptr;
+                const int32_t * rel_p = rel.table ? rel.pos + q_row * rel.pb1 : nullptr;
                 // Score at chunk offset i — original per-element math.
                 auto score = [&](int i) {
                     float s = KQ_row[i];
@@ -173,6 +177,9 @@ static void mkl_fa_online_softmax_chunk(
                     if (mask_h) {
                         s += (float)mask_h[q_row * m_stride
                             + (chunk_start + i)];
+                    }
+                    if (rel_t) {
+                        s += rel_t[rel_p[(chunk_start + i) * rel.pb0]];
                     }
                     return s;
                 };
@@ -216,6 +223,8 @@ static void mkl_fa_normalize_head(
     float * __restrict dst_batch,
     const float * __restrict VKQ_accum,
     const float * __restrict KQ_sum,
+    const float * __restrict KQ_max,
+    const float * sinks,
     int iqh, int n_queries, int DV, int n_q_heads,
     int64_t src_offset, int64_t wg_size) {
 
@@ -228,7 +237,10 @@ static void mkl_fa_normalize_head(
                 if (jc >= n_queries) return;
 
                 int     ksum_idx = (int)(src_offset / DV) + jc;
-                float   inv_sum  = 1.0f / KQ_sum[ksum_idx];
+                // the sink logit only adds to the denominator, against the running max of the row
+                float   sum      = KQ_sum[ksum_idx] +
+                    (sinks ? sycl::native::exp(sinks[iqh] - KQ_max[ksum_idx]) : 0.0f);
+                float   inv_sum  = 1.0f / sum;
                 const float * __restrict src = VKQ_accum
                     + src_offset + jc * (int64_t)DV;
                 // Interleaved dst layout (matching TILE):
@@ -361,7 +373,16 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
     ggml_tensor * KQV = dst;
+
+    ggml_sycl_fattn_rel_bias rel = {};
+    if (dst->src[6]) {
+        const ggml_tensor * table = dst->src[6];
+        const ggml_tensor * pos   = dst->src[7];
+        rel = { (const char *) table->data, (const int32_t *) pos->data, (int64_t) table->nb[1], (int64_t) table->nb[2],
+                (int64_t) (pos->nb[0] / sizeof(int32_t)), (int64_t) (pos->nb[1] / sizeof(int32_t)) };
+    }
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
@@ -603,7 +624,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                             kvh_base_head,
                             mask_batch, mask_head_stride,
                             mask_row_stride, mask_n_heads,
-                            logit_softcap, wg_size, kq_done);
+                            rel, logit_softcap, wg_size, kq_done);
                         MKL_ACCUM(softmax_time_us, t0);
                     }
 
@@ -646,7 +667,8 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                 int     iqh        = kvh_base_head + iqg;
                 int64_t src_offset = (int64_t)iqg * n_queries * DV;
                 mkl_fa_normalize_head(stream,
-                    dst_batch, VKQ_accum_ptr, KQ_sum_ptr,
+                    dst_batch, VKQ_accum_ptr, KQ_sum_ptr, KQ_max_ptr,
+                    sinks ? (const float *) sinks->data : nullptr,
                     iqh, n_queries, DV, n_q_heads,
                     src_offset, wg_size);
             }

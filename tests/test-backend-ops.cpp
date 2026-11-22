@@ -4707,8 +4707,8 @@ struct test_add_unary_mul : public test_case {
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
-// flash attention with a relative-position bias (ggml_flash_attn_ext_add_rel_bias): the table is a strided view of a
-// [n_head*n_batch, n_dist] matrix as Inkling 2 builds it, the mask is shared by the heads
+// flash attention with a relative-position bias (ggml_flash_attn_ext_add_rel_bias): the table is a view of a
+// [n_dist, n_head*n_batch] matrix as Inkling 2 builds it, the mask is shared by the heads
 struct test_flash_attn_ext_rel : public test_case {
     const int64_t hs, nh, nr2, kv, nb, n_dist;
     const bool    sinks;
@@ -4733,9 +4733,9 @@ struct test_flash_attn_ext_rel : public test_case {
         ggml_set_name(v, "v");
         ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
         ggml_set_name(m, "m");
-        ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head*nb, n_dist);
+        ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_dist, n_head*nb);
         ggml_set_name(t, "t");
-        ggml_tensor * table = ggml_view_3d(ctx, t, n_head, n_dist, nb, t->nb[1], n_head*ggml_element_size(t), 0);
+        ggml_tensor * table = ggml_reshape_3d(ctx, t, n_dist, n_head, nb);
         ggml_tensor * rel_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, nb);
         ggml_set_name(rel_pos, "rel_pos");
 

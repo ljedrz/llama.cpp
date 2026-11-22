@@ -152,6 +152,7 @@ extern int g_ggml_sycl_fa_onednn_max_kv;
 extern int g_ggml_sycl_enable_mkl_fa;
 extern int g_ggml_sycl_fa_dpas;
 extern int g_ggml_sycl_fa_head_mask;
+extern int g_ggml_sycl_fa_rel;
 extern int g_ggml_sycl_memtrace;
 extern int g_ggml_sycl_memtrace_step;
 extern int g_ggml_sycl_graph_eviction_timeout;

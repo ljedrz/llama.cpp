@@ -9087,8 +9087,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const int32_t * rows = kv_rows ? (const int32_t *) ((const char *) kv_rows->data + iq3*kv_rows->nb[1]) : nullptr;
 
-        // relative-position bias of this query and head: table[h, rel_pos[ic, iq1], iq1]
-        const char * rel_t = rel_table ? (const char *) rel_table->data + iq2*rel_table->nb[0] + iq1*rel_table->nb[2] : nullptr;
+        // relative-position bias of this query and head: table[rel_pos[ic, iq1], h, iq1]
+        const char * rel_t = rel_table ? (const char *) rel_table->data + iq2*rel_table->nb[1] + iq1*rel_table->nb[2] : nullptr;
         const char * rel_p = rel_pos   ? (const char *) rel_pos->data + iq1*rel_pos->nb[1] : nullptr;
 
         // online softmax / attention
@@ -9120,7 +9120,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             s += mv; // apply mask
 
             if (rel_t) {
-                s += *(const float *) (rel_t + *(const int32_t *) (rel_p + ic*rel_pos->nb[0]) * rel_table->nb[1]);
+                s += ((const float *) rel_t)[*(const int32_t *) (rel_p + ic*rel_pos->nb[0])];
             }
 
             const float Mold = M;
