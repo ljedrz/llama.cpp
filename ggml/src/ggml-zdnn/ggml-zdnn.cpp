@@ -160,7 +160,8 @@ static bool ggml_zdnn_supports_op(const ggml_backend_zdnn_device_context * ctx_d
             } break;
 
         case GGML_OP_FLASH_ATTN_EXT:
-            return ggml_zdnn_supports_flash_attn_ext(ctx_dev, op);
+            // the relative-position bias (ggml_flash_attn_ext_add_rel_bias) is not supported
+            return op->src[6] == nullptr && ggml_zdnn_supports_flash_attn_ext(ctx_dev, op);
 
         default:
             return false;
