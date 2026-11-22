@@ -4707,6 +4707,83 @@ struct test_add_unary_mul : public test_case {
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
+// flash attention with a relative-position bias (ggml_flash_attn_ext_add_rel_bias): the table is a strided view of a
+// [n_head*n_batch, n_dist] matrix as Inkling 2 builds it, the mask is shared by the heads
+struct test_flash_attn_ext_rel : public test_case {
+    const int64_t hs, nh, nr2, kv, nb, n_dist;
+    const bool    sinks;
+
+    std::string vars() override {
+        return VARS_TO_STR7(hs, nh, nr2, kv, nb, n_dist, sinks);
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    test_flash_attn_ext_rel(int64_t hs = 128, int64_t nh = 8, int64_t nr2 = 3, int64_t kv = 1024, int64_t nb = 3,
+                            int64_t n_dist = 129, bool sinks = true)
+        : hs(hs), nh(nh), nr2(nr2), kv(kv), nb(nb), n_dist(n_dist), sinks(sinks) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_head = nh*nr2;
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, n_head, 1);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        ggml_set_name(v, "v");
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_set_name(m, "m");
+        ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head*nb, n_dist);
+        ggml_set_name(t, "t");
+        ggml_tensor * table = ggml_view_3d(ctx, t, n_head, n_dist, nb, t->nb[1], n_head*ggml_element_size(t), 0);
+        ggml_tensor * rel_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, nb);
+        ggml_set_name(rel_pos, "rel_pos");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
+        if (sinks) {
+            ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_head);
+            ggml_set_name(s, "s");
+            ggml_flash_attn_ext_add_sinks(out, s);
+        }
+        ggml_flash_attn_ext_add_rel_bias(out, table, rel_pos);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else if (strcmp(t->name, "t") == 0) {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            } else if (strcmp(t->name, "rel_pos") == 0) {
+                // the clamped distance of token i (at position kv - nb + i) to cell j
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t i = 0; i < nb; ++i) {
+                    for (int64_t j = 0; j < kv; ++j) {
+                        const int64_t d = std::abs(kv - nb + i - j);
+                        data[i*kv + j] = (int32_t) std::min<int64_t>(d, n_dist - 1);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "m") == 0) {
+                // causal, plus a masked block at the start so whole chunks are masked out
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (int64_t i = 0; i < nb; ++i) {
+                    for (int64_t j = 0; j < kv; ++j) {
+                        const bool vis = j <= kv - nb + i && j >= kv/4;
+                        data[i*kv + j] = ggml_fp32_to_fp16(vis ? 0.0f : -INFINITY);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // attention without flash attention as the graph builds it: MUL_MAT(K, q) -> SOFT_MAX(mask, sinks) -> MUL_MAT(V^T, p),
 // with GQA and a mask that is per head or shared, which backends may run as one kernel for a few tokens
 struct test_attn_kq_softmax_kqv : public test_case {
@@ -13382,6 +13459,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // flash attention with a relative-position bias: decode, verify batches, a prompt chunk; short and long caches
+    for (int64_t kv : { 512, 2056, 4096 }) {
+        for (int64_t nb : { 1, 3, 4, 7, 64 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, kv, nb, 1025, true));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 2056, 3, 129, false));
+    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 2048, 256, 1025, true));
 
     // attention without flash attention for a few tokens: GQA 3 with per-head and shared masks, other head sizes and ratios
     for (int64_t n_tok : { 1, 2, 3 }) {

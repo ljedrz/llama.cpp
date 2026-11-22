@@ -3128,6 +3128,11 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
         return false;
     }
 
+    // the relative-position bias of FLASH_ATTN_EXT (ggml_flash_attn_ext_add_rel_bias) is not supported
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[6] != nullptr) {
+        return false;
+    }
+
     bool supp = false;
     if (ggml_op_is_empty(op->op) || ggml_is_empty(op)) {
         supp = true;

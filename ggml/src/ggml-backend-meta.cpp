@@ -841,6 +841,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
 
         GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
+        GGML_ASSERT(tensor->src[6] == nullptr && "the relative-position bias is not split by heads");
         const bool kv_split = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
                 src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2;
         const bool kv_mirrored = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
