@@ -1555,10 +1555,14 @@ struct llm_graph_context {
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
-            ggml_tensor * rel_table, // [n_head_q, n_dist, n_tokens]: bias[kv, token, h] = rel_table[h, rel_pos[kv, token], token]
+            ggml_tensor * rel_table, // bias[kv, token, h] = rel_table[.. rel_pos[kv, token] .., token]: see build_attn_rel_flash
             ggml_tensor * sinks,     // [n_head_q]
                   float   kq_scale,
                     int   il) const;
+
+    // true when build_attn above runs flash attention with the bias in it: then rel_table is [n_dist, n_head_q, n_tokens]
+    // (the distances of a head and a token contiguous), otherwise [n_head_q, n_dist, n_tokens] (gathered by distance)
+    bool build_attn_rel_flash(llm_graph_input_mem_hybrid_iswa_rel * inp, int il) const;
 
     //
     // pooling

@@ -2284,8 +2284,8 @@ extern "C" {
             struct ggml_tensor * sinks);
 
     // relative-position bias added to the scores, in addition to the mask:
-    //   bias[i_kv, i_batch, h] = table[h, rel_pos[i_kv, i_batch], i_batch]
-    // table:   [n_head, n_dist, n_batch, 1] F32, any strides with nb[0] == sizeof(float)
+    //   bias[i_kv, i_batch, h] = table[rel_pos[i_kv, i_batch], h, i_batch]
+    // table:   [n_dist, n_head, n_batch, 1] F32 with contiguous rows (the distances of a head and a query)
     // rel_pos: [n_kv,   n_batch, 1,       1] I32, values in [0, n_dist)
     // not with kv_rows; q, k, v must have ne[3] == 1
     GGML_API void ggml_flash_attn_ext_add_rel_bias(

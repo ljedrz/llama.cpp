@@ -111,6 +111,7 @@ int g_ggml_sycl_fa_onednn_max_kv = 0;
 int g_ggml_sycl_enable_mkl_fa = 1;
 int g_ggml_sycl_fa_dpas = 1;
 int g_ggml_sycl_fa_head_mask = 0;
+int g_ggml_sycl_fa_rel = 0;
 int g_ggml_sycl_memtrace = 0;
 int g_ggml_sycl_memtrace_step = 64;
 int g_ggml_sycl_enable_vmm = 1;
@@ -449,6 +450,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_enable_mkl_fa = ggml_sycl_get_env("GGML_SYCL_ENABLE_MKL_FA", 1);
         g_ggml_sycl_fa_dpas = ggml_sycl_get_env("GGML_SYCL_FA_DPAS", 1);
         g_ggml_sycl_fa_head_mask = ggml_sycl_get_env("GGML_SYCL_FA_HEAD_MASK", 0);
+        g_ggml_sycl_fa_rel = ggml_sycl_get_env("GGML_SYCL_FA_REL", 0);
         g_ggml_sycl_memtrace = ggml_sycl_get_env("GGML_SYCL_MEMTRACE", 0);
         g_ggml_sycl_memtrace_step = ggml_sycl_get_env("GGML_SYCL_MEMTRACE_STEP", 64);
         g_ggml_sycl_enable_vmm = ggml_sycl_get_env("GGML_SYCL_ENABLE_VMM", 1);
@@ -574,6 +576,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_MKL_FA: %d\n", g_ggml_sycl_enable_mkl_fa);
         GGML_LOG_INFO("  GGML_SYCL_FA_DPAS: %d\n", g_ggml_sycl_fa_dpas);
         GGML_LOG_INFO("  GGML_SYCL_FA_HEAD_MASK: %d\n", g_ggml_sycl_fa_head_mask);
+        GGML_LOG_INFO("  GGML_SYCL_FA_REL: %d\n", g_ggml_sycl_fa_rel);
         GGML_LOG_INFO("  GGML_SYCL_MEMTRACE: %d\n", g_ggml_sycl_memtrace);
         GGML_LOG_INFO("  GGML_SYCL_MEMTRACE_STEP: %d\n", g_ggml_sycl_memtrace_step);
 #ifdef SYCL_FLASH_ATTN
@@ -8814,8 +8817,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_SOLVE_TRI:
             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
         case GGML_OP_FLASH_ATTN_EXT:
-            // K/V row lists (ggml_flash_attn_ext_rows) and the relative-position bias are not supported
-            return op->src[5] == nullptr && op->src[6] == nullptr && ggml_sycl_flash_attn_ext_supported(device, op);
+            // K/V row lists (ggml_flash_attn_ext_rows) are not supported; the relative-position bias is decided by the selector
+            return op->src[5] == nullptr && ggml_sycl_flash_attn_ext_supported(device, op);
         default:
             return false;
     }

@@ -5538,7 +5538,7 @@ void ggml_flash_attn_ext_add_rel_bias(
 
     GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1);
     GGML_ASSERT(table->type == GGML_TYPE_F32 && table->nb[0] == sizeof(float));
-    GGML_ASSERT(table->ne[0] == q->ne[2] && table->ne[2] == q->ne[1] && table->ne[3] == 1);
+    GGML_ASSERT(table->ne[1] == q->ne[2] && table->ne[2] == q->ne[1] && table->ne[3] == 1);
     GGML_ASSERT(rel_pos->type == GGML_TYPE_I32);
     GGML_ASSERT(rel_pos->ne[0] == k->ne[1] && rel_pos->ne[1] == q->ne[1] && rel_pos->ne[2] == 1 && rel_pos->ne[3] == 1);
 

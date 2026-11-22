@@ -4490,6 +4490,11 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
 }
 
+bool llm_graph_context::build_attn_rel_flash(llm_graph_input_mem_hybrid_iswa_rel * inp, int il) const {
+    const auto & attn_mask = hparams.is_swa(il) ? inp->get_attn()->self_attn_mask_swa : inp->get_attn()->self_attn_mask;
+    return cparams.flash_attn && attn_mask.raw->ne[3] == 1;
+}
+
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_mem_hybrid_iswa_rel * inp,
         ggml_tensor * wo,
@@ -4513,15 +4518,16 @@ ggml_tensor * llm_graph_context::build_attn(
     //       needs a kv_rows flash attention with a per-head mask (CUDA has none)
     GGML_ASSERT(attn_mask.rows == nullptr);
 
-    const int64_t n_head   = rel_table->ne[0];
     const int64_t n_kv     = rel_pos->ne[0];
     const int64_t n_tokens = rel_pos->ne[1];
     const int64_t n_stream = attn_mask.raw->ne[3];
 
     // flash attention adds the bias from the table itself, so no n_kv x n_tokens x n_head tensor is built
-    if (cparams.flash_attn && n_stream == 1) {
+    if (build_attn_rel_flash(inp, il)) {
         return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, attn_mask.raw, nullptr, sinks, nullptr, kq_scale, il, rel_table, rel_pos);
     }
+
+    const int64_t n_head = rel_table->ne[0];
 
     ggml_tensor * kq_b = ggml_get_rows(ctx0, rel_table, rel_pos);
     kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
@@ -4529,15 +4535,17 @@ ggml_tensor * llm_graph_context::build_attn(
     kq_b = ggml_permute(ctx0, kq_b, 2, 0, 1, 3);
     cb(kq_b, "kq_b", il);
 
-    // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
+    // several streams with flash attention: attention without it over the flash attention cache, the bias as KQ bias
+    if (cparams.flash_attn) {
+        return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, kq_b, attn_mask.raw, nullptr, sinks, nullptr, kq_scale, il);
+    }
+
+    // a mask per head, in the dense layout of the input mask
     ggml_tensor * kq_mask = attn_mask.raw;
     if (kq_mask->type != GGML_TYPE_F32) {
         kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
     }
     kq_mask = ggml_add(ctx0, kq_b, kq_mask);
-    if (cparams.flash_attn) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
-    }
     cb(kq_mask, "kq_mask_rel_pos", il);
     // before KQ: the gathered bias is freed before KQ is allocated, two n_kv x n_tokens x n_head tensors at a time
     ggml_build_forward_expand(gf, kq_mask);
