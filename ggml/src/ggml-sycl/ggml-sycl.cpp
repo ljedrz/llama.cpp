@@ -71,6 +71,7 @@
 #include "ggml-sycl/fused-gemm.hpp"
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/getrows.hpp"
+#include "ggml-sycl/attn-dec.hpp"
 #include "ggml-sycl/mem.hpp"
 #include "ggml-sycl/mmvf.hpp"
 #include "ggml-sycl/norm.hpp"
@@ -120,6 +121,7 @@ int g_ggml_sycl_enable_esimd = 1;
 int g_ggml_sycl_mmid_esimd = 1;
 int g_ggml_sycl_nvfp4_moe_f32 = 1;
 int g_ggml_sycl_mmvf = 1;
+int g_ggml_sycl_attn_dec = 1;
 int g_ggml_sycl_mmvq_wide = 1;
 int g_ggml_sycl_enable_xmx_esimd = 1;
 int g_ggml_sycl_xmx_max_cols = GGML_SYCL_XMX_MAX_COLS_DEFAULT;
@@ -459,6 +461,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_mmid_esimd = ggml_sycl_get_env("GGML_SYCL_MMID_ESIMD", 1);
         g_ggml_sycl_nvfp4_moe_f32 = ggml_sycl_get_env("GGML_SYCL_NVFP4_MOE_F32", 1);
         g_ggml_sycl_mmvf = ggml_sycl_get_env("GGML_SYCL_MMVF", 1);
+        g_ggml_sycl_attn_dec = ggml_sycl_get_env("GGML_SYCL_ATTN_DEC", 1);
         g_ggml_sycl_mmvq_wide = ggml_sycl_get_env("GGML_SYCL_MMVQ_WIDE", 1);
         g_ggml_sycl_enable_xmx_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_XMX_ESIMD", 1);
         g_ggml_sycl_xmx_max_cols = std::max(0, ggml_sycl_get_env("GGML_SYCL_XMX_MAX_COLS", GGML_SYCL_XMX_MAX_COLS_DEFAULT));
@@ -598,6 +601,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_MMID_ESIMD: %d\n", g_ggml_sycl_mmid_esimd);
         GGML_LOG_INFO("  GGML_SYCL_NVFP4_MOE_F32: %d\n", g_ggml_sycl_nvfp4_moe_f32);
         GGML_LOG_INFO("  GGML_SYCL_MMVF: %d\n", g_ggml_sycl_mmvf);
+        GGML_LOG_INFO("  GGML_SYCL_ATTN_DEC: %d\n", g_ggml_sycl_attn_dec);
         GGML_LOG_INFO("  GGML_SYCL_XMX_GATHER_SHAPES: %d\n", g_ggml_sycl_xmx_gather_shapes);
         GGML_LOG_INFO("  GGML_SYCL_DYNAMIC_PRECISION: %s\n",
                       ggml_sycl_dynamic_precision_names[g_ggml_sycl_dynamic_precision]);
@@ -6540,6 +6544,109 @@ static int ggml_sycl_fuse_rel_bias_mask(ggml_backend_sycl_context & ctx, ggml_cg
     return (oc ? j + 1 : j) - i;
 }
 
+// attention of a few tokens without flash attention: MUL_MAT(K, q) -> SOFT_MAX(mask, sinks) -> MUL_MAT(V^T, p) over an
+// F16 KV cache as one pass over K and V per KV head (ggml_sycl_attn_dec). Returns the number of nodes after i it took.
+static int ggml_sycl_fuse_attn_dec(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    if (!g_ggml_sycl_enable_fusion || !g_ggml_sycl_attn_dec) {
+        return 0;
+    }
+    const auto next = [&](int j) {
+        do {
+            ++j;
+        } while (j < cgraph->n_nodes && ggml_sycl_is_view_or_noop(cgraph->nodes[j]));
+        return j;
+    };
+    const auto single_use = [&](int j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        return !(t->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(cgraph, j) == 1;
+    };
+    const int js = next(i);
+    const int jv = js < cgraph->n_nodes ? next(js) : cgraph->n_nodes;
+    if (jv >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * kq  = cgraph->nodes[i];
+    ggml_tensor * sm  = cgraph->nodes[js];
+    ggml_tensor * kqv = cgraph->nodes[jv];
+    if (sm->op != GGML_OP_SOFT_MAX || sm->src[0] != kq || kqv->op != GGML_OP_MUL_MAT || kqv->src[1] != sm ||
+        !single_use(i) || !single_use(js) || !(sm->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+        !(kqv->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        return 0;
+    }
+    const ggml_tensor * k     = kq->src[0];
+    const ggml_tensor * q     = kq->src[1];
+    const ggml_tensor * v     = kqv->src[0];
+    const ggml_tensor * mask  = sm->src[1];
+    const ggml_tensor * sinks = sm->src[2];
+    const int64_t D = k->ne[0], n_kv = k->ne[1], n_head_kv = k->ne[2], n_tok = q->ne[1], n_head = q->ne[2];
+    float scale = 1.0f, max_bias = 0.0f;
+    memcpy(&scale, (const float *) sm->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (const float *) sm->op_params + 1, sizeof(float));
+    if (max_bias != 0.0f || n_head % n_head_kv != 0 || !ggml_sycl_attn_dec_supported(D, n_tok * (n_head / n_head_kv)) ||
+        n_kv % 8 != 0 || n_kv < 1024) {
+        // short caches leave too few chunks per KV head for the device; the three separate kernels are faster there
+        return 0;
+    }
+    if (k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || q->type != GGML_TYPE_F32 || kq->type != GGML_TYPE_F32 ||
+        sm->type != GGML_TYPE_F32 || kqv->type != GGML_TYPE_F32 || ggml_backend_buffer_is_sycl_split(k->buffer) ||
+        ggml_backend_buffer_is_sycl_split(v->buffer) || k->ne[3] != 1 || q->ne[3] != 1 || v->ne[3] != 1 ||
+        q->ne[0] != D || v->ne[0] != n_kv || v->ne[1] != D || v->ne[2] != n_head_kv ||
+        k->nb[0] != sizeof(sycl::half) || v->nb[0] != sizeof(sycl::half) || q->nb[0] != sizeof(float) ||
+        !ggml_is_contiguous(kqv) || kqv->ne[0] != D || kqv->ne[1] != n_tok || kqv->ne[2] != n_head) {
+        return 0;
+    }
+    // 16-byte loads of K rows, V^T rows (from chunk starts at multiples of 128) and q
+    if ((uintptr_t) k->data % 16 || k->nb[1] % 16 || k->nb[2] % 16 || (uintptr_t) v->data % 16 || v->nb[1] % 16 ||
+        v->nb[2] % 16 || (uintptr_t) q->data % 16 || q->nb[1] % 16 || q->nb[2] % 16) {
+        return 0;
+    }
+    if (mask && (mask->ne[0] != n_kv || mask->ne[1] < n_tok || (mask->ne[2] != 1 && mask->ne[2] != n_head) ||
+                 mask->ne[3] != 1 || (mask->type != GGML_TYPE_F32 && mask->type != GGML_TYPE_F16))) {
+        return 0;
+    }
+    if (sinks && (sinks->type != GGML_TYPE_F32 || sinks->ne[0] != n_head)) {
+        return 0;
+    }
+    // the output is written by the second kernel, after q, K, V and the mask were read; the sinks are read with it
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    if (sinks && overlap(kqv, sinks)) {
+        return 0;
+    }
+
+    ggml_sycl_attn_dec_args a = {};
+    a.q          = (const char *) q->data;
+    a.k          = (const char *) k->data;
+    a.v          = (const char *) v->data;
+    a.mask       = mask ? (const char *) mask->data : nullptr;
+    a.sinks      = sinks ? (const float *) sinks->data : nullptr;
+    a.dst        = (float *) kqv->data;
+    a.D          = D;
+    a.n_kv       = n_kv;
+    a.n_tok      = n_tok;
+    a.n_head     = n_head;
+    a.n_head_kv  = n_head_kv;
+    a.mask_heads = mask ? mask->ne[2] : 1;
+    a.q_nb1      = q->nb[1];
+    a.q_nb2      = q->nb[2];
+    a.k_nb1      = k->nb[1];
+    a.k_nb2      = k->nb[2];
+    a.v_nb1      = v->nb[1];
+    a.v_nb2      = v->nb[2];
+    a.m_nb0      = mask ? mask->nb[0] : 0;
+    a.m_nb1      = mask ? mask->nb[1] : 0;
+    a.m_nb2      = mask ? mask->nb[2] : 0;
+    a.scale      = scale;
+    a.mask_f16   = mask && mask->type == GGML_TYPE_F16;
+    scope_op_debug_print scope_dbg_print(__func__, kqv, /*num_src=*/2, " : attn dec");
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    ggml_sycl_attn_dec(ctx, a);
+    return jv - i;
+}
+
 // SOFT_MAX whose only consumer is the batched F16 mat-mul (KQV over the V cache): that path converts src1 to F16 first,
 // so the softmax writes F16 into the buffer the conversion would have used. Returns the number of nodes after i it took.
 static int ggml_sycl_fuse_soft_max_mul_mat(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
@@ -7674,6 +7781,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         if (node->op == GGML_OP_MUL || node->op == GGML_OP_L2_NORM) {
             const int skip = ggml_sycl_fuse_l2_norm(*sycl_ctx, cgraph, i);
+            if (skip > 0) {
+                i += skip;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_MUL_MAT) {
+            const int skip = ggml_sycl_fuse_attn_dec(*sycl_ctx, cgraph, i);
             if (skip > 0) {
                 i += skip;
                 continue;
