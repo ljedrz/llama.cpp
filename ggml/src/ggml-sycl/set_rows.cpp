@@ -105,6 +105,69 @@ static void set_rows_sycl_q(const char * __restrict__ src0_d,
     GGML_UNUSED(nb13);
 }
 
+// q8_0 with a sub-group per block (a work-item per block leaves a token's few K/V blocks latency-bound); the same
+// values as cpy_blck_f32_q8_0
+template <typename TIn, typename TIdx>
+static void set_rows_sycl_q8_0_sg(const char * __restrict__ src0_d, const TIdx * __restrict__ src1_d,
+                                  block_q8_0 * __restrict__ dst_d, const int64_t ne00, const int64_t ne01,
+                                  const int64_t ne02, const int64_t ne03, const int64_t ne11, const int64_t ne12,
+                                  const size_t nb01, const size_t nb02, const size_t nb03, const size_t nb10,
+                                  const size_t nb11, const size_t nb12, const size_t nb1, const size_t nb2,
+                                  const size_t nb3, queue_ptr stream) {
+    constexpr int VPL = QK8_0 / WARP_SIZE;  // values per lane
+    static_assert(QK8_0 % WARP_SIZE == 0, "q8_0 block per sub-group");
+    const int64_t total_blocks = (ne00 * ne01 * ne02 * ne03) / QK8_0;
+    constexpr int sg_per_wg    = 8;
+    const int64_t n_wg         = ceil_div(total_blocks, (int64_t) sg_per_wg);
+
+    stream->parallel_for(
+        sycl::nd_range<1>(n_wg * sg_per_wg * WARP_SIZE, sg_per_wg * WARP_SIZE),
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            const auto    sg   = item.get_sub_group();
+            const int     lane = (int) sg.get_local_linear_id();
+            const int64_t i    = item.get_group(0) * sg_per_wg + sg.get_group_linear_id();
+            if (i >= total_blocks) {
+                return;
+            }
+            const int64_t i_base = i * QK8_0;
+            const int64_t i03    = i_base / (ne00 * ne01 * ne02);
+            const int64_t rem1   = i_base - i03 * (ne00 * ne01 * ne02);
+            const int64_t i02    = rem1 / (ne00 * ne01);
+            const int64_t rem2   = rem1 - i02 * ne00 * ne01;
+            const int64_t i01    = rem2 / ne00;
+            const int64_t i00    = rem2 - i01 * ne00;
+            const int64_t i12    = i03 % ne12;
+            const int64_t i11    = i02 % ne11;
+            const int64_t i10    = i01;
+
+            const TIn *   src     = (const TIn *) (src0_d + calculate_offset<3>({ nb01, nb02, nb03 }, { i01, i02, i03 })) +
+                                i00 + lane * VPL;
+            const int64_t dst_row = src1_d[calculate_offset<3>({ nb10, nb11, nb12 }, { i10, i11, i12 }) / sizeof(TIdx)];
+            block_q8_0 *  dst     = (block_q8_0 *) ((char *) dst_d +
+                                                calculate_offset<3>({ nb1, nb2, nb3 }, { dst_row, i02, i03 })) +
+                               i00 / QK8_0;
+
+            float x[VPL];
+            float amax = 0.0f;
+#pragma unroll
+            for (int j = 0; j < VPL; ++j) {
+                x[j] = (float) src[j];
+                amax = sycl::fmax(amax, sycl::fabs(x[j]));
+            }
+            amax = sycl::reduce_over_group(sg, amax, sycl::maximum<float>());
+
+            const float d  = div_correctly_rounded(amax, 127.0f);
+            const float id = amax != 0.0f ? div_correctly_rounded(127.0f, amax) : 0.0f;
+            if (lane == 0) {
+                dst->d = d;
+            }
+#pragma unroll
+            for (int j = 0; j < VPL; ++j) {
+                dst->qs[lane * VPL + j] = (int) sycl::rint(x[j] * id);
+            }
+        });
+}
+
 template<typename blockType>
 using quantize_row_qk_t = void (*)(const float *, blockType *, int64_t);
 
@@ -356,10 +419,8 @@ static void set_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * s
             break;
 #endif
         case GGML_TYPE_Q8_0:
-            set_rows_sycl_q<TIn, TIdx, block_q8_0, QK8_0, cpy_blck_f32_q8_0>(
-                src0_d, src1_d, (block_q8_0 *) dst->data, ne00, ne01, ne02, ne03,
-                ne10, ne11, ne12, ne13, nb00, nb01,
-                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+            set_rows_sycl_q8_0_sg<TIn, TIdx>(src0_d, src1_d, (block_q8_0 *) dst->data, ne00, ne01, ne02, ne03, ne11,
+                                             ne12, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q1_0:
             set_rows_sycl_q<TIn, TIdx, block_q1_0, QK1_0, cpy_blck_f32_q1_0>(
