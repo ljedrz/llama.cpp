@@ -1540,6 +1540,15 @@ public:
                     break;
                 }
 
+                if (has_rnn_context && !params.probabilistic) {
+                    // greedy: the first maximum of the row, as the RNN conditioning graph picks it, without running
+                    // the sampler chain over the whole vocabulary (from unslothai/llama.cpp#394)
+                    const float * row = llama_get_logits_ith(ctx_dft, idx);
+                    const int32_t n_v = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                    result.push_back((llama_token) (std::max_element(row, row + n_v) - row));
+                    continue;
+                }
+
                 const llama_token sampled = common_sampler_sample(smpl, ctx_dft, idx, true);
                 if (has_rnn_context) {
                     // Use the first maximum, as in the RNN conditioning graph.
