@@ -13677,6 +13677,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 2056, 3, 129, false));
     test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 2048, 256, 1025, true));
+    // prompt chunks over long caches: ragged token counts, a short table without sinks, GQA 4, more cells
+    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 2056, 37, 1025, true));
+    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 4096, 300, 129, false));
+    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 4, 4, 2056, 40, 1025, true));
+    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 8200, 64, 1025, true));
     // other token counts, head sizes and GQA ratios of the few-token kernel: 6, 4, 3, 16 and 12 query vectors per KV head
     test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 2056, 2, 1025, true));
     test_cases.emplace_back(new test_flash_attn_ext_rel(256, 4, 4, 2056, 1, 513, true));
@@ -14717,6 +14722,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, true, false, 2048));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
+    }
+
+    // prompt over a long cache with the relative-position bias (Inkling 2: 24 / 8 heads, 1024-token ubatch)
+    for (int64_t kv : {32768, 131072}) {
+        test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, kv, 1024, 1025));
     }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
