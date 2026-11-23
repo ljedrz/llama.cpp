@@ -5215,7 +5215,8 @@ struct test_attn_kq_softmax_kqv : public test_case {
 // (their distance clamps to the last one), and distances run past the table.
 struct test_flash_attn_ext_rel : public test_case {
     const int64_t hs, nh, nr2, kv, nb, n_dist;
-    const bool    sinks;
+    const bool      sinks;
+    const ggml_type type_KV;
 
     static constexpr int64_t pos_base = 5;
 
@@ -5226,22 +5227,22 @@ struct test_flash_attn_ext_rel : public test_case {
     int32_t q_pos(int64_t i) const { return (int32_t) (pos_base + kv - nb + i); }
 
     std::string vars() override {
-        return VARS_TO_STR7(hs, nh, nr2, kv, nb, n_dist, sinks);
+        return VARS_TO_STR8(hs, nh, nr2, kv, nb, n_dist, sinks, type_KV);
     }
 
     double max_nmse_err() override { return 5e-4; }
 
     test_flash_attn_ext_rel(int64_t hs = 128, int64_t nh = 8, int64_t nr2 = 3, int64_t kv = 1024, int64_t nb = 3,
-                            int64_t n_dist = 129, bool sinks = true)
-        : hs(hs), nh(nh), nr2(nr2), kv(kv), nb(nb), n_dist(n_dist), sinks(sinks) {}
+                            int64_t n_dist = 129, bool sinks = true, ggml_type type_KV = GGML_TYPE_F16)
+        : hs(hs), nh(nh), nr2(nr2), kv(kv), nb(nb), n_dist(n_dist), sinks(sinks), type_KV(type_KV) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_head = nh*nr2;
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, n_head, 1);
         ggml_set_name(q, "q");
-        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
         ggml_set_name(k, "k");
-        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, nh, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
         ggml_set_name(v, "v");
         ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
         ggml_set_name(m, "m");
@@ -15022,6 +15023,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_rel(128, 4, 1, 2056, 3, 1025, true));
     test_cases.emplace_back(new test_flash_attn_ext_rel(128, 4, 4, 2056, 4, 1025, false));
     test_cases.emplace_back(new test_flash_attn_ext_rel(256, 4, 4, 2056, 3, 513, true));
+    // a q8_0 cache: decode and verify batches, a few-token batch and a prompt chunk, short and long caches
+    for (int64_t kv : { 512, 2056 }) {
+        for (int64_t nb : { 1, 3, 7, 64 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, kv, nb, 1025, true, GGML_TYPE_Q8_0));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 4, 4, 2056, 4, 1025, false, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_rel(256, 4, 4, 2056, 3, 513, true, GGML_TYPE_Q8_0));
 
     // attention without flash attention for a few tokens: GQA 3 with per-head and shared masks, other head sizes and ratios
     for (int64_t n_tok : { 1, 2, 3 }) {

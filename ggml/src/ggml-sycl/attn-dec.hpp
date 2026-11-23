@@ -7,8 +7,9 @@
 // MUL_MAT(V^T, p) as one pass over K and V per KV head, for the n_tok*gqa query vectors that share a KV head
 struct ggml_sycl_attn_dec_args {
     const char * q;      // F32 [D, n_tok, n_head]
-    const char * k;      // F16 [D, n_kv, n_head_kv]
-    const char * v;      // F16 V^T [n_kv, D, n_head_kv], or with v_rows V [D, n_kv, n_head_kv] (flash attention layout)
+    const char * k;      // F16 (or with kv_q8 q8_0) [D, n_kv, n_head_kv]
+    const char * v;      // F16 V^T [n_kv, D, n_head_kv], or with v_rows V [D, n_kv, n_head_kv] (flash attention layout,
+                         // F16 or with kv_q8 q8_0)
     const char * mask;   // F32 or F16 [n_kv, >= n_tok, 1 or n_head], or null
     const float * sinks; // [n_head] or null
     float *      dst;    // F32, element (d, token, head) at d + token*o_t + head*o_h
@@ -20,6 +21,7 @@ struct ggml_sycl_attn_dec_args {
     float        scale;
     bool         mask_f16;
     bool         v_rows;
+    bool         kv_q8;  // K and V are q8_0 (v_rows only); rows need only be 2-byte aligned
     int64_t      o_t, o_h;
     // indexed bias (see ggml_flash_attn_ext_add_indexed_bias): table[idx[kv, token], head, token], or null
     const char *    rel_table;

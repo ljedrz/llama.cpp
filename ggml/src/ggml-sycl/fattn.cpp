@@ -344,21 +344,32 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel_rel(const int device, c
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    // a few tokens over a long cache: the query vectors of a KV head share one read of K and V
+    // a few tokens over a long cache: the query vectors of a KV head share one read of K and V. q8_0 also over short
+    // caches: the alternative there converts K and V to F16 for TILE after the mask step (tg at depth 0 61.6 -> 63.5)
     const int  gqa_ratio = Q->ne[2] / K->ne[2];
-    if (g_ggml_sycl_attn_dec && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 && Q->type == GGML_TYPE_F32 &&
-        Q->ne[0] == V->ne[0] && ggml_sycl_attn_dec_supported(Q->ne[0], Q->ne[1] * gqa_ratio) && K->ne[1] >= 1024 &&
-        K->ne[1] % 8 == 0 && logit_softcap == 0.0f && (uintptr_t) K->data % 16 == 0 && K->nb[1] % 16 == 0 &&
-        K->nb[2] % 16 == 0 && (uintptr_t) Q->data % 16 == 0 && Q->nb[1] % 16 == 0 && Q->nb[2] % 16 == 0 &&
-        (uintptr_t) V->data % 4 == 0 && V->nb[1] % 4 == 0 && V->nb[2] % 4 == 0 && K->nb[0] == 2 && V->nb[0] == 2 &&
-        Q->nb[0] == 4 && dst->nb[0] == 4 && ggml_is_contiguous(dst)) {
+    // F16 K is read 16 bytes and V 4 bytes at a time; q8_0 (34-byte blocks) 2 bytes at a time
+    const bool dec_f16 = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 && (uintptr_t) K->data % 16 == 0 &&
+                         K->nb[1] % 16 == 0 && K->nb[2] % 16 == 0 && (uintptr_t) V->data % 4 == 0 && V->nb[1] % 4 == 0 &&
+                         V->nb[2] % 4 == 0 && K->nb[0] == 2 && V->nb[0] == 2;
+    const bool dec_q8  = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && (uintptr_t) K->data % 2 == 0 &&
+                         K->nb[1] % 2 == 0 && K->nb[2] % 2 == 0 && (uintptr_t) V->data % 2 == 0 && V->nb[1] % 2 == 0 &&
+                         V->nb[2] % 2 == 0;
+    if (g_ggml_sycl_attn_dec && (dec_f16 || dec_q8) && Q->type == GGML_TYPE_F32 && Q->ne[0] == V->ne[0] &&
+        ggml_sycl_attn_dec_supported(Q->ne[0], Q->ne[1] * gqa_ratio) && K->ne[1] >= (dec_q8 ? 256 : 1024) &&
+        K->ne[1] % 8 == 0 && logit_softcap == 0.0f && (uintptr_t) Q->data % 16 == 0 && Q->nb[1] % 16 == 0 &&
+        Q->nb[2] % 16 == 0 && Q->nb[0] == 4 && dst->nb[0] == 4 && ggml_is_contiguous(dst)) {
         return BEST_FATTN_KERNEL_DEC;
     }
 
-    // MKL applies the bias in its softmax: prompts over long caches
-    const bool f16_kv    = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
-                           K->nb[1] % (K->ne[0] * 2) == 0 && V->nb[1] % (V->ne[0] * 2) == 0;
-    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && f16_kv && gqa_ratio >= 2 && Q->ne[0] >= 64 && Q->ne[0] <= 512 &&
+    // MKL applies the bias in its softmax: prompts over long caches; it converts q8_0 K and V to F16 a chunk at a time
+    const auto mkl_kv_ok = [](const ggml_tensor * t) {
+        if (t->type == GGML_TYPE_F16) {
+            return t->nb[1] % (t->ne[0] * 2) == 0;
+        }
+        return t->type == GGML_TYPE_Q8_0 && t->nb[1] % sizeof(block_q8_0) == 0 && t->nb[2] % sizeof(block_q8_0) == 0;
+    };
+    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && K->type == V->type && mkl_kv_ok(K) && mkl_kv_ok(V) && gqa_ratio >= 2 &&
+        Q->ne[0] >= 64 && Q->ne[0] <= 512 &&
         Q->ne[0] % 64 == 0 && Q->ne[0] == V->ne[0] && Q->ne[1] >= 32 && K->ne[1] >= 1024 && logit_softcap == 0.0f) {
         return BEST_FATTN_KERNEL_MKL;
     }
@@ -545,6 +556,7 @@ static void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_t
     memcpy(&a.scale, (const float *) dst->op_params + 0, sizeof(float));
     a.mask_f16   = mask != nullptr;
     a.v_rows     = true;
+    a.kv_q8      = K->type == GGML_TYPE_Q8_0;
     // the output is [D, n_head, n_tok]
     a.o_h        = (int64_t) (dst->nb[1] / sizeof(float));
     a.o_t        = (int64_t) (dst->nb[2] / sizeof(float));
