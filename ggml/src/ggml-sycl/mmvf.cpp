@@ -47,6 +47,8 @@ static void mul_mat_vec_f_kernel(const char * __restrict__ src0, const char * __
 
     float acc[NCOLS] = {};
     if constexpr (VEC) {
+        // unrolled so a thread has several loads in flight: few rows over long ones are latency-bound
+#pragma unroll 4
         for (int64_t k = 4 * lane; k < a.ne00; k += 4 * stride) {
             float w[4];
             if constexpr (std::is_same_v<T, float>) {
