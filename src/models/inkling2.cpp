@@ -396,13 +396,20 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         if (!rel_bias) {
             rel_bias = ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0);
         }
-        // the table is [n_head*n_tokens, n_distance], so the heads of a distance and a token are one row for the gather
-        ggml_tensor * table = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, Rcur, hparams.n_relative, n_head*n_tokens), rel_bias);
-
+        ggml_tensor * r2d = ggml_reshape_2d(ctx0, Rcur, hparams.n_relative, n_head*n_tokens);
+        ggml_tensor * table;
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
-        table = ggml_sub(ctx0, table, ggml_reshape_2d(ctx0, sinks, n_head*n_tokens, 1));
-        // [n_head, n_distance, n_tokens]: build_attn gathers it by the distance of each kv to each token
-        table = ggml_view_3d(ctx0, table, n_head, table->ne[1], n_tokens, table->nb[1], n_head*ggml_element_size(table), 0);
+        if (build_attn_rel_flash(inp, il)) {
+            // [n_distance, n_head, n_tokens]: flash attention looks up the distances of a head and a token in one row
+            table = ggml_mul_mat(ctx0, rel_bias, r2d);
+            table = ggml_sub(ctx0, table, ggml_reshape_2d(ctx0, sinks, 1, n_head*n_tokens));
+            table = ggml_reshape_3d(ctx0, table, table->ne[0], n_head, n_tokens);
+        } else {
+            // [n_head, n_distance, n_tokens]: the heads of a distance and a token are one row for the gather
+            table = ggml_mul_mat(ctx0, r2d, rel_bias);
+            table = ggml_sub(ctx0, table, ggml_reshape_2d(ctx0, sinks, n_head*n_tokens, 1));
+            table = ggml_view_3d(ctx0, table, n_head, table->ne[1], n_tokens, table->nb[1], n_head*ggml_element_size(table), 0);
+        }
 
         ggml_tensor *& zero_sinks = zero_sinks_cache[n_head];
         if (!zero_sinks) {
