@@ -13986,6 +13986,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
+    // Inkling 2: decode and a verify batch, and unaligned experts with views first
+    test_cases.emplace_back(new test_moe_reduce(2304, 8, 1));
+    test_cases.emplace_back(new test_moe_reduce(2304, 8, 3));
+    test_cases.emplace_back(new test_moe_reduce(63,   8, 5, true));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));

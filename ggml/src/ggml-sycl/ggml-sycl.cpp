@@ -6296,6 +6296,87 @@ static int ggml_sycl_fuse_ssm_conv_residual(ggml_backend_sycl_context & ctx, ggm
     return 0;
 }
 
+// The MoE output of build_moe_ffn at the MUL of node i: MUL(experts [n_embd, n_slot, n_tok], weights [1, n_slot, n_tok]),
+// a VIEW per slot and the chain of ADDs over them, as one kernel that sums the weighted slots in the same order.
+// Returns the number of nodes after i it took, 0 when the pattern does not match.
+static int ggml_sycl_fuse_moe_reduce(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * mul = cgraph->nodes[i];
+    if (!g_ggml_sycl_enable_fusion || mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    const ggml_tensor * ex = mul->src[0];
+    const ggml_tensor * w  = mul->src[1];
+    const int64_t       n_slot = ex->ne[1];
+    if (ex->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || ex->nb[0] != sizeof(float) || w->ne[0] != 1 ||
+        w->ne[1] != n_slot || w->ne[2] != ex->ne[2] || ex->ne[3] != 1 || w->ne[3] != 1 || n_slot < 2 ||
+        !ggml_are_same_shape(mul, ex) || !ggml_is_contiguous(mul)) {
+        return 0;
+    }
+    const int64_t n_embd = ex->ne[0];
+    const int64_t n_tok  = ex->ne[2];
+
+    std::vector<int>     idx = { i };
+    std::vector<ggml_op> ops = { GGML_OP_MUL };
+    int                  k   = i + 1;
+    for (int64_t s = 0; s < n_slot; ++s, ++k) {
+        const ggml_tensor * v = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
+        if (!v || v->op != GGML_OP_VIEW || v->view_src != mul || v->ne[0] != n_embd || v->ne[1] != n_tok ||
+            v->ne[2] != 1 || v->ne[3] != 1 || v->nb[1] != mul->nb[2] || v->view_offs != (size_t) s * mul->nb[1]) {
+            return 0;
+        }
+        idx.push_back(k);
+        ops.push_back(GGML_OP_VIEW);
+    }
+    const ggml_tensor * prev = cgraph->nodes[i + 1];
+    for (int64_t s = 1; s < n_slot; ++s, ++k) {
+        const ggml_tensor * a = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
+        if (!a || a->op != GGML_OP_ADD || a->src[0] != prev || a->src[1] != cgraph->nodes[i + 1 + s] ||
+            a->type != GGML_TYPE_F32) {
+            return 0;
+        }
+        idx.push_back(k);
+        ops.push_back(GGML_OP_ADD);
+        prev = a;
+    }
+    ggml_tensor * out = cgraph->nodes[idx.back()];
+    if (!ggml_is_contiguous(out) ||
+        !ggml_can_fuse_subgraph_ext(cgraph, idx.data(), (int) idx.size(), ops.data(), &idx.back(), 1)) {
+        return 0;
+    }
+    // the kernel reads the slots of an element while it writes the element: out may not overlap the inputs
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    if (overlap(out, ex) || overlap(out, w)) {
+        return 0;
+    }
+
+    const char *  ex_d = (const char *) ex->data;
+    const char *  w_d  = (const char *) w->data;
+    float *       dst  = (float *) out->data;
+    const size_t  enb1 = ex->nb[1], enb2 = ex->nb[2], wnb1 = w->nb[1], wnb2 = w->nb[2];
+    const int64_t n    = n_embd * n_tok;
+    const int     wg   = 256;
+    ctx.stream()->parallel_for(sycl::nd_range<1>((n + wg - 1) / wg * wg, wg), [=](sycl::nd_item<1> it) {
+        const int64_t j = it.get_global_id(0);
+        if (j >= n) {
+            return;
+        }
+        const int64_t e  = j % n_embd;
+        const int64_t t  = j / n_embd;
+        const char *  xr = ex_d + t * enb2 + e * sizeof(float);
+        const char *  wr = w_d + t * wnb2;
+        float         acc = *(const float *) xr * *(const float *) wr;
+        for (int64_t s = 1; s < n_slot; ++s) {
+            acc += *(const float *) (xr + s * enb1) * *(const float *) (wr + s * wnb1);
+        }
+        dst[j] = acc;
+    });
+    return idx.back() - i;
+}
+
 // Attention over a stack of states with learned queries at the CONCAT of node i, the form of the Inkling 2 depth mixing:
 //   states = CONCAT(prev, last) along dim 1, scores = query.states, SOFT_MAX, then states^T as a CONT of a TRANSPOSE
 //   times the weights; with one query the scores are MUL_MAT(query, states) and a RESHAPE, with more
@@ -7761,6 +7842,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 #endif
         if (node->op == GGML_OP_MUL_MAT) {
             const int skip = ggml_sycl_fuse_gate_mix(*sycl_ctx, cgraph, i);
+            if (skip > 0) {
+                i += skip;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_MUL) {
+            const int skip = ggml_sycl_fuse_moe_reduce(*sycl_ctx, cgraph, i);
             if (skip > 0) {
                 i += skip;
                 continue;
