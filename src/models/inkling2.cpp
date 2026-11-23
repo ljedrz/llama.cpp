@@ -262,7 +262,11 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     }
 
     out = ggml_add(ctx0, cur, out);
-    return scaled ? ggml_scale(ctx0, out, conv_scale(dynamic != nullptr)) : out;
+    out = scaled ? ggml_scale(ctx0, out, conv_scale(dynamic != nullptr)) : out;
+
+    // right after the concat and the state store, so a backend can run the conv step as one kernel
+    ggml_build_forward_expand(gf, out);
+    return out;
 }
 
 float llama_model_inkling2::graph::conv_scale(bool dynamic) const {
