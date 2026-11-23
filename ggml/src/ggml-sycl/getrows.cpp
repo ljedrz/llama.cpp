@@ -561,7 +561,13 @@ static void rel_bias_mask_sycl(const ggml_sycl_rel_bias_mask_args & a, queue_ptr
         if (k >= p.n_kv) {
             return;
         }
-        const int32_t i   = *(const int32_t *) (p.idx + k*p.ib0 + q*p.ib1);
+        int64_t i;
+        if (p.kv_pos) {
+            const uint32_t d = (uint32_t) p.q_pos[q] - (uint32_t) p.kv_pos[k];
+            i = d < p.d_max ? d : p.d_max;
+        } else {
+            i = *(const int32_t *) (p.idx + k*p.ib0 + q*p.ib1);
+        }
         const char *  row = p.table + i*p.tb1 + q*p.tb2;
         const float   m   = (float) *(const mask_t *) (p.mask + k*p.mb0 + q*p.mb1);
         dst_t *       d   = (dst_t *) (p.dst + q*p.db1) + k;

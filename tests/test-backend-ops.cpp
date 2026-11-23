@@ -4708,7 +4708,9 @@ struct test_add_unary_mul : public test_case {
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
 // flash attention with a relative-position bias (ggml_flash_attn_ext_add_rel_bias): the table is a view of a
-// [n_dist, n_head*n_batch] matrix as Inkling 2 builds it, the mask is shared by the heads
+// [n_dist, n_head*n_batch] matrix as Inkling 2 builds it, the mask is shared by the heads. The cells hold the
+// positions of a wrapped ring (as a SWA cache does) with empty cells, cells after the queries are not masked (their
+// distance clamps to the last one), and distances run past the table.
 struct test_flash_attn_ext_rel : public test_case {
     const int64_t hs, nh, nr2, kv, nb, n_dist;
     const bool    sinks;
@@ -4723,6 +4725,10 @@ struct test_flash_attn_ext_rel : public test_case {
                             int64_t n_dist = 129, bool sinks = true)
         : hs(hs), nh(nh), nr2(nr2), kv(kv), nb(nb), n_dist(n_dist), sinks(sinks) {}
 
+    static constexpr int64_t pos_base = 5;
+
+    static bool cell_empty(int64_t j) { return j % 17 == 5; }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_head = nh*nr2;
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, n_head, 1);
@@ -4736,8 +4742,10 @@ struct test_flash_attn_ext_rel : public test_case {
         ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_dist, n_head*nb);
         ggml_set_name(t, "t");
         ggml_tensor * table = ggml_reshape_3d(ctx, t, n_dist, n_head, nb);
-        ggml_tensor * rel_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, nb);
-        ggml_set_name(rel_pos, "rel_pos");
+        ggml_tensor * kv_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv);
+        ggml_set_name(kv_pos, "kv_pos");
+        ggml_tensor * q_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nb);
+        ggml_set_name(q_pos, "q_pos");
 
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
         if (sinks) {
@@ -4745,7 +4753,7 @@ struct test_flash_attn_ext_rel : public test_case {
             ggml_set_name(s, "s");
             ggml_flash_attn_ext_add_sinks(out, s);
         }
-        ggml_flash_attn_ext_add_rel_bias(out, table, rel_pos);
+        ggml_flash_attn_ext_add_rel_bias(out, table, kv_pos, q_pos);
         ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
         return out;
@@ -4757,22 +4765,24 @@ struct test_flash_attn_ext_rel : public test_case {
                 init_tensor_uniform(t, -4.0f, 4.0f);
             } else if (strcmp(t->name, "t") == 0) {
                 init_tensor_uniform(t, -2.0f, 2.0f);
-            } else if (strcmp(t->name, "rel_pos") == 0) {
-                // the clamped distance of token i (at position kv - nb + i) to cell j
-                std::vector<int32_t> data(ggml_nelements(t));
+            } else if (strcmp(t->name, "kv_pos") == 0) {
+                std::vector<int32_t> data(kv);
+                for (int64_t j = 0; j < kv; ++j) {
+                    data[j] = cell_empty(j) ? INT32_MAX : (int32_t) (pos_base + (j + kv/3) % kv);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "q_pos") == 0) {
+                std::vector<int32_t> data(nb);
                 for (int64_t i = 0; i < nb; ++i) {
-                    for (int64_t j = 0; j < kv; ++j) {
-                        const int64_t d = std::abs(kv - nb + i - j);
-                        data[i*kv + j] = (int32_t) std::min<int64_t>(d, n_dist - 1);
-                    }
+                    data[i] = (int32_t) (pos_base + kv - nb + i);
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
             } else if (strcmp(t->name, "m") == 0) {
-                // causal, plus a masked block at the start so whole chunks are masked out
+                // empty cells and a block at the start (so whole chunks are masked out), no causal mask
                 std::vector<ggml_fp16_t> data(ggml_nelements(t));
                 for (int64_t i = 0; i < nb; ++i) {
                     for (int64_t j = 0; j < kv; ++j) {
-                        const bool vis = j <= kv - nb + i && j >= kv/4;
+                        const bool vis = !cell_empty(j) && j >= kv/4;
                         data[i*kv + j] = ggml_fp32_to_fp16(vis ? 0.0f : -INFINITY);
                     }
                 }

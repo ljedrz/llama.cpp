@@ -43,13 +43,34 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst);
 
 size_t ggml_sycl_flash_attn_ext_get_alloc_size(const ggml_tensor * dst);
 
-// the relative-position bias of a flash attention node (src[6], src[7]): bias[kv, q, h] = table[pos[kv, q], h, q]
+// the relative-position bias of a flash attention node (src[6..8]): bias[kv, q, h] = table[d, h, q] with
+// d = min((uint32_t) (q_pos[q] - kv_pos[kv]), d_max), see ggml_flash_attn_ext_add_rel_bias
 struct ggml_sycl_fattn_rel_bias {
-    const char *    table = nullptr;  // null: no bias
-    const int32_t * pos   = nullptr;
-    int64_t         tb1 = 0, tb2 = 0; // table strides in bytes (along the head and the query); distances are contiguous
-    int64_t         pb0 = 0, pb1 = 0; // pos strides in elements (along kv and the query)
+    const char *    table  = nullptr;  // null: no bias
+    const int32_t * kv_pos = nullptr;
+    const int32_t * q_pos  = nullptr;
+    int64_t         tb1 = 0, tb2 = 0;  // table strides in bytes (along the head and the query); distances are contiguous
+    uint32_t        d_max = 0;         // n_dist - 1
 };
+
+// the bias table index of a query at position qp and a cell at position kp
+static inline uint32_t ggml_sycl_rel_dist(int32_t qp, int32_t kp, uint32_t d_max) {
+    const uint32_t d = (uint32_t) qp - (uint32_t) kp;
+    return d < d_max ? d : d_max;
+}
+
+static inline ggml_sycl_fattn_rel_bias ggml_sycl_fattn_get_rel_bias(const ggml_tensor * dst) {
+    ggml_sycl_fattn_rel_bias rel = {};
+    if (const ggml_tensor * table = dst->src[6]) {
+        rel.table  = (const char *) table->data;
+        rel.kv_pos = (const int32_t *) dst->src[7]->data;
+        rel.q_pos  = (const int32_t *) dst->src[8]->data;
+        rel.tb1    = (int64_t) table->nb[1];
+        rel.tb2    = (int64_t) table->nb[2];
+        rel.d_max  = (uint32_t) (table->ne[0] - 1);
+    }
+    return rel;
+}
 
 void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 

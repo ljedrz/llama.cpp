@@ -21,11 +21,13 @@ struct ggml_sycl_attn_dec_args {
     bool         mask_f16;
     bool         v_rows;
     int64_t      o_t, o_h;
-    // relative-position bias (see ggml_flash_attn_ext_add_rel_bias): table[rel_pos[kv, token], head, token], or null
+    // relative-position bias (see ggml_flash_attn_ext_add_rel_bias): table[min(q_pos[token] - kv_pos[kv], r_dmax), head,
+    // token], or null
     const char *    rel_table;
-    const int32_t * rel_pos;
+    const int32_t * rel_kv_pos;
+    const int32_t * rel_q_pos;
     size_t          r_tb1, r_tb2;   // table strides in bytes along the head and the token
-    size_t          r_pb0, r_pb1;   // rel_pos strides in elements along kv and the token
+    uint32_t        r_dmax;         // n_dist - 1
 };
 
 bool ggml_sycl_attn_dec_supported(int64_t D, int64_t nq);

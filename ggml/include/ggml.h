@@ -2292,15 +2292,20 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
-    // relative-position bias added to the scores, in addition to the mask:
-    //   bias[i_kv, i_batch, h] = table[rel_pos[i_kv, i_batch], h, i_batch]
-    // table:   [n_dist, n_head, n_batch, 1] F32 with contiguous rows (the distances of a head and a query)
-    // rel_pos: [n_kv,   n_batch, 1,       1] I32, values in [0, n_dist)
+    // relative-position bias added to the scores, in addition to the mask, from the positions of the KV cells and of
+    // the queries:
+    //   bias[i_kv, i_batch, h] = table[d, h, i_batch], d = min((uint32_t) (q_pos[i_batch] - kv_pos[i_kv]), n_dist - 1)
+    // so a cell after the query or farther than n_dist - 2 takes the last distance; an empty cell can be given
+    // INT32_MAX (and must be masked out)
+    // table:  [n_dist, n_head, n_batch, 1] F32 with contiguous rows (the distances of a head and a query)
+    // kv_pos: [n_kv] I32, contiguous
+    // q_pos:  [n_batch] I32, contiguous
     // not with kv_rows; q, k, v must have ne[3] == 1
     GGML_API void ggml_flash_attn_ext_add_rel_bias(
             struct ggml_tensor * a,
             struct ggml_tensor * table,
-            struct ggml_tensor * rel_pos);
+            struct ggml_tensor * kv_pos,
+            struct ggml_tensor * q_pos);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

@@ -8982,7 +8982,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * kv_rows = dst->src[5];
     const ggml_tensor * rel_table = dst->src[6];
-    const ggml_tensor * rel_pos   = dst->src[7];
+    const ggml_tensor * rel_kv_pos = dst->src[7];
+    const ggml_tensor * rel_q_pos  = dst->src[8];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9087,9 +9088,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const int32_t * rows = kv_rows ? (const int32_t *) ((const char *) kv_rows->data + iq3*kv_rows->nb[1]) : nullptr;
 
-        // relative-position bias of this query and head: table[rel_pos[ic, iq1], h, iq1]
-        const char * rel_t = rel_table ? (const char *) rel_table->data + iq2*rel_table->nb[1] + iq1*rel_table->nb[2] : nullptr;
-        const char * rel_p = rel_pos   ? (const char *) rel_pos->data + iq1*rel_pos->nb[1] : nullptr;
+        // relative-position bias of this query and head: table[min(q_pos[iq1] - kv_pos[ic], n_dist - 1), h, iq1]
+        const char *    rel_t  = rel_table ? (const char *) rel_table->data + iq2*rel_table->nb[1] + iq1*rel_table->nb[2] : nullptr;
+        const int32_t * rel_kp = rel_table ? (const int32_t *) rel_kv_pos->data : nullptr;
+        const uint32_t  rel_qp = rel_table ? (uint32_t) ((const int32_t *) rel_q_pos->data)[iq1] : 0;
+        const uint32_t  rel_d1 = rel_table ? (uint32_t) (rel_table->ne[0] - 1) : 0;
 
         // online softmax / attention
         // loop over n_kv and n_head_kv
@@ -9120,7 +9123,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             s += mv; // apply mask
 
             if (rel_t) {
-                s += ((const float *) rel_t)[*(const int32_t *) (rel_p + ic*rel_pos->nb[0])];
+                s += ((const float *) rel_t)[std::min(rel_qp - (uint32_t) rel_kp[ic], rel_d1)];
             }
 
             const float Mold = M;

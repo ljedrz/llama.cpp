@@ -19,6 +19,7 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor *dst);
 void ggml_sycl_op_get_rows_back(ggml_backend_sycl_context & ctx, ggml_tensor *dst);
 
 // dst[k, q, h] = table[h, idx[k, q], q] + mask[k, q]: a gathered per-head bias added to a KQ mask, written per head.
+// With kv_pos set, idx[k, q] = min((uint32_t) (q_pos[q] - kv_pos[k]), d_max) and idx is not read.
 // Strides in bytes. The mask is F32 or F16, dst is F32 or F16 with contiguous rows.
 struct ggml_sycl_rel_bias_mask_args {
     const char * table;
@@ -32,6 +33,9 @@ struct ggml_sycl_rel_bias_mask_args {
     size_t       db1, db2;
     bool         mask_f16;
     bool         dst_f16;
+    const int32_t * kv_pos = nullptr;
+    const int32_t * q_pos  = nullptr;
+    uint32_t        d_max  = 0;
 };
 
 void ggml_sycl_rel_bias_mask(const ggml_sycl_rel_bias_mask_args & a, queue_ptr stream);

@@ -85,7 +85,8 @@ static void attn_dec_chunk(const ggml_sycl_attn_dec_args a, const int C, float *
     for (int j = sgi; j < NQ; j += ATTN_DEC_NSG) {
         const char * mrow = a.mask ? a.mask + c0 * a.m_nb0 + (j / G) * a.m_nb1 + ((hkv * G + j % G) % a.mask_heads) * a.m_nb2 : nullptr;
         const float *   rt = a.rel_table ? (const float *) (a.rel_table + (hkv * G + j % G) * a.r_tb1 + (j / G) * a.r_tb2) : nullptr;
-        const int32_t * rp = a.rel_table ? a.rel_pos + c0 * a.r_pb0 + (j / G) * a.r_pb1 : nullptr;
+        const int32_t * rp = a.rel_table ? a.rel_kv_pos + c0 : nullptr;
+        const uint32_t  rq = a.rel_table ? (uint32_t) a.rel_q_pos[j / G] : 0;
         float m = -INFINITY;
         for (int kk = lane; kk < cn; kk += WARP_SIZE) {
             float s = sc[j * C + kk];
@@ -93,7 +94,8 @@ static void attn_dec_chunk(const ggml_sycl_attn_dec_args a, const int C, float *
                 s += (float) *(const mask_t *) (mrow + kk * a.m_nb0);
             }
             if (rt) {
-                s += rt[rp[kk * a.r_pb0]];
+                const uint32_t d = rq - (uint32_t) rp[kk];
+                s += rt[d < a.r_dmax ? d : a.r_dmax];
             }
             if (mrow || rt) {
                 sc[j * C + kk] = s;
