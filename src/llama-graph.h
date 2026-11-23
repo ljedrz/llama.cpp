@@ -806,9 +806,16 @@ public:
     llm_graph_input_attn_kv_iswa * get_attn() const { return inp_attn.get(); }
     llm_graph_input_rs           * get_recr() const { return inp_rs.get(); }
 
-    // distance from the token to the cell, extent for the empty, future and more distant cells
+    // attention without flash attention (or several streams): distance from the token to the cell, extent for the
+    // empty, future and more distant cells
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
+
+    // flash attention: the positions of the cells (INT32_MAX for an empty one) and of the tokens, the kernels take the
+    // distance from them (see ggml_flash_attn_ext_add_rel_bias). Only the inputs the graph uses get a buffer.
+    ggml_tensor * self_kv_pos     = nullptr; // I32 [n_kv]
+    ggml_tensor * self_kv_pos_swa = nullptr; // I32 [n_kv_swa]
+    ggml_tensor * self_q_pos      = nullptr; // I32 [n_batch]
 
     const uint32_t extent;
     const uint32_t extent_swa;
@@ -1340,8 +1347,9 @@ struct llm_graph_context {
                 int64_t   n_kv_max,
                   float   kq_scale,
                     int   il,
-            ggml_tensor * rel_table = nullptr,  // flash attention only: [n_head_q, n_dist, n_tokens], see ggml_flash_attn_ext_add_rel_bias
-            ggml_tensor * rel_pos   = nullptr) const; // [n_kv, n_tokens] I32
+            ggml_tensor * rel_table  = nullptr,  // flash attention only: [n_dist, n_head_q, n_tokens], see ggml_flash_attn_ext_add_rel_bias
+            ggml_tensor * rel_kv_pos = nullptr,  // [n_kv] I32
+            ggml_tensor * rel_q_pos  = nullptr) const; // [n_tokens] I32
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
