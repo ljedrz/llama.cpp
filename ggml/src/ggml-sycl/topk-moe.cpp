@@ -21,9 +21,10 @@ struct ggml_sycl_topk_moe_args {
 };
 
 struct topk_moe_config {
-    bool use_sigmoid;
-    bool with_norm;
-    bool delayed_softmax;
+    bool  use_sigmoid;
+    bool  with_norm;
+    bool  delayed_softmax;
+    float norm_eps;  // added to the weight sum before the clamp (expert_weights_norm_eps graphs: SCALE(sum, 1, eps))
 };
 
 // warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path
@@ -230,7 +231,7 @@ static void topk_moe_kernel(const float * __restrict__ logits,
 
     if (config.with_norm) {
         wt_sum          = warp_reduce_sum<WARP_SIZE>(wt_sum);
-        wt_sum          = sycl::fmax(wt_sum, clamp_val);
+        wt_sum          = sycl::fmax(wt_sum + config.norm_eps, clamp_val);
         const float inv = 1.0f / wt_sum;
 #pragma unroll
         for (int i = 0; i < experts_per_thread; i++) {
@@ -297,14 +298,18 @@ static void ggml_sycl_op_topk_moe(ggml_backend_sycl_context &     ctx,
     int32_t *     ids_d     = (int32_t *) ids->data;
     const float * bias_d    = bias ? (const float *) bias->data : nullptr;
 
-    const bool  with_norm = clamp != nullptr;
-    const float clamp_val = clamp ? ggml_get_op_params_f32(clamp, 0) : -INFINITY;
-    const float scale_val = scale ? ggml_get_op_params_f32(scale, 0) : 1.0f;
+    // the sum goes through CLAMP(sum, min) or, with an epsilon, SCALE(sum, 1, eps)
+    const bool  with_norm   = clamp != nullptr;
+    const bool  clamp_is_op = clamp && clamp->op == GGML_OP_CLAMP;
+    const float clamp_val   = clamp_is_op ? ggml_get_op_params_f32(clamp, 0) : -INFINITY;
+    const float norm_eps    = clamp && !clamp_is_op ? ggml_get_op_params_f32(clamp, 1) : 0.0f;
+    const float scale_val   = scale ? ggml_get_op_params_f32(scale, 0) : 1.0f;
 
     topk_moe_config config;
     config.use_sigmoid     = args.sigmoid;
     config.with_norm       = with_norm;
     config.delayed_softmax = args.delayed_softmax;
+    config.norm_eps        = norm_eps;
 
     queue_ptr stream = ctx.stream();
     ggml_sycl_set_device(ctx.device);
@@ -499,12 +504,18 @@ static bool ggml_sycl_topk_moe_fusion(const ggml_cgraph * cgraph, int node_idx, 
     }
 
     if (nodes[node_idx]->op == GGML_OP_RESHAPE) {
-        // check RESHAPE -> SUM_ROWS -> CLAMP -> DIV -> RESHAPE
+        // check RESHAPE -> SUM_ROWS -> CLAMP (or SCALE(x, 1, eps)) -> DIV -> RESHAPE
         static const std::vector<ggml_op> norm_ops = { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP };
 
         args.norm = true;
         for (const ggml_op op : norm_ops) {
-            if (nodes[node_idx]->op == op && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
+            if (node_idx >= n_nodes || nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
+                args.norm = false;
+                return true;
+            }
+            const ggml_tensor * t = nodes[node_idx];
+            const bool eps_add = op == GGML_OP_CLAMP && t->op == GGML_OP_SCALE && ggml_get_op_params_f32(t, 0) == 1.0f;
+            if (t->op == op || eps_add) {
                 node_idx++;
             } else {
                 args.norm = false;
@@ -638,6 +649,7 @@ int ggml_sycl_fuse_topk_moe(ggml_backend_sycl_context & ctx, ggml_cgraph * cgrap
         if (args.norm) {
             ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE });
             clamp = cgraph->nodes[i + (int) ops.size() - 3];
+            ops[ops.size() - 3] = clamp->op;  // CLAMP or SCALE
         }
         if (args.scale) {
             ops.insert(ops.end(), { GGML_OP_SCALE });
