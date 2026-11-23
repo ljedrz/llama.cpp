@@ -4436,13 +4436,17 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const int64_t n_head = rel_table->ne[0];
 
-    ggml_tensor * kq_b = ggml_get_rows(ctx0, rel_table, rel_pos);
+    // several streams with flash attention: attention without it over the flash attention cache, with the bias as KQ
+    // bias, which build_attn_mha adds before the softmax scales the scores by kq_scale
+    GGML_ASSERT(!cparams.flash_attn || !hparams.attn_soft_cap);
+    ggml_tensor * table = cparams.flash_attn ? ggml_scale(ctx0, rel_table, 1.0f/kq_scale) : rel_table;
+
+    ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
     kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
     // the mask is added to the permuted view
     kq_b = ggml_permute(ctx0, kq_b, 2, 0, 1, 3);
     cb(kq_b, "kq_b", il);
 
-    // several streams with flash attention: attention without it over the flash attention cache, the bias as KQ bias
     if (cparams.flash_attn) {
         return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, kq_b, attn_mask.raw, nullptr, sinks, nullptr, kq_scale, il);
     }
