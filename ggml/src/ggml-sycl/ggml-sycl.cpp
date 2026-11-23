@@ -6217,14 +6217,18 @@ static int ggml_sycl_fuse_gate_mix(ggml_backend_sycl_context & ctx, ggml_cgraph 
     return idx[n_ops - 1] - i;
 }
 
-// SSM_CONV at node i with a residual: ADD of the conv and res (through a RESHAPE), then optionally SCALE and an ADD of
-// a second residual res2, as out = res2 + scale*(res + conv). Runs them as one kernel and returns the number of nodes
-// after i it took, 0 when the pattern does not match.
-static int ggml_sycl_fuse_ssm_conv_residual(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
-    ggml_tensor * conv = cgraph->nodes[i];
-    if (!g_ggml_sycl_enable_fusion || conv->op != GGML_OP_SSM_CONV || !ggml_is_contiguous(conv)) {
-        return 0;
-    }
+// The residual chain after the SSM_CONV conv, from node k on: ADD of the conv and res (through a RESHAPE), then
+// optionally SCALE and an ADD of a second residual res2, as out = res2 + scale*(res + conv). Appends the nodes it takes
+// (with the views before each) to idx / ops; n_chain[step] is the size of idx after each step, 0 where it stopped.
+struct ggml_sycl_conv_chain {
+    int                 n_chain[3] = {};
+    const ggml_tensor * res        = nullptr;
+    const ggml_tensor * res2       = nullptr;
+};
+
+static ggml_sycl_conv_chain ggml_sycl_match_conv_chain(const ggml_cgraph * cgraph, const ggml_tensor * conv, int k,
+                                                       std::vector<int> & idx, std::vector<ggml_op> & ops) {
+    ggml_sycl_conv_chain ch;
     // the operand of a binary node other than src, src reached through views only
     const auto other = [](const ggml_tensor * node, const ggml_tensor * src) -> const ggml_tensor * {
         for (int j = 0; j < 2; ++j) {
@@ -6244,19 +6248,13 @@ static int ggml_sycl_fuse_ssm_conv_residual(ggml_backend_sycl_context & ctx, ggm
                ggml_nelements(t) == ggml_nelements(conv);
     };
 
-    // the chain: ADD, then SCALE, then ADD, each with the views before it
-    std::vector<int>     idx = { i };
-    std::vector<ggml_op> ops = { GGML_OP_SSM_CONV };
-    int                  n_chain[3] = {};
-    const ggml_tensor *  prev = conv;
-    const ggml_tensor *  res  = nullptr;
-    const ggml_tensor *  res2 = nullptr;
-    for (int step = 0, k = i + 1; step < 3; ++step, ++k) {
+    const ggml_tensor * prev = conv;
+    for (int step = 0; step < 3; ++step, ++k) {
         for (; k < cgraph->n_nodes && ggml_sycl_is_view_or_noop(cgraph->nodes[k]); ++k) {
             idx.push_back(k);
             ops.push_back(cgraph->nodes[k]->op);
         }
-        ggml_tensor * t = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
+        const ggml_tensor * t = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
         if (!t || !fits(t)) {
             break;
         }
@@ -6269,35 +6267,212 @@ static int ggml_sycl_fuse_ssm_conv_residual(ggml_backend_sycl_context & ctx, ggm
             if (!fits(r)) {
                 break;
             }
-            (step == 0 ? res : res2) = r;
+            (step == 0 ? ch.res : ch.res2) = r;
         }
         idx.push_back(k);
         ops.push_back(t->op);
-        n_chain[step] = (int) idx.size();
+        ch.n_chain[step] = (int) idx.size();
         prev = t;
     }
+    return ch;
+}
+
+static bool ggml_sycl_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
+// SSM_CONV at node i with a residual (see ggml_sycl_match_conv_chain) as one kernel. Returns the number of nodes after
+// i it took, 0 when the pattern does not match.
+static int ggml_sycl_fuse_ssm_conv_residual(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * conv = cgraph->nodes[i];
+    if (!g_ggml_sycl_enable_fusion || conv->op != GGML_OP_SSM_CONV || !ggml_is_contiguous(conv)) {
+        return 0;
+    }
+    std::vector<int>           idx = { i };
+    std::vector<ggml_op>       ops = { GGML_OP_SSM_CONV };
+    const ggml_sycl_conv_chain ch  = ggml_sycl_match_conv_chain(cgraph, conv, i + 1, idx, ops);
 
     // the longest chain that can be fused
     for (int step = 2; step >= 0; --step) {
-        const int n = n_chain[step];
+        const int n = ch.n_chain[step];
         if (n == 0 || !ggml_can_fuse_subgraph_ext(cgraph, idx.data(), n, ops.data(), &idx[n - 1], 1)) {
             continue;
         }
         ggml_tensor *       out = cgraph->nodes[idx[n - 1]];
-        const float         sc  = step >= 1 ? ggml_get_op_params_f32(cgraph->nodes[idx[n_chain[1] - 1]], 0) : 1.0f;
-        const ggml_tensor * r2  = step == 2 ? res2 : nullptr;
+        const float         sc  = step >= 1 ? ggml_get_op_params_f32(cgraph->nodes[idx[ch.n_chain[1] - 1]], 0) : 1.0f;
+        const ggml_tensor * res = ch.res;
+        const ggml_tensor * r2  = step == 2 ? ch.res2 : nullptr;
         // the kernel reads the conv input around the element it writes, and res and res2 at it
-        const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
-            const char * a0 = (const char *) a->data;
-            const char * b0 = (const char *) b->data;
-            return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
-        };
-        if (overlap(out, conv->src[0]) || (overlap(out, res) && out->data != res->data) ||
-            (r2 && overlap(out, r2) && out->data != r2->data)) {
+        if (ggml_sycl_overlap(out, conv->src[0]) || (ggml_sycl_overlap(out, res) && out->data != res->data) ||
+            (r2 && ggml_sycl_overlap(out, r2) && out->data != r2->data)) {
             return 0;
         }
         ggml_sycl_ssm_conv_residual(ctx, conv, res, sc, r2, out);
         return idx[n - 1] - i;
+    }
+    return 0;
+}
+
+// A conv step at the CONCAT of node i, the form of build_conv_state_store with the conv after it:
+//   CONCAT(past, x) along dim 0, the state store (CPY of its last columns, or SET_ROWS of overlapping windows of it
+//   into slots), SSM_CONV of the concat, then the residual chain of ggml_sycl_match_conv_chain, with views in between.
+// Runs them as one kernel for a few tokens and returns the number of nodes after i it took, 0 when the pattern does not
+// match. The concat is still written (other nodes may read views of it).
+static int ggml_sycl_fuse_conv_step(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * cat = cgraph->nodes[i];
+    if (!g_ggml_sycl_enable_fusion || cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat, 0) != 0 ||
+        cat->type != GGML_TYPE_F32 || !ggml_is_contiguous(cat) || cat->ne[3] != 1) {
+        return 0;
+    }
+    const ggml_tensor * past = cat->src[0];
+    const ggml_tensor * x    = cat->src[1];
+    const int64_t       n    = x->ne[0];
+    const int64_t       np   = past->ne[0];
+    const int64_t       C    = cat->ne[1];
+    const int64_t       S    = cat->ne[2];
+    if (past->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || past->nb[0] != sizeof(float) ||
+        !ggml_sycl_conv_step_supported(np + 1, n) || past->ne[1] != C || past->ne[2] != S || x->ne[1] != C ||
+        x->ne[2] != S || past->ne[3] != 1 || x->ne[3] != 1) {
+        return 0;
+    }
+    // a view of the concat (not of something else) taken into the fused nodes; other views are no-ops left out
+    const auto views_of = [&](int & k, std::vector<int> & idx, std::vector<ggml_op> & ops) {
+        for (; k < cgraph->n_nodes && ggml_sycl_is_view_or_noop(cgraph->nodes[k]); ++k) {
+            if (cgraph->nodes[k]->view_src == cat) {
+                idx.push_back(k);
+                ops.push_back(cgraph->nodes[k]->op);
+            }
+        }
+    };
+    std::vector<int>     idx = { i };
+    std::vector<ggml_op> ops = { GGML_OP_CONCAT };
+    int                  k   = i + 1;
+    views_of(k, idx, ops);
+
+    ggml_sycl_conv_step_args a = {};
+    a.past  = (const float *) past->data;
+    a.p_nb1 = past->nb[1];
+    a.p_nb2 = past->nb[2];
+    a.x     = (const char *) x->data;
+    a.x_nb0 = x->nb[0];
+    a.x_nb1 = x->nb[1];
+    a.x_nb2 = x->nb[2];
+    a.cat   = (float *) cat->data;
+    a.C     = C;
+    a.n     = n;
+    a.S     = S;
+
+    // the state store
+    ggml_tensor * st = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
+    if (!st || (st->op != GGML_OP_CPY && st->op != GGML_OP_SET_ROWS) || st->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    const ggml_tensor * sv = st->src[0];
+    if (sv->view_src != cat || sv->type != GGML_TYPE_F32 || sv->nb[0] != sizeof(float)) {
+        return 0;
+    }
+    a.st     = (char *) st->data;
+    a.n_keep = sv->ne[0];
+    if (st->op == GGML_OP_CPY) {
+        // the last n_keep columns: [n_keep, C, S] at column np + n - n_keep, into a destination with contiguous rows
+        if (sv->ne[0] > np + n || sv->ne[1] != C || sv->ne[2] != S || sv->nb[1] != cat->nb[1] || sv->nb[2] != cat->nb[2] ||
+            sv->view_offs != (size_t) (np + n - sv->ne[0]) * sizeof(float) || sv->ne[0] != np ||
+            st->nb[0] != sizeof(float) || st->ne[2] != 1 || st->ne[3] != 1 || ggml_nelements(st) != ggml_nelements(sv)) {
+            return 0;
+        }
+        a.store  = 1;
+        a.st_ne0 = st->ne[0];
+        a.st_nb0 = st->nb[0];
+        a.st_nb1 = st->nb[1];
+    } else {
+        // overlapping windows [n_keep, Kw, C, S] of the concat, one column apart, into the rows idx of [n_keep, K, C, S]
+        const ggml_tensor * ids = st->src[1];
+        const int64_t       kw  = sv->ne[1];
+        if (ids->type != GGML_TYPE_I32 || ids->ne[0] != kw || ggml_nelements(ids) != kw || !ggml_is_contiguous(ids) ||
+            sv->ne[0] != np || sv->nb[1] != sizeof(float) || sv->ne[2] != C || sv->ne[3] != S || sv->nb[2] != cat->nb[1] ||
+            sv->nb[3] != cat->nb[2] || sv->view_offs % sizeof(float) != 0 || st->ne[0] != np || st->ne[2] != C ||
+            st->ne[3] != S) {
+            return 0;
+        }
+        const int64_t first = (int64_t) (sv->view_offs / sizeof(float));
+        if (first + kw - 1 + np > np + n) {
+            return 0;
+        }
+        a.store    = 2;
+        a.st_idx   = (const int32_t *) ids->data;
+        a.st_kw    = kw;
+        a.st_first = first;
+        a.st_nb0   = st->nb[0];
+        a.st_nb1   = st->nb[1];
+        a.st_nb2   = st->nb[2];
+        a.st_nb3   = st->nb[3];
+    }
+    const int i_store = k;
+    idx.push_back(k);
+    ops.push_back(st->op);
+    ++k;
+    views_of(k, idx, ops);
+
+    // the conv of the concat
+    ggml_tensor * conv = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
+    if (!conv || conv->op != GGML_OP_SSM_CONV || conv->src[0] != cat || conv->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(conv) || conv->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(conv->src[1]) ||
+        conv->src[1]->ne[0] != np + 1 || conv->src[1]->ne[1] != C) {
+        return 0;
+    }
+    a.w = (const float *) conv->src[1]->data;
+    idx.push_back(k);
+    ops.push_back(GGML_OP_SSM_CONV);
+    const int                  n_conv = (int) idx.size();
+    const ggml_sycl_conv_chain ch     = ggml_sycl_match_conv_chain(cgraph, conv, k + 1, idx, ops);
+
+    // the longest chain that can be fused (step -1: the conv without a residual)
+    for (int step = 2; step >= -1; --step) {
+        const int n_nodes = step >= 0 ? ch.n_chain[step] : n_conv;
+        if (n_nodes == 0) {
+            continue;
+        }
+        // the concat is written only when a node outside these reads it (the dynamic taps of a full-attention layer)
+        const int outs[3]   = { i_store, idx[n_nodes - 1], i };
+        bool      write_cat = false;
+        if (!ggml_can_fuse_subgraph_ext(cgraph, idx.data(), n_nodes, ops.data(), outs, 2)) {
+            if (!ggml_can_fuse_subgraph_ext(cgraph, idx.data(), n_nodes, ops.data(), outs, 3)) {
+                continue;
+            }
+            write_cat = true;
+        }
+        ggml_tensor *       out = cgraph->nodes[idx[n_nodes - 1]];
+        const ggml_tensor * res = step >= 0 ? ch.res : nullptr;
+        const ggml_tensor * r2  = step == 2 ? ch.res2 : nullptr;
+        // a work-item reads the window of its channel and writes the concat, the state and the outputs of its channel:
+        // a write may only alias a read at the same element (out on res or res2, in place)
+        // (x is a view of res, written in place through out, when the residual is the conv input itself)
+        const bool          x_in_res = res && x->view_src == res && out->data == res->data;
+        const ggml_tensor * reads[]  = { past, conv->src[1] };
+        const ggml_tensor * writes[] = { cat, st, out };
+        bool                bad      = false;
+        for (const ggml_tensor * w : writes) {
+            for (const ggml_tensor * r : reads) {
+                bad = bad || ggml_sycl_overlap(w, r);
+            }
+            bad = bad || (ggml_sycl_overlap(w, x) && !(w == out && x_in_res));
+            bad = bad || (res && ggml_sycl_overlap(w, res) && !(w == out && out->data == res->data));
+            bad = bad || (r2 && ggml_sycl_overlap(w, r2) && !(w == out && out->data == r2->data));
+        }
+        bad = bad || ggml_sycl_overlap(cat, st) || ggml_sycl_overlap(cat, out) || ggml_sycl_overlap(st, out);
+        if (bad) {
+            return 0;
+        }
+        a.cat   = write_cat ? (float *) cat->data : nullptr;
+        a.out   = (float *) out->data;
+        a.res   = res ? (const float *) res->data : nullptr;
+        a.res2  = r2 ? (const float *) r2->data : nullptr;
+        a.scale = step >= 1 ? ggml_get_op_params_f32(cgraph->nodes[idx[ch.n_chain[1] - 1]], 0) : 1.0f;
+        scope_op_debug_print scope_dbg_print(__func__, out, /*num_src=*/2, " : conv step");
+        ggml_sycl_conv_step(ctx, a);
+        return idx[n_nodes - 1] - i;
     }
     return 0;
 }
@@ -7902,6 +8077,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         if (node->op == GGML_OP_GET_ROWS) {
             const int skip = ggml_sycl_fuse_rel_bias_mask(*sycl_ctx, cgraph, i);
+            if (skip > 0) {
+                i += skip;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_CONCAT) {
+            const int skip = ggml_sycl_fuse_conv_step(*sycl_ctx, cgraph, i);
             if (skip > 0) {
                 i += skip;
                 continue;

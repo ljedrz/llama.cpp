@@ -671,3 +671,101 @@ void ggml_sycl_ssm_conv_window(ggml_backend_sycl_context & ctx, const ggml_sycl_
                            state->nb[1] / fs, state->nb[2] / fs, xt->nb[0] / fs, xt->nb[1] / fs, xt->nb[2] / fs,
                            m.cpy[0]->src[1]->nb[1] / fs);
 }
+
+template <int NT>
+static void conv_step_kernel(const ggml_sycl_conv_step_args a, const sycl::nd_item<1> & it) {
+    constexpr int DC = 4;
+    constexpr int NP = DC - 1;
+    const int64_t j  = it.get_global_id(0);
+    if (j >= a.C * a.S) {
+        return;
+    }
+    const int64_t c = j % a.C;
+    const int64_t s = j / a.C;
+
+    float col[NP + NT];
+    const float * p = (const float *) ((const char *) a.past + c * a.p_nb1 + s * a.p_nb2);
+#pragma unroll
+    for (int k = 0; k < NP; ++k) {
+        col[k] = p[k];
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        col[NP + t] = *(const float *) (a.x + t * a.x_nb0 + c * a.x_nb1 + s * a.x_nb2);
+    }
+    if (a.cat) {
+        float * cc = a.cat + (s * a.C + c) * (NP + NT);
+#pragma unroll
+        for (int k = 0; k < NP + NT; ++k) {
+            cc[k] = col[k];
+        }
+    }
+    if (a.store == 1) {
+#pragma unroll
+        for (int k = 0; k < NP; ++k) {
+            if (k < a.n_keep) {
+                const int64_t f = k + a.n_keep * (c + a.C * s);
+                *(float *) (a.st + (f % a.st_ne0) * a.st_nb0 + (f / a.st_ne0) * a.st_nb1) = col[NT + k];
+            }
+        }
+    } else if (a.store == 2) {
+        for (int64_t w = 0; w < a.st_kw; ++w) {
+            char * row = a.st + (int64_t) a.st_idx[w] * a.st_nb1 + c * a.st_nb2 + s * a.st_nb3;
+            for (int64_t k = 0; k < a.n_keep; ++k) {
+                // the window starts at column first + w; NP + NT bounds the column for the register array
+                const int64_t col_i = a.st_first + w + k;
+#pragma unroll
+                for (int q = 0; q < NP + NT; ++q) {
+                    if (q == col_i) {
+                        *(float *) (row + k * a.st_nb0) = col[q];
+                    }
+                }
+            }
+        }
+    }
+    const float * wc = a.w + c * DC;
+    float         wr[DC];
+#pragma unroll
+    for (int k = 0; k < DC; ++k) {
+        wr[k] = wc[k];
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        float sumf = 0.0f;
+#pragma unroll
+        for (int k = 0; k < DC; ++k) {
+            sumf += col[t + k] * wr[k];
+        }
+        const size_t o = (size_t) (s * NT + t) * a.C + c;
+        if (a.res) {
+            sumf = a.scale * (a.res[o] + sumf);
+            if (a.res2) {
+                sumf = a.res2[o] + sumf;
+            }
+        }
+        a.out[o] = sumf;
+    }
+}
+
+bool ggml_sycl_conv_step_supported(int64_t d_conv, int64_t n) {
+    return d_conv == 4 && n >= 1 && n <= 8;
+}
+
+void ggml_sycl_conv_step(ggml_backend_sycl_context & ctx, const ggml_sycl_conv_step_args & a) {
+    GGML_ASSERT(ggml_sycl_conv_step_supported(4, a.n));
+    const int64_t n_items = a.C * a.S;
+    const int     wg      = 256;
+    const sycl::nd_range<1> r((n_items + wg - 1) / wg * wg, wg);
+    const ggml_sycl_conv_step_args p = a;
+    queue_ptr stream = ctx.stream();
+    switch (a.n) {
+        case 1: stream->parallel_for(r, [=](sycl::nd_item<1> it) { conv_step_kernel<1>(p, it); }); break;
+        case 2: stream->parallel_for(r, [=](sycl::nd_item<1> it) { conv_step_kernel<2>(p, it); }); break;
+        case 3: stream->parallel_for(r, [=](sycl::nd_item<1> it) { conv_step_kernel<3>(p, it); }); break;
+        case 4: stream->parallel_for(r, [=](sycl::nd_item<1> it) { conv_step_kernel<4>(p, it); }); break;
+        case 5: stream->parallel_for(r, [=](sycl::nd_item<1> it) { conv_step_kernel<5>(p, it); }); break;
+        case 6: stream->parallel_for(r, [=](sycl::nd_item<1> it) { conv_step_kernel<6>(p, it); }); break;
+        case 7: stream->parallel_for(r, [=](sycl::nd_item<1> it) { conv_step_kernel<7>(p, it); }); break;
+        default: stream->parallel_for(r, [=](sycl::nd_item<1> it) { conv_step_kernel<8>(p, it); }); break;
+    }
+}

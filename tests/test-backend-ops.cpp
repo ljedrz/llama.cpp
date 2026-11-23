@@ -9458,6 +9458,126 @@ struct test_moe_reduce : public test_case {
     }
 };
 
+// a short-conv step as build_conv_state_store and Inkling 2's convolve build it: CONCAT(past, x) of a channel slice of
+// the history, the state store (CPY of the last columns, or SET_ROWS of overlapping windows into rollback slots),
+// SSM_CONV of the concat and its residual chain; backends may run it as one kernel
+struct test_conv_step : public test_case {
+    const int64_t C, n, S;
+    const int     store;     // 0: CPY, 1: SET_ROWS
+    const int     chain;     // 0: none, 1: + res, 2: then SCALE, 3: then + res2
+    const bool    cat_used;  // another node reads a window of the concat (the dynamic taps)
+
+    ggml_tensor * st_node    = nullptr;
+    ggml_tensor * extra_node = nullptr;
+    ggml_tensor * out_node   = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONV_STEP";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(C, n, S, store, chain, cat_used);
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> v = { out_node, st_node };
+        if (extra_node) {
+            v.push_back(extra_node);
+        }
+        return v;
+    }
+
+    test_conv_step(int64_t C = 1024, int64_t n = 1, int64_t S = 1, int store = 0, int chain = 2, bool cat_used = false)
+        : C(C), n(n), S(S), store(store), chain(chain), cat_used(cat_used) {}
+
+    static constexpr int64_t np = 3;
+    static constexpr int64_t K  = 3;
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t R        = 2*C;   // channels of a state row: this conv is at channel offset C
+        const int64_t mem_size = S + 1; // cells: this ubatch writes from cell 1
+
+        ggml_tensor * hist = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, np, R, S);
+        ggml_set_name(hist, "hist");
+        ggml_tensor * past = ggml_view_3d(ctx, hist, np, C, S, hist->nb[1], hist->nb[2], C*hist->nb[1]);
+
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, n*S);
+        ggml_set_name(cur, "cur");
+        ggml_tensor * x   = ggml_transpose(ctx, ggml_reshape_3d(ctx, cur, C, n, S));
+        ggml_tensor * cat = ggml_concat(ctx, past, x, 0);
+
+        if (store == 0) {
+            ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, np*R, mem_size);
+            ggml_set_name(state, "state");
+            ggml_tensor * last = ggml_view_3d(ctx, cat, np, C, S, cat->nb[1], cat->nb[2], n*cat->nb[0]);
+            ggml_tensor * cell = ggml_view_2d(ctx, state, np*C, S, state->nb[1], state->nb[1] + C*np*sizeof(float));
+            st_node = ggml_cpy(ctx, last, cell);
+        } else {
+            const int64_t kw = std::min(n, K);
+            ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, np*R, mem_size*K);
+            ggml_set_name(state, "state");
+            const size_t  row   = state->nb[1];
+            ggml_tensor * slots = ggml_view_4d(ctx, state, np, K, C, S, mem_size*row, np*sizeof(float), row,
+                                               row + C*np*sizeof(float));
+            ggml_tensor * windows = ggml_view_4d(ctx, cat, np, kw, C, S, sizeof(float), cat->nb[1], cat->nb[2],
+                                                 (n - (kw - 1))*sizeof(float));
+            ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kw);
+            ggml_set_name(idx, "idx");
+            st_node = ggml_set_rows(ctx, slots, windows, idx);
+        }
+        ggml_set_name(st_node, "store");
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, st_node);
+        }
+
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, np + 1, C);
+        ggml_set_name(w, "w");
+        ggml_tensor * out = ggml_reshape_2d(ctx, ggml_ssm_conv(ctx, cat, w), C, n*S);
+        if (chain >= 1) {
+            out = ggml_add(ctx, cur, out);
+        }
+        if (chain >= 2) {
+            out = ggml_scale(ctx, out, 0.375f);
+        }
+        if (chain >= 3) {
+            ggml_tensor * res2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, n*S);
+            ggml_set_name(res2, "res2");
+            out = ggml_add(ctx, res2, out);
+        }
+        ggml_set_name(out, "out");
+        out_node = out;
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, out);
+        }
+
+        if (cat_used) {
+            ggml_tensor * win = ggml_view_3d(ctx, cat, n, C, S, cat->nb[1], cat->nb[2], sizeof(float));
+            extra_node = ggml_scale(ctx, ggml_cont(ctx, ggml_transpose(ctx, win)), 2.0f);
+            ggml_set_name(extra_node, "extra");
+            out = ggml_add(ctx, out, ggml_reshape_2d(ctx, extra_node, C, n*S));
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "idx") == 0) {
+                // the rollback slots in reverse, as s_slot_rev
+                std::vector<int32_t> data(t->ne[0]);
+                for (int64_t i = 0; i < t->ne[0]; ++i) {
+                    data[i] = (int32_t) (t->ne[0] - 1 - i);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (t->type == GGML_TYPE_F32 && !ggml_is_view_op(t->op)) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // mul_mat with src1 in [0, 1]: a zero-mean src1 hides errors in the zero point or the min of a quantized src0
 struct test_mul_mat_pos : public test_mul_mat {
     using test_mul_mat::test_mul_mat;
@@ -15577,6 +15697,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
+    // conv steps: decode and verify batches, both store forms, the residual chains, a concat read elsewhere
+    for (int store : { 0, 1 }) {
+        for (int64_t n : { 1, 2, 3, 5 }) {
+            test_cases.emplace_back(new test_conv_step(1024, n, 1, store, 2));
+        }
+        for (int chain : { 0, 1, 3 }) {
+            test_cases.emplace_back(new test_conv_step(2304, 3, 1, store, chain));
+        }
+        test_cases.emplace_back(new test_conv_step(1024, 1, 2, store, 2));
+        test_cases.emplace_back(new test_conv_step(1024, 3, 1, store, 0, true));
+        test_cases.emplace_back(new test_conv_step(1024, 3, 1, store, 1, true));
+    }
     // Inkling 2: decode and a verify batch, and unaligned experts with views first
     test_cases.emplace_back(new test_moe_reduce(2304, 8, 1));
     test_cases.emplace_back(new test_moe_reduce(2304, 8, 3));
