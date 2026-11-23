@@ -1339,7 +1339,9 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * rel_table = nullptr,  // flash attention only: [n_head_q, n_dist, n_tokens], see ggml_flash_attn_ext_add_rel_bias
+            ggml_tensor * rel_pos   = nullptr) const; // [n_kv, n_tokens] I32
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1546,8 +1548,8 @@ struct llm_graph_context {
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
-            ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
-            ggml_tensor * sinks, // [n_head_q]
+            ggml_tensor * rel_table, // [n_head_q, n_dist, n_tokens]: bias[kv, token, h] = rel_table[h, rel_pos[kv, token], token]
+            ggml_tensor * sinks,     // [n_head_q]
                   float   kq_scale,
                     int   il) const;
 
