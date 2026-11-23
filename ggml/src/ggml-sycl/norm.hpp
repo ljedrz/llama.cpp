@@ -41,4 +41,24 @@ void ggml_sycl_op_l2_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * m
 #define GGML_SYCL_L2_BATCH_MAX 8
 void ggml_sycl_l2_norm_batch(ggml_backend_sycl_context & ctx, ggml_tensor ** nodes, int count);
 
+// An L2 (x/max(|x|, eps), times out_scale, after an optional weight) or RMS norm of rows of ncols, written straight into
+// the rows of a SET_ROWS destination (KV cache): token t's nrows normed rows go to row idx[t], element r*ncols + c.
+struct ggml_sycl_norm_set_rows_args {
+    const float * x;
+    size_t        x_nb1, x_nb2;      // bytes: row, token (columns contiguous)
+    const float * w;                 // optional [ncols, w_nrows] multiplied before the norm (row r % w_nrows)
+    int64_t       w_nrows;
+    int64_t       ncols, nrows, ntok;
+    bool          rms;
+    float         eps;
+    float         out_scale;
+    char *        dst;
+    size_t        dst_nb1;
+    bool          dst_f16;
+    const void *  idx;
+    bool          idx_i64;
+};
+
+void ggml_sycl_norm_set_rows(ggml_backend_sycl_context & ctx, const ggml_sycl_norm_set_rows_args & a);
+
 #endif // GGML_SYCL_NORM_HPP

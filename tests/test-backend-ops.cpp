@@ -9578,6 +9578,84 @@ struct test_conv_step : public test_case {
     }
 };
 
+// a normed K or V written into the KV cache: RMS_NORM, or L2_NORM and SCALE (optionally after a MUL), of the heads of
+// a few tokens, then SET_ROWS of their rows into the cache; backends may write the cache rows straight from the norm
+struct test_norm_set_rows : public test_case {
+    const int64_t   hs, nh, n_tok;
+    const bool      rms;
+    const bool      mul;
+    const ggml_type type_cache;
+
+    ggml_tensor * sr        = nullptr;
+    ggml_tensor * other_out = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "NORM_SET_ROWS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(hs, nh, n_tok, rms, mul, type_cache);
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return other_out ? std::vector<ggml_tensor *>{ sr, other_out } : std::vector<ggml_tensor *>{ sr };
+    }
+
+    test_norm_set_rows(int64_t hs = 128, int64_t nh = 8, int64_t n_tok = 1, bool rms = false, bool mul = false,
+                       ggml_type type_cache = GGML_TYPE_F16)
+        : hs(hs), nh(nh), n_tok(n_tok), rms(rms), mul(mul), type_cache(type_cache) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hs*nh, n_tok);
+        ggml_set_name(x, "x");
+        ggml_tensor * y = ggml_reshape_3d(ctx, x, hs, nh, n_tok);
+        if (rms) {
+            y = ggml_rms_norm(ctx, y, 1e-6f);
+        } else {
+            if (mul) {
+                ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hs, nh);
+                ggml_set_name(w, "w");
+                y = ggml_mul(ctx, y, w);
+            }
+            y = ggml_scale(ctx, ggml_l2_norm(ctx, y, 0.25f), 3.0f);
+        }
+        // an unrelated node between the norm and its cache write, as build_attn orders Q, K and V before the writes
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, y);
+            ggml_tensor * other = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hs, nh);
+            ggml_set_name(other, "other");
+            other_out = ggml_rms_norm(ctx, other, 1e-5f);
+            ggml_build_forward_expand(gf, other_out);
+        }
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, type_cache, hs*nh, 64);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tok);
+        ggml_set_name(idx, "idx");
+        sr = ggml_set_rows(ctx, cache, ggml_view_2d(ctx, y, hs*nh, n_tok, y->nb[2], 0), idx);
+        ggml_set_name(sr, "set_rows");
+        // read the cache view so that the SET_ROWS is not the graph output
+        ggml_tensor * out = ggml_sum(ctx, ggml_cast(ctx, sr, GGML_TYPE_F32));
+        return other_out ? ggml_add(ctx, out, ggml_sum(ctx, other_out)) : out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "idx") == 0) {
+                std::vector<int64_t> data(t->ne[0]);
+                for (int64_t i = 0; i < t->ne[0]; ++i) {
+                    data[i] = 7 + 5*i;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int64_t));
+            } else if (!ggml_is_view_op(t->op) && (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16)) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // mul_mat with src1 in [0, 1]: a zero-mean src1 hides errors in the zero point or the min of a quantized src0
 struct test_mul_mat_pos : public test_mul_mat {
     using test_mul_mat::test_mul_mat;
@@ -15701,6 +15779,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
+    // normed K / V into the KV cache
+    for (ggml_type tc : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        for (int64_t n_tok : { 1, 3 }) {
+            test_cases.emplace_back(new test_norm_set_rows(128, 8, n_tok, true,  false, tc));
+            test_cases.emplace_back(new test_norm_set_rows(128, 8, n_tok, false, false, tc));
+            test_cases.emplace_back(new test_norm_set_rows(128, 8, n_tok, false, true,  tc));
+        }
+    }
     // conv steps: decode and verify batches, both store forms, the residual chains, a concat read elsewhere
     for (int store : { 0, 1 }) {
         for (int64_t n : { 1, 2, 3, 5 }) {

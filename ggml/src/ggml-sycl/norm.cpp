@@ -1319,3 +1319,43 @@ void ggml_sycl_l2_norm_batch(ggml_backend_sycl_context & ctx, ggml_tensor ** nod
 
     l2_norm_f32_batch_sycl<WARP_SIZE>(p, st, count, ncols, nrows_total, eps, ctx.stream());
 }
+
+void ggml_sycl_norm_set_rows(ggml_backend_sycl_context & ctx, const ggml_sycl_norm_set_rows_args & a) {
+    const ggml_sycl_norm_set_rows_args p      = a;
+    const int64_t                      n_rows = a.nrows * a.ntok;
+    constexpr int                      SG_WG  = 4;  // rows per work-group, a sub-group each
+    const sycl::range<1>               block(SG_WG * WARP_SIZE);
+    const sycl::range<1>               grid((n_rows + SG_WG - 1) / SG_WG * SG_WG * WARP_SIZE);
+    ctx.stream()->parallel_for(sycl::nd_range<1>(grid, block), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+        const auto    sg   = it.get_sub_group();
+        const int     lane = (int) sg.get_local_linear_id();
+        const int64_t row  = it.get_group(0) * SG_WG + sg.get_group_linear_id();
+        if (row >= n_rows) {
+            return;
+        }
+        const int64_t r = row % p.nrows;
+        const int64_t t = row / p.nrows;
+        const float * x = (const float *) ((const char *) p.x + r * p.x_nb1 + t * p.x_nb2);
+        const float * w = p.w ? p.w + (r % p.w_nrows) * p.ncols : nullptr;
+
+        float tmp = 0.0f;
+        for (int64_t c = lane; c < p.ncols; c += WARP_SIZE) {
+            const float v = w ? x[c] * w[c] : x[c];
+            tmp += v * v;
+        }
+        tmp = sycl::reduce_over_group(sg, tmp, sycl::plus<float>());
+        const float scale = p.rms ? sycl::rsqrt(tmp / p.ncols + p.eps) : sycl::rsqrt(sycl::fmax(tmp, p.eps * p.eps));
+
+        const int64_t dr  = p.idx_i64 ? ((const int64_t *) p.idx)[t] : ((const int32_t *) p.idx)[t];
+        char *        dst = p.dst + dr * p.dst_nb1;
+        for (int64_t c = lane; c < p.ncols; c += WARP_SIZE) {
+            const float v = w ? x[c] * w[c] : x[c];
+            const float y = p.rms ? scale * v : p.out_scale * (scale * v);
+            if (p.dst_f16) {
+                ((sycl::half *) dst)[r * p.ncols + c] = (sycl::half) y;
+            } else {
+                ((float *) dst)[r * p.ncols + c] = y;
+            }
+        }
+    });
+}

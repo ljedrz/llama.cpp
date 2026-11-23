@@ -6670,6 +6670,109 @@ static int ggml_sycl_fuse_depth_mix(ggml_backend_sycl_context & ctx, ggml_cgraph
 
 // L2_NORM then SCALE at node i, optionally after a MUL by a [ncols, nrows or 1] weight: the scaled L2 clips of
 // Inkling 2. Returns the number of nodes after i it took, 0 when the pattern does not match.
+// After the norm chain nodes[idx] (its output y, F32 [ncols, nrows, ntok] contiguous): a SET_ROWS of y (through a view)
+// as [ncols*nrows, ntok] rows into an F16 / F32 destination (a KV cache write), y used by nothing else. Other nodes may
+// sit in between (build_attn expands Q, K and V before their cache writes) when they do not read y or the destination
+// and do not compute the row ids: the write then runs early and its nodes go to fused_ahead. Fills a for
+// ggml_sycl_norm_set_rows, returns false when the pattern does not match.
+static bool ggml_sycl_match_norm_set_rows(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph, const ggml_tensor * y,
+                                          std::vector<int> & idx, std::vector<ggml_op> & ops, ggml_sycl_norm_set_rows_args & a) {
+    if (y->type != GGML_TYPE_F32 || !ggml_is_contiguous(y) || y->ne[3] != 1) {
+        return false;
+    }
+    const auto base = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+    const size_t n_chain = idx.size();
+    int          k_sr    = -1;
+    std::vector<int> skipped;
+    for (int k = idx.back() + 1; k < cgraph->n_nodes && k <= idx.back() + 16; ++k) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        if (t->op == GGML_OP_SET_ROWS && base(t->src[0]) == y) {
+            k_sr = k;
+            break;
+        }
+        if (ggml_sycl_is_view_or_noop(t) && t->view_src == y) {
+            idx.push_back(k);
+            ops.push_back(t->op);
+            continue;
+        }
+        skipped.push_back(k);
+    }
+    if (k_sr < 0) {
+        return false;
+    }
+    const ggml_tensor * sr  = cgraph->nodes[k_sr];
+    const ggml_tensor * src = sr->src[0];
+    const ggml_tensor * ids = sr->src[1];
+    const int64_t       n   = y->ne[0] * y->ne[1];
+    if ((sr->type != GGML_TYPE_F16 && sr->type != GGML_TYPE_F32) || src->view_offs != 0 || !ggml_is_contiguous(src) ||
+        src->ne[0] != n || src->ne[1] != y->ne[2] || src->ne[2] != 1 || src->ne[3] != 1 ||
+        (ids->type != GGML_TYPE_I32 && ids->type != GGML_TYPE_I64) || !ggml_is_contiguous(ids) ||
+        ggml_nelements(ids) != y->ne[2] || sr->ne[0] != n || sr->nb[0] != ggml_type_size(sr->type) || sr->ne[2] != 1 ||
+        sr->ne[3] != 1) {
+        return false;
+    }
+    // the nodes passed over: no reads of y or of the destination buffer region, none computes the ids
+    for (int k : skipped) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        if (t == ids || base(t) == base(ids) || base(t) == base(sr)) {
+            return false;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * s = t->src[j];
+            if (s && (base(s) == y || base(s) == base(sr) || s == sr)) {
+                return false;
+            }
+        }
+    }
+    idx.push_back(k_sr);
+    ops.push_back(GGML_OP_SET_ROWS);
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idx.data(), (int) idx.size(), ops.data(), &idx.back(), 1)) {
+        return false;
+    }
+    a.ncols   = y->ne[0];
+    a.nrows   = y->ne[1];
+    a.ntok    = y->ne[2];
+    a.dst     = (char *) sr->data;
+    a.dst_nb1 = sr->nb[1];
+    a.dst_f16 = sr->type == GGML_TYPE_F16;
+    a.idx     = ids->data;
+    a.idx_i64 = ids->type == GGML_TYPE_I64;
+    for (size_t j = n_chain; j < idx.size(); ++j) {
+        ctx.fused_ahead.insert(cgraph->nodes[idx[j]]);
+    }
+    // the chain itself is skipped by the caller (it ends at idx[n_chain - 1])
+    idx.resize(n_chain);
+    return true;
+}
+
+// RMS_NORM at node i whose only use is a KV cache write (see ggml_sycl_match_norm_set_rows): one kernel. Returns 1 when
+// it ran (the write is taken out of order, so no node after i is skipped here), 0 otherwise.
+static int ggml_sycl_fuse_rms_norm_set_rows(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * nr = cgraph->nodes[i];
+    if (!g_ggml_sycl_enable_fusion || nr->op != GGML_OP_RMS_NORM) {
+        return 0;
+    }
+    const ggml_tensor * x = nr->src[0];
+    if (x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || !ggml_are_same_shape(x, nr)) {
+        return 0;
+    }
+    std::vector<int>             idx = { i };
+    std::vector<ggml_op>         ops = { GGML_OP_RMS_NORM };
+    ggml_sycl_norm_set_rows_args a   = {};
+    if (!ggml_sycl_match_norm_set_rows(ctx, cgraph, nr, idx, ops, a)) {
+        return 0;
+    }
+    a.x     = (const float *) x->data;
+    a.x_nb1 = x->nb[1];
+    a.x_nb2 = x->nb[2];
+    a.rms   = true;
+    memcpy(&a.eps, nr->op_params, sizeof(float));
+    a.out_scale = 1.0f;
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    ggml_sycl_norm_set_rows(ctx, a);
+    return 1;
+}
+
 static int ggml_sycl_fuse_l2_norm(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
     ggml_tensor * node = cgraph->nodes[i];
     const bool    mul  = node->op == GGML_OP_MUL;
@@ -6693,6 +6796,32 @@ static int ggml_sycl_fuse_l2_norm(ggml_backend_sycl_context & ctx, ggml_cgraph *
         if (w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || w->ne[0] != x->ne[0] ||
             (w->ne[1] != 1 && w->ne[1] != x->ne[1]) || w->ne[2] != 1 || w->ne[3] != 1 || !ggml_are_same_shape(node, x)) {
             return 0;
+        }
+    }
+    // the scaled norm written only into KV cache rows (Inkling 2's K): one kernel without the F32 result
+    {
+        std::vector<int>             idx;
+        std::vector<ggml_op>         ops;
+        ggml_sycl_norm_set_rows_args a = {};
+        if (mul) {
+            idx = { i, i + 1, i + 2 };
+            ops = { GGML_OP_MUL, GGML_OP_L2_NORM, GGML_OP_SCALE };
+        } else {
+            idx = { i, i + 1 };
+            ops = { GGML_OP_L2_NORM, GGML_OP_SCALE };
+        }
+        if (x->nb[0] == sizeof(float) && ggml_are_same_shape(x, sc) && ggml_sycl_match_norm_set_rows(ctx, cgraph, sc, idx, ops, a)) {
+            a.x       = (const float *) x->data;
+            a.x_nb1   = x->nb[1];
+            a.x_nb2   = x->nb[2];
+            a.w       = mul ? (const float *) node->src[1]->data : nullptr;
+            a.w_nrows = mul ? node->src[1]->ne[1] : 1;
+            a.rms     = false;
+            memcpy(&a.eps, l2->op_params, sizeof(float));
+            a.out_scale = ggml_get_op_params_f32(sc, 0);
+            SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+            ggml_sycl_norm_set_rows(ctx, a);
+            return idx.back() - i;
         }
     }
     // a row is read twice before and while it is written: only an exact alias of the input is safe
@@ -7995,6 +8124,7 @@ static void ggml_sycl_find_gdn_state_rows(const ggml_cgraph * cgraph, ggml_sycl_
 
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_conv_window_match conv_window;
+    sycl_ctx->fused_ahead.clear();
     ggml_sycl_gdn_state_rows gdn_rows;
     ggml_sycl_find_gdn_state_rows(cgraph, gdn_rows);
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -8006,6 +8136,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
         if (gdn_rows.skip.count(node)) {
+            continue;
+        }
+        if (sycl_ctx->fused_ahead.count(node)) {
             continue;
         }
 
@@ -8046,6 +8179,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 i += skip;
                 continue;
             }
+        }
+        if (node->op == GGML_OP_RMS_NORM && ggml_sycl_fuse_rms_norm_set_rows(*sycl_ctx, cgraph, i)) {
+            continue;
         }
         if (node->op == GGML_OP_MUL) {
             const int skip = ggml_sycl_fuse_moe_reduce(*sycl_ctx, cgraph, i);

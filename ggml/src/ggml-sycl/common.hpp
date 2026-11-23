@@ -21,6 +21,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "base.hpp"
 #include "dpct/helper.hpp"
@@ -620,6 +621,9 @@ struct ggml_backend_sycl_context {
 
     int64_t last_graph_eviction_sweep = 0;
     std::optional<bool> graph_compatible;
+    // nodes a fusion earlier in the graph already ran (out of order, e.g. a KV cache write taken into its norm);
+    // cleared at the start of every graph compute
+    std::unordered_set<const ggml_tensor *> fused_ahead;
 
     ggml_sycl_graph * sycl_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();
