@@ -113,6 +113,7 @@ int g_ggml_sycl_enable_mkl_fa = 1;
 int g_ggml_sycl_fa_dpas = 1;
 int g_ggml_sycl_fa_head_mask = 0;
 int g_ggml_sycl_fa_rel = 1;
+int g_ggml_sycl_fa_xmx = 1;
 int g_ggml_sycl_memtrace = 0;
 int g_ggml_sycl_memtrace_step = 64;
 int g_ggml_sycl_enable_vmm = 1;
@@ -454,6 +455,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_fa_dpas = ggml_sycl_get_env("GGML_SYCL_FA_DPAS", 1);
         g_ggml_sycl_fa_head_mask = ggml_sycl_get_env("GGML_SYCL_FA_HEAD_MASK", 0);
         g_ggml_sycl_fa_rel = ggml_sycl_get_env("GGML_SYCL_FA_REL", 1);
+        g_ggml_sycl_fa_xmx = ggml_sycl_get_env("GGML_SYCL_FA_XMX", 1);
         g_ggml_sycl_memtrace = ggml_sycl_get_env("GGML_SYCL_MEMTRACE", 0);
         g_ggml_sycl_memtrace_step = ggml_sycl_get_env("GGML_SYCL_MEMTRACE_STEP", 64);
         g_ggml_sycl_enable_vmm = ggml_sycl_get_env("GGML_SYCL_ENABLE_VMM", 1);
@@ -582,6 +584,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_FA_DPAS: %d\n", g_ggml_sycl_fa_dpas);
         GGML_LOG_INFO("  GGML_SYCL_FA_HEAD_MASK: %d\n", g_ggml_sycl_fa_head_mask);
         GGML_LOG_INFO("  GGML_SYCL_FA_REL: %d\n", g_ggml_sycl_fa_rel);
+        GGML_LOG_INFO("  GGML_SYCL_FA_XMX: %d\n", g_ggml_sycl_fa_xmx);
         GGML_LOG_INFO("  GGML_SYCL_MEMTRACE: %d\n", g_ggml_sycl_memtrace);
         GGML_LOG_INFO("  GGML_SYCL_MEMTRACE_STEP: %d\n", g_ggml_sycl_memtrace_step);
 #ifdef SYCL_FLASH_ATTN

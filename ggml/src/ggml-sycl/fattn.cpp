@@ -19,6 +19,7 @@
 #include "fattn-vec.hpp"
 #include "fattn.hpp"
 #include "fattn-onednn.hpp"
+#include "fattn-xmx.hpp"
 #include "fattn-sparse.hpp"
 #include "fattn-dpas.hpp"
 #include "getrows.hpp"
@@ -104,6 +105,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_ONEDNN   = 150, // oneDNN SDPA: native F16 (PR #25222)
     BEST_FATTN_KERNEL_TILE     = 200,
     BEST_FATTN_KERNEL_MKL      = 300,
+    BEST_FATTN_KERNEL_XMX      = 350, // relative-position bias: prompts over a long F16 cache, scores in registers (Xe2)
     BEST_FATTN_KERNEL_REL_MASK = 400, // relative-position bias: the per-head mask materialized, then a kernel that takes it
     BEST_FATTN_KERNEL_DEC      = 450, // a few tokens over a long F16 cache, one pass over K and V per KV head (attn-dec)
 };
@@ -361,7 +363,10 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel_rel(const int device, c
         return BEST_FATTN_KERNEL_DEC;
     }
 
-    // MKL applies the bias in its softmax: prompts over long caches; it converts q8_0 K and V to F16 a chunk at a time
+    // prompts over long F16 caches: XMX flash attention, else MKL, which applies the bias in its softmax and converts q8_0 K and V to F16 a chunk at a time
+    if (g_ggml_sycl_fa_xmx && Q->ne[1] >= 32 && K->ne[1] >= 1024 && ggml_sycl_fattn_xmx_supported(device, dst)) {
+        return BEST_FATTN_KERNEL_XMX;
+    }
     const auto mkl_kv_ok = [](const ggml_tensor * t) {
         if (t->type == GGML_TYPE_F16) {
             return t->nb[1] % (t->ne[0] * 2) == 0;
@@ -458,6 +463,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
         const char * kname = "TILE";
         best_fattn_kernel k = ggml_sycl_get_best_fattn_kernel(ctx.device, dst);
         if (k == BEST_FATTN_KERNEL_MKL)  kname = "MKL";
+        if (k == BEST_FATTN_KERNEL_XMX)  kname = "XMX";
         if (k == BEST_FATTN_KERNEL_ONEDNN)  kname = "ONEDNN";
         if (k == BEST_FATTN_KERNEL_VEC)  kname = "VEC";
         if (k == BEST_FATTN_KERNEL_DPAS) kname = "DPAS";
@@ -498,6 +504,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
             best_fattn_kernel kb = ggml_sycl_get_best_fattn_kernel(ctx.device, dst);
             if (kb == BEST_FATTN_KERNEL_ONEDNN) kname = "ONEDNN";
             if (kb == BEST_FATTN_KERNEL_MKL) kname = "MKL";
+            if (kb == BEST_FATTN_KERNEL_XMX) kname = "XMX";
             if (kb == BEST_FATTN_KERNEL_TILE) kname = "TILE";
             if (kb == BEST_FATTN_KERNEL_VEC) kname = "VEC";
             if (kb == BEST_FATTN_KERNEL_DPAS) kname = "DPAS";
@@ -596,6 +603,9 @@ static void ggml_sycl_flash_attn_ext_run(ggml_backend_sycl_context & ctx, ggml_t
             break;
         case BEST_FATTN_KERNEL_MKL:
             ggml_sycl_flash_attn_ext_mkl(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_XMX:
+            ggml_sycl_fattn_xmx(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_REL_MASK:
             ggml_sycl_flash_attn_ext_rel_mask(ctx, dst);
