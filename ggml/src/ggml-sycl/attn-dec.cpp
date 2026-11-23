@@ -35,7 +35,7 @@ static void attn_dec_chunk(const ggml_sycl_attn_dec_args a, const int C, float *
     const int64_t G     = a.n_head / a.n_head_kv;
 
     float * sc = slm;               // [NQ][C] scores, then probabilities
-    float * ml = slm + NQ * C;      // [NQ] max, [NQ] sum
+    float * ml = slm + NQ * sycl::max(C, D);  // [NQ] max, [NQ] sum (after the scratch the position groups use)
 
     // query j is token j / G of head hkv*G + j % G
     float qr[NQ][NI * 8];
@@ -205,7 +205,7 @@ static void attn_dec_chunk(const ggml_sycl_attn_dec_args a, const int C, float *
             }
         }
         if constexpr (PG == 2) {
-            // the second position group hands its sums to the first through local memory (NQ*D <= NQ*C)
+            // the second position group hands its sums to the first through local memory (NQ*D floats before ml)
             item.barrier(sycl::access::fence_space::local_space);
             if (pgrp == 1) {
 #pragma unroll
@@ -328,7 +328,10 @@ template <int D, int NQ, typename mask_t, bool VROWS, bool Q8>
 static void attn_dec_launch(ggml_backend_sycl_context & ctx, const ggml_sycl_attn_dec_args & a) {
     // chunks of a multiple of 128 positions, about 2048 work-groups over the KV heads
     const int64_t c_slm   = ((int64_t) ggml_sycl_info().devices[ctx.device].smpbo / sizeof(float) - 2 * NQ) / NQ / 128 * 128;
-    const int64_t C       = std::clamp<int64_t>((a.n_kv * a.n_head_kv / 2048 + 127) / 128 * 128, 128, std::min<int64_t>(1024, c_slm));
+    // caches up to 2048 positions (short contexts, the sliding-window layers): ~16 chunks per KV head, a multiple of 16
+    // positions; Inkling 2 tg at depth 4096 / 32768 66.7 / 59.3 -> 67.3 / 59.9 against chunks of 128 and up
+    const int64_t C       = a.n_kv <= 2048 ? std::clamp<int64_t>((a.n_kv / 16 + 15) / 16 * 16, 16, 128) :
+        std::clamp<int64_t>((a.n_kv * a.n_head_kv / 2048 + 127) / 128 * 128, 128, std::min<int64_t>(1024, c_slm));
     const int64_t n_split = (a.n_kv + C - 1) / C;
 
     dpct::queue_ptr                stream = ctx.stream();
@@ -341,7 +344,7 @@ static void attn_dec_launch(ggml_backend_sycl_context & ctx, const ggml_sycl_att
         const sycl::range<3> grid(1, n_split, a.n_head_kv);
         const sycl::range<3> block(1, 1, ATTN_DEC_NSG * WARP_SIZE);
         stream->submit([&](sycl::handler & cgh) {
-            sycl::local_accessor<float, 1> slm(sycl::range<1>(NQ * C + 2 * NQ), cgh);
+            sycl::local_accessor<float, 1> slm(sycl::range<1>(NQ * std::max<int64_t>(C, D) + 2 * NQ), cgh);
             auto f = [=](sycl::nd_item<3> item) {
                 attn_dec_chunk<D, NQ, mask_t, VROWS, Q8>(p, Ci, part_d, slm.get_multi_ptr<sycl::access::decorated::no>().get(),
                                               item);

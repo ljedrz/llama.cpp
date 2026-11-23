@@ -344,8 +344,8 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel_rel(const int device, c
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    // a few tokens over a long cache: the query vectors of a KV head share one read of K and V. q8_0 also over short
-    // caches: the alternative there converts K and V to F16 for TILE after the mask step (tg at depth 0 61.6 -> 63.5)
+    // a few tokens over the cache: the query vectors of a KV head share one read of K and V; from 256 positions, with
+    // short chunks for short caches (see attn_dec_launch): ahead of the materialized mask + VEC / TILE there too
     const int  gqa_ratio = Q->ne[2] / K->ne[2];
     // F16 K is read 16 bytes and V 4 bytes at a time; q8_0 (34-byte blocks) 2 bytes at a time
     const bool dec_f16 = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 && (uintptr_t) K->data % 16 == 0 &&
@@ -355,7 +355,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel_rel(const int device, c
                          K->nb[1] % 2 == 0 && K->nb[2] % 2 == 0 && (uintptr_t) V->data % 2 == 0 && V->nb[1] % 2 == 0 &&
                          V->nb[2] % 2 == 0;
     if (g_ggml_sycl_attn_dec && (dec_f16 || dec_q8) && Q->type == GGML_TYPE_F32 && Q->ne[0] == V->ne[0] &&
-        ggml_sycl_attn_dec_supported(Q->ne[0], Q->ne[1] * gqa_ratio) && K->ne[1] >= (dec_q8 ? 256 : 1024) &&
+        ggml_sycl_attn_dec_supported(Q->ne[0], Q->ne[1] * gqa_ratio) && K->ne[1] >= 256 &&
         K->ne[1] % 8 == 0 && logit_softcap == 0.0f && (uintptr_t) Q->data % 16 == 0 && Q->nb[1] % 16 == 0 &&
         Q->nb[2] % 16 == 0 && Q->nb[0] == 4 && dst->nb[0] == 4 && ggml_is_contiguous(dst)) {
         return BEST_FATTN_KERNEL_DEC;

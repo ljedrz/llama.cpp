@@ -15143,6 +15143,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_rel(128, 4, 1, 2056, 3, 1025, true));
     test_cases.emplace_back(new test_flash_attn_ext_rel(128, 4, 4, 2056, 4, 1025, false));
     test_cases.emplace_back(new test_flash_attn_ext_rel(256, 4, 4, 2056, 3, 513, true));
+    // short caches in short chunks: n_kv 256 and 1032
+    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 256, 1, 1025, true));
+    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 1032, 3, 1025, true));
+    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 1032, 4, 1025, true, GGML_TYPE_Q8_0));
     // a q8_0 cache: decode and verify batches, a few-token batch and a prompt chunk, short and long caches
     for (int64_t kv : { 512, 2056 }) {
         for (int64_t nb : { 1, 3, 7, 64 }) {
