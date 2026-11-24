@@ -5210,10 +5210,20 @@ struct test_attn_kq_softmax_kqv : public test_case {
 };
 
 // flash attention with an indexed bias as Inkling 2 builds it (relative-position bias): the table is a view of a
-// [n_dist, n_head*n_batch] matrix, the indices are the clamped distances, the mask is shared by the heads
+// [n_dist, n_head*n_batch] matrix, the indices are the clamped distances, the mask is shared by the heads. The cells
+// hold the positions of a wrapped ring (as a SWA cache does) with empty cells, cells after the queries are not masked
+// (their distance clamps to the last one), and distances run past the table.
 struct test_flash_attn_ext_rel : public test_case {
     const int64_t hs, nh, nr2, kv, nb, n_dist;
     const bool    sinks;
+
+    static constexpr int64_t pos_base = 5;
+
+    static bool cell_empty(int64_t j) { return j % 17 == 5; }
+
+    // an empty cell has INT32_MAX, as the graph gives it
+    int32_t kv_pos(int64_t j) const { return cell_empty(j) ? INT32_MAX : (int32_t) (pos_base + (j + kv/3) % kv); }
+    int32_t q_pos(int64_t i) const { return (int32_t) (pos_base + kv - nb + i); }
 
     std::string vars() override {
         return VARS_TO_STR7(hs, nh, nr2, kv, nb, n_dist, sinks);
@@ -5260,21 +5270,21 @@ struct test_flash_attn_ext_rel : public test_case {
             } else if (strcmp(t->name, "t") == 0) {
                 init_tensor_uniform(t, -2.0f, 2.0f);
             } else if (strcmp(t->name, "rel_pos") == 0) {
-                // the clamped distance of token i (at position kv - nb + i) to cell j
+                // the distance of token i to cell j, clamped to the last one (a later or empty cell wraps around)
                 std::vector<int32_t> data(ggml_nelements(t));
                 for (int64_t i = 0; i < nb; ++i) {
                     for (int64_t j = 0; j < kv; ++j) {
-                        const int64_t d = std::abs(kv - nb + i - j);
-                        data[i*kv + j] = (int32_t) std::min<int64_t>(d, n_dist - 1);
+                        const uint32_t d = (uint32_t) q_pos(i) - (uint32_t) kv_pos(j);
+                        data[i*kv + j] = (int32_t) std::min<uint32_t>(d, (uint32_t) (n_dist - 1));
                     }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
             } else if (strcmp(t->name, "m") == 0) {
-                // causal, plus a masked block at the start so whole chunks are masked out
+                // empty cells and a block at the start (so whole chunks are masked out), no causal mask
                 std::vector<ggml_fp16_t> data(ggml_nelements(t));
                 for (int64_t i = 0; i < nb; ++i) {
                     for (int64_t j = 0; j < kv; ++j) {
-                        const bool vis = j <= kv - nb + i && j >= kv/4;
+                        const bool vis = !cell_empty(j) && j >= kv/4;
                         data[i*kv + j] = ggml_fp32_to_fp16(vis ? 0.0f : -INFINITY);
                     }
                 }
