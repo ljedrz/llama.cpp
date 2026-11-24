@@ -8394,6 +8394,45 @@ struct test_moe_reduce : public test_case {
     }
 };
 
+// Inkling 2's loop controller as its graph builds it: (x - tanh(wf*g)*x) + tanh(wu*g)*m with two F32 MUL_MATs on one
+// input g; backends may run it as one kernel
+struct test_gate_mix : public test_case {
+    const int64_t k, nr, nc;
+
+    test_gate_mix(int64_t k, int64_t nr, int64_t nc) : k(k), nr(nr), nc(nc) {}
+
+    std::string vars() override {
+        return VARS_TO_STR3(k, nr, nc);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATE_MIX";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-6; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * wf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, nr);
+        ggml_set_name(wf, "wf");
+        ggml_tensor * wu = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, nr);
+        ggml_set_name(wu, "wu");
+        ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, nc);
+        ggml_set_name(g, "g");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nr, nc);
+        ggml_set_name(x, "x");
+        ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nr, nc);
+        ggml_set_name(m, "m");
+        ggml_tensor * forget = ggml_tanh(ctx, ggml_mul_mat(ctx, wf, g));
+        ggml_tensor * gain   = ggml_tanh(ctx, ggml_mul_mat(ctx, wu, g));
+        ggml_tensor * out    = ggml_add(ctx, ggml_sub(ctx, x, ggml_mul(ctx, forget, x)), ggml_mul(ctx, gain, m));
+        ggml_set_name(out, "gate_mix");
+        return out;
+    }
+};
+
 // the SiTU activation of build_moe_ffn after a merged gate_up with a per-slot scale (Inkling 2's NVFP4 experts):
 // MUL(gate_up, scale), the gate and up halves as views, beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb); backends may
 // run it as one kernel
@@ -14237,6 +14276,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128, false, true));
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
+    // the loop controller: decode (the mat-vec kernel) and prompt batches (two MUL_MATs and one element-wise kernel)
+    test_cases.emplace_back(new test_gate_mix(64, 2304, 3));
+    test_cases.emplace_back(new test_gate_mix(64, 2304, 64));
+    test_cases.emplace_back(new test_gate_mix(64, 67, 37));
     // the SiTU of a gate_up with a per-slot scale: Inkling 2 Mini's prompt shape, a ragged one, another beta / lb
     test_cases.emplace_back(new test_moe_situ(1152, 8, 64));
     test_cases.emplace_back(new test_moe_situ(67, 3, 37));
