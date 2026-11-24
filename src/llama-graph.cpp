@@ -1468,6 +1468,18 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
     }
 
+    if (self_kv_pos->buffer) {
+        attn_ctx->get_base()->set_input_kv_pos(self_kv_pos, ubatch);
+    }
+
+    if (self_kv_pos_swa->buffer) {
+        attn_ctx->get_swa()->set_input_kv_pos(self_kv_pos_swa, ubatch);
+    }
+
+    if (self_q_pos->buffer) {
+        ggml_backend_tensor_set(self_q_pos, ubatch->pos, 0, ggml_nbytes(self_q_pos));
+    }
+
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -1513,6 +1525,10 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+
+    res &= self_kv_pos->ne[0]     == attn_ctx->get_base()->get_n_kv();
+    res &= self_kv_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+    res &= self_q_pos->ne[0]      == params.ubatch.n_tokens;
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -3158,7 +3174,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * bias_table,
          ggml_tensor * bias_indices,
          ggml_tensor * k_scale,
-         ggml_tensor * v_scale) const {
+         ggml_tensor * v_scale,
+         ggml_tensor * bias_kv_pos,
+         ggml_tensor * bias_q_pos) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -3229,11 +3247,16 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_prec_set_acc(cur, GGML_PREC_F32);
 
         if (bias_table) {
-            ggml_flash_attn_ext_add_indexed_bias(cur, bias_table, bias_indices);
+            if (bias_kv_pos) {
+                ggml_flash_attn_ext_add_indexed_bias_pos(cur, bias_table, bias_kv_pos, bias_q_pos);
+            } else {
+                ggml_flash_attn_ext_add_indexed_bias(cur, bias_table, bias_indices);
+            }
             auto * dev = model.dev_layer(il);
             if ((!cparams.offload_kqv && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) || !ggml_backend_dev_supports_op(dev, cur)) {
                 // Keep ordinary flash attention on the layer device.
                 ggml_flash_attn_ext_add_indexed_bias(cur, nullptr, nullptr);
+                cur->src[8] = nullptr;
                 cur->src[3] = dense_bias_mask();
             }
         }
@@ -3763,7 +3786,9 @@ static ggml_tensor * build_attn_iswa_impl(
             float     kq_scale,
             int       il,
         ggml_tensor * bias_table = nullptr,
-        ggml_tensor * bias_indices = nullptr) {
+        ggml_tensor * bias_indices = nullptr,
+        ggml_tensor * bias_kv_pos = nullptr,
+        ggml_tensor * bias_q_pos = nullptr) {
     ggml_context * ctx0 = gctx.ctx0;
     ggml_cgraph  * gf   = gctx.gf;
 
@@ -3830,7 +3855,7 @@ static ggml_tensor * build_attn_iswa_impl(
     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
 
     ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il, bias_table, bias_indices,
-            mctx_cur->get_k_scale(il), mctx_cur->get_v_scale(il));
+            mctx_cur->get_k_scale(il), mctx_cur->get_v_scale(il), bias_kv_pos, bias_q_pos);
     gctx.cb(cur, "kqv_out", il);
 
     if (v_rot) {
@@ -4507,6 +4532,18 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     ggml_set_input(inp->self_rel_pos_swa);
     ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
 
+    inp->self_kv_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv());
+    ggml_set_input(inp->self_kv_pos);
+    ggml_set_name(inp->self_kv_pos, "attn_inp_kv_pos");
+
+    inp->self_kv_pos_swa = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv());
+    ggml_set_input(inp->self_kv_pos_swa);
+    ggml_set_name(inp->self_kv_pos_swa, "attn_inp_kv_pos_swa");
+
+    inp->self_q_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+    ggml_set_input(inp->self_q_pos);
+    ggml_set_name(inp->self_q_pos, "attn_inp_q_pos");
+
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
 }
 
@@ -4530,8 +4567,16 @@ ggml_tensor * llm_graph_context::build_attn(
     GGML_ASSERT(attn_mask.rows == nullptr);
     ggml_tensor * indices = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
 
+    // one stream: flash attention takes the distances from the positions of the cells and the tokens
+    ggml_tensor * kv_pos = nullptr;
+    ggml_tensor * q_pos  = nullptr;
+    if (attn_mask.raw->ne[3] == 1) {
+        kv_pos = is_swa ? inp->self_kv_pos_swa : inp->self_kv_pos;
+        q_pos  = inp->self_q_pos;
+    }
+
     return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, q_cur, k_cur, v_cur, nullptr, attn_mask.raw, nullptr,
-            sinks, nullptr, kq_scale, il, bias_table, indices);
+            sinks, nullptr, kq_scale, il, bias_table, indices, kv_pos, q_pos);
 }
 
 void llm_graph_context::build_dense_out(
