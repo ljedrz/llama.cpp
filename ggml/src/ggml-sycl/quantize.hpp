@@ -23,17 +23,16 @@
 
 #include "ggml-sycl/dpct/helper.hpp"
 
+// one block of QK8_1 values starting at xb, a sub-group per block
 template <int ElementsPerWI>
-__dpct_inline__ static void quantize_q8_1_impl(const float * __restrict__ x,
-                                               sycl::vec<int8_t, ElementsPerWI> & quantized_values, float & d,
-                                               float & sum, const sycl::nd_item<1> & it) {
-    auto subgroup_id = it.get_group(0);
-    auto wi_id       = it.get_local_id(0);
+__dpct_inline__ static void quantize_q8_1_block(const float * __restrict__ xb,
+                                                sycl::vec<int8_t, ElementsPerWI> & quantized_values, float & d,
+                                                float & sum, const sycl::nd_item<1> & it) {
+    auto wi_id = it.get_local_id(0);
 
     sycl::vec<float, ElementsPerWI> wi_f32_vals;
 
-    auto float_ptr_offset = subgroup_id * QK8_1 + ElementsPerWI * wi_id;
-    wi_f32_vals           = *reinterpret_cast<const sycl::vec<float, ElementsPerWI> *>(x + float_ptr_offset);
+    wi_f32_vals = *reinterpret_cast<const sycl::vec<float, ElementsPerWI> *>(xb + ElementsPerWI * wi_id);
 
     float amax = 0.0f;
 
@@ -53,6 +52,13 @@ __dpct_inline__ static void quantize_q8_1_impl(const float * __restrict__ x,
     }
 
     d = amax == 0 ? 0 : d;
+}
+
+template <int ElementsPerWI>
+__dpct_inline__ static void quantize_q8_1_impl(const float * __restrict__ x,
+                                               sycl::vec<int8_t, ElementsPerWI> & quantized_values, float & d,
+                                               float & sum, const sycl::nd_item<1> & it) {
+    quantize_q8_1_block<ElementsPerWI>(x + it.get_group(0) * QK8_1, quantized_values, d, sum, it);
 }
 
 // No op to control codepath in ggml_sycl_op_mul_mat

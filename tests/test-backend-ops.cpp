@@ -12574,6 +12574,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 32,  1, 256));
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 64, 16, 512));
+    // rows that end after the first half of a super-block
+    for (int n : {1, 8, 16, 33, 64, 100}) {
+        test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 48, n, 1152));
+    }
+    test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 32, 64, 384));
+    test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 8, 2, false, 48, 64, 1152));
+    // prompt batches: rows of 2D block loads (k 1024, 2304) and read row by row (k 1152), uneven expert loads
+    for (int k : {1024, 1152, 2304}) {
+        test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 16, 4, false, 80, 100, k));
+        test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 16, 4, true,  80, 100, k));
+    }
     test_cases.emplace_back(new test_mul_mat_w4a4(GGML_TYPE_NVFP4, GGML_TYPE_F32, 32,  1, 256));
     test_cases.emplace_back(new test_mul_mat_w4a4(GGML_TYPE_NVFP4, GGML_TYPE_F32, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
@@ -14471,6 +14482,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     for (int r : {1, 2048}) {
         test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 2560, 65536, r, 1, 1, false));
+    }
+
+    // NVFP4 expert shapes of Inkling 2 Mini: K = 1152 ends after half a super-block, 1024 and 1280 do not
+    for (int n : {8, 64}) {
+        for (int k : {1024, 1152, 1280}) {
+            test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 2304, n, k));
+        }
     }
 
     // LoRA at prefill: B is [rank, n_out], so K = rank
