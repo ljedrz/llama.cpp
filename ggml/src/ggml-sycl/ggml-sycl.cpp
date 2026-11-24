@@ -6480,6 +6480,91 @@ static int ggml_sycl_fuse_conv_step(ggml_backend_sycl_context & ctx, ggml_cgraph
     return 0;
 }
 
+// The SiTU activation of build_moe_ffn after a merged gate_up with a per-slot scale, at the MUL of node i:
+//   MUL(gate_up [2*n_ff, n_slot, n_tok], scale [1, n_slot, n_tok]), VIEW gate, SCALE, TANH, SCALE, SIGMOID(gate), MUL,
+//   VIEW up, SCALE, TANH, SCALE, MUL
+// as one kernel: out = s1*tanh(s0*g)*sigmoid(g) * s3*tanh(s2*u) of the scaled gate g and up u. Prompt batches take it; a
+// few tokens fuse the whole chain into the NVFP4 MoE GEMV (ggml_sycl_fuse_nvfp4_moe) before this sees the MUL.
+// Returns the number of nodes after i it took, 0 when the pattern does not match.
+static int ggml_sycl_fuse_moe_situ(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    constexpr int  n_ops = 12;
+    static const ggml_op ops[n_ops] = { GGML_OP_MUL,  GGML_OP_VIEW,  GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY,
+                                        GGML_OP_MUL,  GGML_OP_VIEW,  GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
+    ggml_tensor * mul = cgraph->nodes[i];
+    if (!g_ggml_sycl_enable_fusion || mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 || i + n_ops > cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * gu = mul->src[0];
+    const ggml_tensor * sc = mul->src[1];
+    if (gu->type != GGML_TYPE_F32 || sc->type != GGML_TYPE_F32 || gu->nb[0] != sizeof(float) || sc->ne[0] != 1 ||
+        sc->ne[1] != gu->ne[1] || sc->ne[2] != gu->ne[2] || gu->ne[3] != 1 || sc->ne[3] != 1 || gu->ne[0] % 2 ||
+        !ggml_are_same_shape(mul, gu)) {
+        return 0;
+    }
+    const auto is_unary = [](const ggml_tensor * t, ggml_unary_op op) {
+        return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == op;
+    };
+    // SCALE by its op param with no bias
+    const auto is_scale = [](const ggml_tensor * t, const ggml_tensor * src, float & scale) {
+        if (t->op != GGML_OP_SCALE || t->src[0] != src || ggml_get_op_params_f32(t, 1) != 0.0f) {
+            return false;
+        }
+        scale = ggml_get_op_params_f32(t, 0);
+        return true;
+    };
+    // a half of the rows of mul with its strides
+    const auto is_half = [&](const ggml_tensor * t, int half) {
+        return t->op == GGML_OP_VIEW && t->src[0] == mul && t->ne[0] * 2 == mul->ne[0] && t->ne[1] == mul->ne[1] &&
+               t->ne[2] == mul->ne[2] && t->nb[1] == mul->nb[1] && t->nb[2] == mul->nb[2] &&
+               t->view_offs == (size_t) half * t->ne[0] * sizeof(float);
+    };
+    float          s[4];
+    ggml_tensor ** n = cgraph->nodes + i + 1;
+    if (!(is_half(n[0], 0) && is_scale(n[1], n[0], s[0]) && is_unary(n[2], GGML_UNARY_OP_TANH) && n[2]->src[0] == n[1] &&
+          is_scale(n[3], n[2], s[1]) && is_unary(n[4], GGML_UNARY_OP_SIGMOID) && n[4]->src[0] == n[0] &&
+          n[5]->op == GGML_OP_MUL && n[5]->src[0] == n[3] && n[5]->src[1] == n[4] && is_half(n[6], 1) &&
+          is_scale(n[7], n[6], s[2]) && is_unary(n[8], GGML_UNARY_OP_TANH) && n[8]->src[0] == n[7] &&
+          is_scale(n[9], n[8], s[3]) && n[10]->op == GGML_OP_MUL && n[10]->src[0] == n[5] && n[10]->src[1] == n[9])) {
+        return 0;
+    }
+    ggml_tensor * out     = n[10];
+    const int     out_idx = i + n_ops - 1;
+    if (out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) ||
+        !ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, &out_idx, 1)) {
+        return 0;
+    }
+    // an output element reads the gate and the up rows of its (slot, token): out may not overlap the inputs
+    if (ggml_sycl_overlap(out, gu) || ggml_sycl_overlap(out, sc)) {
+        return 0;
+    }
+
+    const char *  gu_d  = (const char *) gu->data;
+    const char *  sc_d  = (const char *) sc->data;
+    float *       dst   = (float *) out->data;
+    const int64_t n_ff  = out->ne[0], n_slot = out->ne[1];
+    const size_t  gnb1  = gu->nb[1], gnb2 = gu->nb[2], snb1 = sc->nb[1], snb2 = sc->nb[2];
+    const int64_t nel   = ggml_nelements(out);
+    const float   s0 = s[0], s1 = s[1], s2 = s[2], s3 = s[3];
+    const int     wg    = 256;
+    scope_op_debug_print scope_dbg_print(__func__, out, /*num_src=*/2, " : moe situ");
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    ctx.stream()->parallel_for(sycl::nd_range<1>((nel + wg - 1) / wg * wg, wg), [=](sycl::nd_item<1> it) {
+        const int64_t j = it.get_global_id(0);
+        if (j >= nel) {
+            return;
+        }
+        const int64_t r  = j % n_ff;
+        const int64_t st = j / n_ff;
+        const int64_t sl = st % n_slot, t = st / n_slot;
+        const float * row = (const float *) (gu_d + sl * gnb1 + t * gnb2);
+        const float   w   = *(const float *) (sc_d + sl * snb1 + t * snb2);
+        const float   g   = row[r] * w;
+        const float   u   = row[r + n_ff] * w;
+        dst[j] = s1 * sycl::tanh(s0 * g) / (1.0f + sycl::exp(-g)) * s3 * sycl::tanh(s2 * u);
+    });
+    return n_ops - 1;
+}
+
 // The MoE output of build_moe_ffn at the MUL of node i: MUL(experts [n_embd, n_slot, n_tok], weights [1, n_slot, n_tok]),
 // a VIEW per slot and the chain of ADDs over them, as one kernel that sums the weighted slots in the same order.
 // Returns the number of nodes after i it took, 0 when the pattern does not match.
@@ -8187,7 +8272,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
         if (node->op == GGML_OP_MUL) {
-            const int skip = ggml_sycl_fuse_moe_reduce(*sycl_ctx, cgraph, i);
+            int skip = ggml_sycl_fuse_moe_situ(*sycl_ctx, cgraph, i);
+            if (skip == 0) {
+                skip = ggml_sycl_fuse_moe_reduce(*sycl_ctx, cgraph, i);
+            }
             if (skip > 0) {
                 i += skip;
                 continue;
