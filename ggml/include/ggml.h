@@ -2322,6 +2322,15 @@ extern "C" {
             struct ggml_tensor * table,
             struct ggml_tensor * indices);
 
+    // The indexed bias with the indices from positions: indices[key, query] = min((uint32_t) (q_pos[query] - kv_pos[key]), table->ne[0] - 1).
+    // A key after its query or farther than table->ne[0] - 2 takes the last entry; an empty cell can be given INT32_MAX (it must be masked out).
+    // kv_pos: [n_kv, n_stream] I32, a position per mask column; q_pos: [n_queries] I32, queries of all streams in stream order. Both contiguous.
+    GGML_API void ggml_flash_attn_ext_add_indexed_bias_pos(
+            struct ggml_tensor * a,
+            struct ggml_tensor * table,
+            struct ggml_tensor * kv_pos,
+            struct ggml_tensor * q_pos);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,

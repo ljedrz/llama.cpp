@@ -167,7 +167,8 @@ static void mkl_fa_online_softmax_chunk(
                 }
                 // indexed bias of this query and head: table[idx[kv, q_row], h, q_row]
                 const float *   rel_t = rel.table ? (const float *) (rel.table + (int64_t) (kvh_head + gqa_group) * rel.tb1 + q_row * rel.tb2) : nullptr;
-                const int32_t * rel_i = rel.table ? rel.idx + q_row * rel.ib1 : nullptr;
+                const int32_t * rel_i  = rel.idx ? rel.idx + q_row * rel.ib1 : nullptr;
+                const int32_t   rel_qp = rel.q_pos ? rel.q_pos[q_row] : 0;
                 // Score at chunk offset i — original per-element math.
                 auto score = [&](int i) {
                     float s = KQ_row[i];
@@ -179,7 +180,7 @@ static void mkl_fa_online_softmax_chunk(
                             + (chunk_start + i)];
                     }
                     if (rel_t) {
-                        s += rel_t[rel_i[chunk_start + i]];
+                        s += rel_t[rel_i ? (uint32_t) rel_i[chunk_start + i] : ggml_sycl_rel_dist(rel_qp, rel.kv_pos[chunk_start + i], rel.d_max)];
                     }
                     return s;
                 };

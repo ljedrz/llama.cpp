@@ -5655,7 +5655,12 @@ bool ggml_validate_flash_attn_ext_indexed_bias(const struct ggml_tensor * a) {
         table->type == GGML_TYPE_F32 && ggml_is_contiguous(table) && table->ne[0] > 0 && table->ne[1] == q->ne[2] &&
         (q->ne[1] == 0 || q->ne[3] <= INT64_MAX/q->ne[1]) && table->ne[2] == q->ne[1]*q->ne[3] && table->ne[3] == 1 &&
         indices->type == GGML_TYPE_I32 && ggml_is_contiguous(indices) && ggml_is_matrix(indices) &&
-        indices->ne[0] == mask->ne[0] && indices->ne[1] == table->ne[2];
+        indices->ne[0] == mask->ne[0] &&
+        (ggml_flash_attn_ext_indexed_bias_pos(a) ?
+            // the positions form: the key positions per stream in src[7], the query positions in src[8]
+            indices->ne[1] == q->ne[3] && a->src[8] && a->src[8]->type == GGML_TYPE_I32 && ggml_is_contiguous(a->src[8]) &&
+            ggml_nelements(a->src[8]) == table->ne[2] :
+            indices->ne[1] == table->ne[2]);
 }
 
 void ggml_flash_attn_ext_add_indexed_bias(
@@ -5666,6 +5671,19 @@ void ggml_flash_attn_ext_add_indexed_bias(
     a->src[6] = table;
     a->src[7] = indices;
     ggml_set_op_params_i32(a, 5, table != NULL);
+    GGML_ASSERT(ggml_validate_flash_attn_ext_indexed_bias(a));
+}
+
+void ggml_flash_attn_ext_add_indexed_bias_pos(
+        struct ggml_tensor * a,
+        struct ggml_tensor * table,
+        struct ggml_tensor * kv_pos,
+        struct ggml_tensor * q_pos) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    a->src[6] = table;
+    a->src[7] = kv_pos;
+    a->src[8] = q_pos;
+    ggml_set_op_params_i32(a, 5, GGML_FA_INDEXED_BIAS_POS);
     GGML_ASSERT(ggml_validate_flash_attn_ext_indexed_bias(a));
 }
 

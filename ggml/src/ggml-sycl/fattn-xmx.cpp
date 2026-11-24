@@ -130,160 +130,209 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_sycl_pool_alloc<float> part_buf(ctx.pool());
     float *          part      = nsplit > 1 ? part_buf.alloc((size_t) nsplit * n_q_heads * q_pad * (D + 2)) : nullptr;
 
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.parallel_for(sycl::nd_range<1>((n_thr + WGT - 1) / WGT * WGT, WGT),
-            sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> },
-            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                using namespace sycl::ext::intel::esimd;
-                using half = sycl::half;
-                const int tid = it.get_global_id(0);
-                const int kvh = tid / (tiles * nsplit);
-                if (kvh >= n_kv_heads) {
-                    return;
-                }
-                const int sp = (tid / tiles) % nsplit;  // the 16 threads of a work-group read the same keys
-                const int t  = tid % tiles;
-                const int h  = kvh * gqa + t / qtiles;  // query head
-                const int q0 = (t % qtiles) * RPT;      // first token
+    // a kernel per bias form: the positions and the index rows together held registers that both lost
+    const auto launch = [&](auto pos_tag) {
+        constexpr bool POS = decltype(pos_tag)::value;
+        stream->submit([&](sycl::handler & cgh) {
+            cgh.parallel_for(sycl::nd_range<1>((n_thr + WGT - 1) / WGT * WGT, WGT),
+                sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> },
+                [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                    using namespace sycl::ext::intel::esimd;
+                    using half = sycl::half;
+                    const int tid = it.get_global_id(0);
+                    const int kvh = tid / (tiles * nsplit);
+                    if (kvh >= n_kv_heads) {
+                        return;
+                    }
+                    const int sp = (tid / tiles) % nsplit;  // the 16 threads of a work-group read the same keys
+                    const int t  = tid % tiles;
+                    const int h  = kvh * gqa + t / qtiles;  // query head
+                    const int q0 = (t % qtiles) * RPT;      // first token
 
-                // the DPAS A pieces of Q come from L1 every step: in registers they took 64 of the 256 and left too few for the rest
-                // rows past the tokens read zero and are not stored
-                const half * qhead = qp + (size_t) h * n_queries * D;
+                    // the DPAS A pieces of Q come from L1 every step: in registers they took 64 of the 256 and left too few for the rest
+                    // rows past the tokens read zero and are not stored
+                    const half * qhead = qp + (size_t) h * n_queries * D;
 
-                // the bias table of this query head
-                const char * tab0 = rel.table ? rel.table + (int64_t) h * rel.tb1 : nullptr;
-
-                simd<float, MB * NC * 8 * 16> O = 0.0f;  // [mb][c][8 rows][16]
-                float mref[RPT], lsum[RPT];
+                    // the bias table of this query head; from positions also each row's position and its clamped entry (all cells
+                    // d_max or more behind), in base 2
+                    const char * tab0     = rel.table ? rel.table + (int64_t) h * rel.tb1 : nullptr;
+                    int32_t      qpos[RPT] = {};
+                    float        cfar[RPT] = {};
+                    int32_t      qpos_min  = INT32_MAX;
+                    if (POS && rel.table) {
 #pragma unroll
-                for (int R = 0; R < RPT; ++R) {
-                    mref[R] = NEG;
-                    lsum[R] = 0.0f;
-                }
-                const uint32_t * kb = (const uint32_t *) (kp + kvh * k_head);
-                const half *     vb = (const half *) (vp + kvh * v_head);
-
-                const int k_end = std::min(n_kv, (sp + 1) * kt_split * KT);
-                for (int k0 = sp * kt_split * KT; k0 < k_end; k0 += KT) {
-                    // S = Q K^T, [mb][8 rows][16 keys]
-                    simd<float, MB * 8 * KT> S = 0.0f;
-#pragma unroll
-                    for (int c = 0; c < NC; ++c) {
-                        simd<uint32_t, 8 * KT> kt = load_2d<uint32_t, 8, KT, 1, true, false>(kb, D * 2 - 1, n_kv - 1, k_pitch - 1, c * 8, k0);
-#pragma unroll
-                        for (int mb = 0; mb < MB; ++mb) {
-                            S.template select<8 * KT, 1>(mb * 8 * KT) = xmx::dpas<8, 8, float, float, half, half>(
-                                simd<float, 8 * KT>(S.template select<8 * KT, 1>(mb * 8 * KT)), kt.template bit_cast_view<half>().read(),
-                                load_2d<half, 16, 8, 1, false, false>(qhead, D * 2 - 1, n_queries - 1, D * 2 - 1, c * 16, q0 + mb * 8));
+                        for (int R = 0; R < RPT; ++R) {
+                            const int q = q0 + R < n_queries ? q0 + R : n_queries - 1;
+                            qpos[R]     = rel.q_pos[q];
+                            cfar[R]     = ((const float *) (tab0 + (int64_t) q * rel.tb2))[rel.d_max] * LOG2E;
+                            qpos_min    = qpos[R] < qpos_min ? qpos[R] : qpos_min;
                         }
                     }
 
-                    // mask: the tokens' rows of this key tile, [16 rows][16 keys] like S; keys past the cache are masked here
-                    simd<half, RPT * KT> mt = load_2d<half, KT, RPT, 1, false, false>(mp, n_kv * 2 - 1, m_rows - 1, m_pitch - 1, k0, q0);
-                    S += simd<float, RPT * KT>(mt) * LOG2E;
-                    if (k0 + KT > n_kv) {
-                        simd_mask<KT> out = simd<int32_t, KT>(0, 1) >= n_kv - k0;
+                    simd<float, MB * NC * 8 * 16> O = 0.0f;  // [mb][c][8 rows][16]
+                    float mref[RPT], lsum[RPT];
+#pragma unroll
+                    for (int R = 0; R < RPT; ++R) {
+                        mref[R] = NEG;
+                        lsum[R] = 0.0f;
+                    }
+                    const uint32_t * kb = (const uint32_t *) (kp + kvh * k_head);
+                    const half *     vb = (const half *) (vp + kvh * v_head);
+
+                    const int k_end = std::min(n_kv, (sp + 1) * kt_split * KT);
+                    for (int k0 = sp * kt_split * KT; k0 < k_end; k0 += KT) {
+                        // S = Q K^T, [mb][8 rows][16 keys]
+                        simd<float, MB * 8 * KT> S = 0.0f;
+#pragma unroll
+                        for (int c = 0; c < NC; ++c) {
+                            simd<uint32_t, 8 * KT> kt = load_2d<uint32_t, 8, KT, 1, true, false>(kb, D * 2 - 1, n_kv - 1, k_pitch - 1, c * 8, k0);
+#pragma unroll
+                            for (int mb = 0; mb < MB; ++mb) {
+                                S.template select<8 * KT, 1>(mb * 8 * KT) = xmx::dpas<8, 8, float, float, half, half>(
+                                    simd<float, 8 * KT>(S.template select<8 * KT, 1>(mb * 8 * KT)), kt.template bit_cast_view<half>().read(),
+                                    load_2d<half, 16, 8, 1, false, false>(qhead, D * 2 - 1, n_queries - 1, D * 2 - 1, c * 16, q0 + mb * 8));
+                            }
+                        }
+
+                        // mask: the tokens' rows of this key tile, [16 rows][16 keys] like S; keys past the cache are masked here
+                        simd<half, RPT * KT> mt = load_2d<half, KT, RPT, 1, false, false>(mp, n_kv * 2 - 1, m_rows - 1, m_pitch - 1, k0, q0);
+                        S += simd<float, RPT * KT>(mt) * LOG2E;
+                        if (k0 + KT > n_kv) {
+                            simd_mask<KT> out = simd<int32_t, KT>(0, 1) >= n_kv - k0;
+#pragma unroll
+                            for (int R = 0; R < RPT; ++R) {
+                                simd<float, KT> s = S.template select<KT, 1>(R * KT);
+                                s.merge(simd<float, KT>(NEG * 2.0f), out);
+                                S.template select<KT, 1>(R * KT) = s;
+                            }
+                        }
+
+                        // a runtime test keeps the bias loads after QK: hoisted before it they cost registers (33 -> 65 ms per call)
+                        if (!rel.table) {
+                        } else if constexpr (POS) {
+                            // the cells are in no particular position order: test each tile by the positions it holds (an empty cell is INT32_MAX, so near)
+                            simd<int32_t, KT> kpos;
+                            if (k0 + KT <= n_kv) {
+                                kpos = block_load<int32_t, KT>(rel.kv_pos + k0);
+                            } else {
+                                simd<uint32_t, KT> off(0, 4);
+                                kpos = gather<int32_t, KT>(rel.kv_pos + k0, off, simd<int32_t, KT>(0, 1) < n_kv - k0);
+                            }
+                            const int32_t kpos_max = hmax<int32_t>(kpos);
+                            if (qpos_min - kpos_max >= (int32_t) rel.d_max) {
+#pragma unroll
+                                for (int R = 0; R < RPT; ++R) {
+                                    S.template select<KT, 1>(R * KT) += cfar[R];
+                                }
+                            } else {
+#pragma unroll
+                                for (int R = 0; R < RPT; ++R) {
+                                    const int q = q0 + R < n_queries ? q0 + R : n_queries - 1;
+                                    simd<uint32_t, KT> d = simd<uint32_t, KT>(qpos[R] - kpos);
+                                    d = min(d, simd<uint32_t, KT>(rel.d_max));
+                                    simd<float, KT> b = gather<float, KT>((const float *) (tab0 + (int64_t) q * rel.tb2), d * 4u);
+                                    S.template select<KT, 1>(R * KT) += b * LOG2E;
+                                }
+                            }
+                        } else {
+                            // each row reads the table entries its index row names for this key tile; keys past the cache take entry 0
+#pragma unroll
+                            for (int R = 0; R < RPT; ++R) {
+                                const int       q    = q0 + R < n_queries ? q0 + R : n_queries - 1;
+                                const int32_t * irow = rel.idx + (int64_t) q * rel.ib1 + k0;
+                                simd<int32_t, KT> ix;
+                                if (k0 + KT <= n_kv) {
+                                    ix = block_load<int32_t, KT>(irow);
+                                } else {
+                                    simd_mask<KT> in = simd<int32_t, KT>(0, 1) < n_kv - k0;
+                                    ix = gather<int32_t, KT>(irow, simd<uint32_t, KT>(0, 4), in);
+                                    ix.merge(simd<int32_t, KT>(0), !in);
+                                }
+                                simd<float, KT> b = gather<float, KT>((const float *) (tab0 + (int64_t) q * rel.tb2), simd<uint32_t, KT>(ix) * 4u);
+                                S.template select<KT, 1>(R * KT) += b * LOG2E;
+                            }
+                        }
+
+                        // online softmax in base 2: a row's max and the rescale only run when a score passes the running max
+                        // a lazier max (moved only 8 past it) measured the same speed and a higher KLD
+                        simd<half, MB * 8 * KT> P;
 #pragma unroll
                         for (int R = 0; R < RPT; ++R) {
                             simd<float, KT> s = S.template select<KT, 1>(R * KT);
-                            s.merge(simd<float, KT>(NEG * 2.0f), out);
-                            S.template select<KT, 1>(R * KT) = s;
+                            if ((s > mref[R]).any()) {
+                                const float mx    = hmax<float>(s);
+                                const float alpha = exp2(simd<float, 1>(mref[R] - mx))[0];
+                                mref[R] = mx;
+                                lsum[R] *= alpha;
+#pragma unroll
+                                for (int c = 0; c < NC; ++c) {
+                                    O.template select<16, 1>((((R / 8) * NC + c) * 8 + R % 8) * 16) *= alpha;
+                                }
+                            }
+                            simd<float, KT> p = exp2(s - mref[R]);
+                            lsum[R] += reduce<float>(p, std::plus<>());
+                            P.template select<KT, 1>(R * KT) = convert<half>(p);
+                        }
+
+                        // O += P V
+#pragma unroll
+                        for (int c = 0; c < NC; ++c) {
+                            simd<half, KT * 16> vt = load_2d<half, 16, KT, 1, false, true>(vb, D * 2 - 1, n_kv - 1, v_pitch - 1, c * 16, k0);
+#pragma unroll
+                            for (int mb = 0; mb < MB; ++mb) {
+                                O.template select<8 * 16, 1>((mb * NC + c) * 8 * 16) = xmx::dpas<8, 8, float, float, half, half>(
+                                    simd<float, 8 * 16>(O.template select<8 * 16, 1>((mb * NC + c) * 8 * 16)), vt,
+                                    simd<half, 8 * KT>(P.template select<8 * KT, 1>(mb * 8 * KT)));
+                            }
                         }
                     }
 
-                    if (rel.table) {
-                        // each row reads the table entries its index row names for this key tile; keys past the cache take entry 0
+                    if (part) {
+                        // rows [split][head][token]: D unnormalized values, then the max and the sum in base 2
+                        float * pr = part + ((size_t) sp * n_q_heads + h) * q_pad * (D + 2);
+                        simd<float, RPT> mv, lv;
 #pragma unroll
                         for (int R = 0; R < RPT; ++R) {
-                            const int       q    = q0 + R < n_queries ? q0 + R : n_queries - 1;
-                            const int32_t * irow = rel.idx + (int64_t) q * rel.ib1 + k0;
-                            simd<int32_t, KT> ix;
-                            if (k0 + KT <= n_kv) {
-                                ix = block_load<int32_t, KT>(irow);
-                            } else {
-                                simd_mask<KT> in = simd<int32_t, KT>(0, 1) < n_kv - k0;
-                                ix = gather<int32_t, KT>(irow, simd<uint32_t, KT>(0, 4), in);
-                                ix.merge(simd<int32_t, KT>(0), !in);
-                            }
-                            simd<float, KT> b = gather<float, KT>((const float *) (tab0 + (int64_t) q * rel.tb2), simd<uint32_t, KT>(ix) * 4u);
-                            S.template select<KT, 1>(R * KT) += b * LOG2E;
-                        }
-                    }
-
-                    // online softmax in base 2: a row's max and the rescale only run when a score passes the running max
-                    // a lazier max (moved only 8 past it) measured the same speed and a higher KLD
-                    simd<half, MB * 8 * KT> P;
-#pragma unroll
-                    for (int R = 0; R < RPT; ++R) {
-                        simd<float, KT> s = S.template select<KT, 1>(R * KT);
-                        if ((s > mref[R]).any()) {
-                            const float mx    = hmax<float>(s);
-                            const float alpha = exp2(simd<float, 1>(mref[R] - mx))[0];
-                            mref[R] = mx;
-                            lsum[R] *= alpha;
+                            mv[R] = mref[R];
+                            lv[R] = lsum[R];
+                            simd<float, D> orow;
 #pragma unroll
                             for (int c = 0; c < NC; ++c) {
-                                O.template select<16, 1>((((R / 8) * NC + c) * 8 + R % 8) * 16) *= alpha;
+                                orow.template select<16, 1>(c * 16) = O.template select<16, 1>((((R / 8) * NC + c) * 8 + R % 8) * 16);
                             }
+                            block_store<float, D>(pr + (size_t) (q0 + R) * D, orow);
                         }
-                        simd<float, KT> p = exp2(s - mref[R]);
-                        lsum[R] += reduce<float>(p, std::plus<>());
-                        P.template select<KT, 1>(R * KT) = convert<half>(p);
+                        block_store<float, RPT>(pr + (size_t) q_pad * D + q0, mv);
+                        block_store<float, RPT>(pr + (size_t) q_pad * (D + 1) + q0, lv);
+                        return;
                     }
 
-                    // O += P V
-#pragma unroll
-                    for (int c = 0; c < NC; ++c) {
-                        simd<half, KT * 16> vt = load_2d<half, 16, KT, 1, false, true>(vb, D * 2 - 1, n_kv - 1, v_pitch - 1, c * 16, k0);
-#pragma unroll
-                        for (int mb = 0; mb < MB; ++mb) {
-                            O.template select<8 * 16, 1>((mb * NC + c) * 8 * 16) = xmx::dpas<8, 8, float, float, half, half>(
-                                simd<float, 8 * 16>(O.template select<8 * 16, 1>((mb * NC + c) * 8 * 16)), vt,
-                                simd<half, 8 * KT>(P.template select<8 * KT, 1>(mb * 8 * KT)));
-                        }
-                    }
-                }
-
-                if (part) {
-                    // rows [split][head][token]: D unnormalized values, then the max and the sum in base 2
-                    float * pr = part + ((size_t) sp * n_q_heads + h) * q_pad * (D + 2);
-                    simd<float, RPT> mv, lv;
+                    // normalize; the sink logit only adds to the denominator
+                    const float sink2 = sk ? sk[h] * LOG2E : 0.0f;
 #pragma unroll
                     for (int R = 0; R < RPT; ++R) {
-                        mv[R] = mref[R];
-                        lv[R] = lsum[R];
-                        simd<float, D> orow;
+                        if (q0 + R < n_queries) {
+                            float l = lsum[R];
+                            if (sk) {
+                                l += exp2(simd<float, 1>(sink2 - mref[R]))[0];
+                            }
+                            const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+                            simd<float, D> orow;
 #pragma unroll
-                        for (int c = 0; c < NC; ++c) {
-                            orow.template select<16, 1>(c * 16) = O.template select<16, 1>((((R / 8) * NC + c) * 8 + R % 8) * 16);
+                            for (int c = 0; c < NC; ++c) {
+                                orow.template select<16, 1>(c * 16) = O.template select<16, 1>((((R / 8) * NC + c) * 8 + R % 8) * 16) * inv;
+                            }
+                            block_store<float, D>(dp + ((size_t) (q0 + R) * n_q_heads + h) * D, orow);
                         }
-                        block_store<float, D>(pr + (size_t) (q0 + R) * D, orow);
                     }
-                    block_store<float, RPT>(pr + (size_t) q_pad * D + q0, mv);
-                    block_store<float, RPT>(pr + (size_t) q_pad * (D + 1) + q0, lv);
-                    return;
-                }
-
-                // normalize; the sink logit only adds to the denominator
-                const float sink2 = sk ? sk[h] * LOG2E : 0.0f;
-#pragma unroll
-                for (int R = 0; R < RPT; ++R) {
-                    if (q0 + R < n_queries) {
-                        float l = lsum[R];
-                        if (sk) {
-                            l += exp2(simd<float, 1>(sink2 - mref[R]))[0];
-                        }
-                        const float inv = l > 0.0f ? 1.0f / l : 0.0f;
-                        simd<float, D> orow;
-#pragma unroll
-                        for (int c = 0; c < NC; ++c) {
-                            orow.template select<16, 1>(c * 16) = O.template select<16, 1>((((R / 8) * NC + c) * 8 + R % 8) * 16) * inv;
-                        }
-                        block_store<float, D>(dp + ((size_t) (q0 + R) * n_q_heads + h) * D, orow);
-                    }
-                }
-            });
-    });
+                });
+        });
+    };
+    if (rel.q_pos) {
+        launch(std::true_type{});
+    } else {
+        launch(std::false_type{});
+    }
 
     if (part) {
         // out = sum_s 2^(m_s - M) O_s / (sum_s 2^(m_s - M) l_s + 2^(sink - M)), M the max over the splits

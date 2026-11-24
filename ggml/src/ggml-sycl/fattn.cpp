@@ -326,6 +326,7 @@ static ggml_tensor ggml_sycl_fattn_rel_mask_node(const ggml_tensor * dst, ggml_t
     node.src[3] = &mask_h;
     node.src[6] = nullptr;
     node.src[7] = nullptr;
+    node.src[8] = nullptr;
     ggml_set_op_params_i32(&node, 5, 0);
     return node;
 }
@@ -419,6 +420,7 @@ static void ggml_sycl_flash_attn_ext_rel_mask(ggml_backend_sycl_context & ctx, g
         rel.table, (const char *) rel.idx, m_data, (char *) buf.get(),
         n_head, n_kv, n_tok, (size_t) rel.tb1, sizeof(float), (size_t) rel.tb2, sizeof(int32_t), (size_t) rel.ib1 * sizeof(int32_t),
         sizeof(sycl::half), m_nb1, mask_h.nb[1], mask_h.nb[2], true, true,
+        rel.kv_pos, rel.q_pos, rel.d_max,
     };
     ggml_sycl_rel_bias_mask(a, ctx.stream());
 
@@ -570,10 +572,13 @@ static void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_t
     const ggml_sycl_fattn_rel_bias rel = ggml_sycl_fattn_get_rel_bias(dst);
     if (rel.table) {
         a.rel_table = rel.table;
-        a.rel_idx   = rel.idx;
-        a.r_tb1     = (size_t) rel.tb1;
-        a.r_tb2     = (size_t) rel.tb2;
-        a.r_ib1     = (size_t) rel.ib1;
+        a.rel_idx    = rel.idx;
+        a.rel_kv_pos = rel.kv_pos;
+        a.rel_q_pos  = rel.q_pos;
+        a.r_tb1      = (size_t) rel.tb1;
+        a.r_tb2      = (size_t) rel.tb2;
+        a.r_ib1      = (size_t) rel.ib1;
+        a.r_dmax     = rel.d_max;
     }
     ggml_sycl_attn_dec(ctx, a);
 }

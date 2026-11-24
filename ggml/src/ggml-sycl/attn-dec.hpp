@@ -23,11 +23,15 @@ struct ggml_sycl_attn_dec_args {
     bool         v_rows;
     bool         kv_q8;  // K and V are q8_0 (v_rows only); rows need only be 2-byte aligned
     int64_t      o_t, o_h;
-    // indexed bias (see ggml_flash_attn_ext_add_indexed_bias): table[idx[kv, token], head, token], or null
+    // indexed bias (see ggml_flash_attn_ext_add_indexed_bias): table[idx[kv, token], head, token], or null; without idx
+    // from positions: table[min(q_pos[token] - kv_pos[kv], r_dmax), head, token]
     const char *    rel_table;
     const int32_t * rel_idx;
+    const int32_t * rel_kv_pos;
+    const int32_t * rel_q_pos;
     size_t          r_tb1, r_tb2;   // table strides in bytes along the head and the token
     size_t          r_ib1;          // idx row stride in elements
+    uint32_t        r_dmax;         // n_dist - 1
 };
 
 bool ggml_sycl_attn_dec_supported(int64_t D, int64_t nq);

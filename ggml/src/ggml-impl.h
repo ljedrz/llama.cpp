@@ -179,6 +179,13 @@ static float ggml_get_op_params_f32(const struct ggml_tensor * tensor, uint32_t 
     return ((const float *)(tensor->op_params))[i];
 }
 
+// GGML_OP_FLASH_ATTN_EXT op_params[5]: 0 no indexed bias, 1 indices in src[7], 2 positions of the keys in src[7] and of the queries in src[8]
+#define GGML_FA_INDEXED_BIAS_POS 2
+
+static inline bool ggml_flash_attn_ext_indexed_bias_pos(const struct ggml_tensor * a) {
+    return a->op == GGML_OP_FLASH_ATTN_EXT && ggml_get_op_params_i32(a, 5) == GGML_FA_INDEXED_BIAS_POS;
+}
+
 // [TAG_GGML_PREC]
 // - GGML_OP_MUL_MAT
 //   0 - acc

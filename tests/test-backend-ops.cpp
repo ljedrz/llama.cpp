@@ -5214,11 +5214,13 @@ struct test_attn_kq_softmax_kqv : public test_case {
 // hold the positions of a wrapped ring (as a SWA cache does) with empty cells, cells after the queries are not masked
 // (their distance clamps to the last one), and distances run past the table. causal: a prompt over a cache instead, the
 // cells in order without empty ones, the last nb cells are the tokens' own, the mask hides the cells after each token.
+// pos: the bias takes the positions instead of the indices (ggml_flash_attn_ext_add_indexed_bias_pos).
 struct test_flash_attn_ext_rel : public test_case {
     const int64_t hs, nh, nr2, kv, nb, n_dist;
     const bool      sinks;
     const ggml_type type_KV;
     const bool      causal;
+    const bool      pos;
 
     static constexpr int64_t pos_base = 5;
 
@@ -5231,14 +5233,15 @@ struct test_flash_attn_ext_rel : public test_case {
     int32_t q_pos(int64_t i) const { return (int32_t) (pos_base + kv - nb + i); }
 
     std::string vars() override {
-        return VARS_TO_STR9(hs, nh, nr2, kv, nb, n_dist, sinks, type_KV, causal);
+        return VARS_TO_STR10(hs, nh, nr2, kv, nb, n_dist, sinks, type_KV, causal, pos);
     }
 
     double max_nmse_err() override { return 5e-4; }
 
     test_flash_attn_ext_rel(int64_t hs = 128, int64_t nh = 8, int64_t nr2 = 3, int64_t kv = 1024, int64_t nb = 3,
-                            int64_t n_dist = 129, bool sinks = true, ggml_type type_KV = GGML_TYPE_F16, bool causal = false)
-        : hs(hs), nh(nh), nr2(nr2), kv(kv), nb(nb), n_dist(n_dist), sinks(sinks), type_KV(type_KV), causal(causal) {}
+                            int64_t n_dist = 129, bool sinks = true, ggml_type type_KV = GGML_TYPE_F16, bool causal = false,
+                            bool pos = false)
+        : hs(hs), nh(nh), nr2(nr2), kv(kv), nb(nb), n_dist(n_dist), sinks(sinks), type_KV(type_KV), causal(causal), pos(pos) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_head = nh*nr2;
@@ -5253,8 +5256,18 @@ struct test_flash_attn_ext_rel : public test_case {
         ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_dist, n_head*nb);
         ggml_set_name(t, "t");
         ggml_tensor * table = ggml_reshape_3d(ctx, t, n_dist, n_head, nb);
-        ggml_tensor * rel_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, nb);
-        ggml_set_name(rel_pos, "rel_pos");
+        ggml_tensor * rel_pos = nullptr;
+        ggml_tensor * kv_pos  = nullptr;
+        ggml_tensor * q_pos   = nullptr;
+        if (pos) {
+            kv_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, 1);
+            ggml_set_name(kv_pos, "kv_pos");
+            q_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nb);
+            ggml_set_name(q_pos, "q_pos");
+        } else {
+            rel_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, nb);
+            ggml_set_name(rel_pos, "rel_pos");
+        }
 
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
         if (sinks) {
@@ -5262,7 +5275,11 @@ struct test_flash_attn_ext_rel : public test_case {
             ggml_set_name(s, "s");
             ggml_flash_attn_ext_add_sinks(out, s);
         }
-        ggml_flash_attn_ext_add_indexed_bias(out, table, rel_pos);
+        if (pos) {
+            ggml_flash_attn_ext_add_indexed_bias_pos(out, table, kv_pos, q_pos);
+        } else {
+            ggml_flash_attn_ext_add_indexed_bias(out, table, rel_pos);
+        }
         ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
         return out;
@@ -5282,6 +5299,18 @@ struct test_flash_attn_ext_rel : public test_case {
                         const uint32_t d = (uint32_t) q_pos(i) - (uint32_t) kv_pos(j);
                         data[i*kv + j] = (int32_t) std::min<uint32_t>(d, (uint32_t) (n_dist - 1));
                     }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "kv_pos") == 0) {
+                std::vector<int32_t> data(kv);
+                for (int64_t j = 0; j < kv; ++j) {
+                    data[j] = kv_pos(j);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "q_pos") == 0) {
+                std::vector<int32_t> data(nb);
+                for (int64_t i = 0; i < nb; ++i) {
+                    data[i] = q_pos(i);
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
             } else if (strcmp(t->name, "m") == 0) {
@@ -15306,41 +15335,48 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // every bias case with the indices and with the positions
+    auto add_rel = [&](int64_t hs, int64_t nh, int64_t nr2, int64_t kv, int64_t nb, int64_t n_dist, bool sinks,
+                       ggml_type type_KV = GGML_TYPE_F16, bool causal = false) {
+        for (bool pos : { false, true }) {
+            test_cases.emplace_back(new test_flash_attn_ext_rel(hs, nh, nr2, kv, nb, n_dist, sinks, type_KV, causal, pos));
+        }
+    };
     // flash attention with a relative-position bias: decode, verify batches, a prompt chunk; short and long caches
     for (int64_t kv : { 512, 2056, 4096 }) {
         for (int64_t nb : { 1, 3, 4, 7, 64 }) {
-            test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, kv, nb, 1025, true));
+            add_rel(128, 8, 3, kv, nb, 1025, true);
         }
     }
-    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 2056, 3, 129, false));
-    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 2048, 256, 1025, true));
+    add_rel(128, 8, 3, 2056, 3, 129, false);
+    add_rel(128, 8, 3, 2048, 256, 1025, true);
     // prompt chunks over long caches: ragged token counts, a short table without sinks, GQA 4, more cells
-    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 2056, 37, 1025, true));
-    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 4096, 300, 129, false));
-    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 4, 4, 2056, 40, 1025, true));
-    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 8200, 64, 1025, true));
+    add_rel(128, 8, 3, 2056, 37, 1025, true);
+    add_rel(128, 8, 3, 4096, 300, 129, false);
+    add_rel(128, 4, 4, 2056, 40, 1025, true);
+    add_rel(128, 8, 3, 8200, 64, 1025, true);
     // prompt chunks over a cache with a causal mask: mask tiles all visible, mixed and all masked
-    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 2048, 256, 1025, true, GGML_TYPE_F16, true));
-    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 1100, 300, 1025, false, GGML_TYPE_F16, true));
-    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 4, 4, 4100, 37, 1025, true, GGML_TYPE_F16, true));
+    add_rel(128, 8, 3, 2048, 256, 1025, true, GGML_TYPE_F16, true);
+    add_rel(128, 8, 3, 1100, 300, 1025, false, GGML_TYPE_F16, true);
+    add_rel(128, 4, 4, 4100, 37, 1025, true, GGML_TYPE_F16, true);
     // other token counts, head sizes and GQA ratios of the few-token kernel: 6, 4, 3, 16 and 12 query vectors per KV head
-    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 2056, 2, 1025, true));
-    test_cases.emplace_back(new test_flash_attn_ext_rel(256, 4, 4, 2056, 1, 513, true));
-    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 4, 1, 2056, 3, 1025, true));
-    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 4, 4, 2056, 4, 1025, false));
-    test_cases.emplace_back(new test_flash_attn_ext_rel(256, 4, 4, 2056, 3, 513, true));
+    add_rel(128, 8, 3, 2056, 2, 1025, true);
+    add_rel(256, 4, 4, 2056, 1, 513, true);
+    add_rel(128, 4, 1, 2056, 3, 1025, true);
+    add_rel(128, 4, 4, 2056, 4, 1025, false);
+    add_rel(256, 4, 4, 2056, 3, 513, true);
     // short caches in short chunks: n_kv 256 and 1032
-    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 256, 1, 1025, true));
-    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 1032, 3, 1025, true));
-    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, 1032, 4, 1025, true, GGML_TYPE_Q8_0));
+    add_rel(128, 8, 3, 256, 1, 1025, true);
+    add_rel(128, 8, 3, 1032, 3, 1025, true);
+    add_rel(128, 8, 3, 1032, 4, 1025, true, GGML_TYPE_Q8_0);
     // a q8_0 cache: decode and verify batches, a few-token batch and a prompt chunk, short and long caches
     for (int64_t kv : { 512, 2056 }) {
         for (int64_t nb : { 1, 3, 7, 64 }) {
-            test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, kv, nb, 1025, true, GGML_TYPE_Q8_0));
+            add_rel(128, 8, 3, kv, nb, 1025, true, GGML_TYPE_Q8_0);
         }
     }
-    test_cases.emplace_back(new test_flash_attn_ext_rel(128, 4, 4, 2056, 4, 1025, false, GGML_TYPE_Q8_0));
-    test_cases.emplace_back(new test_flash_attn_ext_rel(256, 4, 4, 2056, 3, 513, true, GGML_TYPE_Q8_0));
+    add_rel(128, 4, 4, 2056, 4, 1025, false, GGML_TYPE_Q8_0);
+    add_rel(256, 4, 4, 2056, 3, 513, true, GGML_TYPE_Q8_0);
 
     // attention without flash attention for a few tokens: GQA 3 with per-head and shared masks, other head sizes and ratios
     for (int64_t n_tok : { 1, 2, 3 }) {
@@ -16461,6 +16497,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t kv : {32768, 131072}) {
         test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, kv, 1024, 1025));
         test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, kv, 1024, 1025, true, GGML_TYPE_F16, true));
+        test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, kv, 1024, 1025, true, GGML_TYPE_F16, true, true));
     }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
