@@ -648,6 +648,7 @@ enum class xmx_scale_kind {
 template <bool SR, int NC_WIDE, xmx_scale_kind KIND> struct xmx_traits_base {
     static constexpr bool short_rows = SR;
     static constexpr bool half_sb    = false;  // rows may end in the middle of a super-block
+    static constexpr bool pair       = false;  // a tile is the even or the odd rows of 32, see xmx_traits_nvfp4
     static constexpr int  nc_wide    = NC_WIDE;
     static constexpr bool has_min    = KIND == xmx_scale_kind::min;
     static constexpr bool plain      = KIND == xmx_scale_kind::plain;
@@ -1038,14 +1039,20 @@ ESIMD_INLINE simd<float, 16> xmx_ue4m3(const simd<uint32_t, 16> & x) {
 // NVFP4 in its stored layout, the weights are not reordered: a block of 64 is 9 dwords, the UE4M3 scales of its
 // four 16 wide sub-blocks and 32 bytes of E2M1 codes. Byte j of a sub-block holds weight j in its low nibble and
 // weight j + 8 in its high nibble, so a super-block is 4 blocks and every load stays dword aligned.
-template <bool SR> struct xmx_traits_nvfp4 : xmx_traits_base<SR, 7, xmx_scale_kind::split> {
+// PAIR: rows whose size is not a multiple of 16 bytes (2D block loads need such a pitch) are read as pairs, a 2D row
+// of two weight rows. A tile is then the even (or odd) rows of a block of 32, at a dword offset into the pair.
+template <bool SR, bool PAIR = false> struct xmx_traits_nvfp4 : xmx_traits_base<SR, 7, xmx_scale_kind::split> {
+    static_assert(!(SR && PAIR));
     static constexpr int  sb_dwords = 4 * sizeof(block_nvfp4) / 4;
     static constexpr bool half_sb   = true;
+    static constexpr bool pair      = PAIR;
 
     struct ctx : xmx_ctx_base {
         const uint8_t * x;
         unsigned        px;
+        unsigned        rb;    // bytes per weight row
         int             nblk;  // blocks of 64 per row
+        int             xoff;  // dwords from the start of a 2D row to the tile's row
     };
 
     static ESIMD_INLINE ctx make(const void * vx, int nrows, int bpr, int row0) {
@@ -1053,14 +1060,24 @@ template <bool SR> struct xmx_traits_nvfp4 : xmx_traits_base<SR, 7, xmx_scale_ki
         xmx_ctx_init(c, nrows, bpr, row0);
         c.x    = (const uint8_t *) vx;
         c.px   = xmx_pitch(bpr, 4 * sizeof(block_nvfp4));
+        c.rb   = c.px + 1;
         c.nblk = 4 * bpr;
+        c.xoff = 0;
         return c;
     }
 
-    // a row of ncols, which may end after the first half of the last super-block
+    // a row of ncols, which may end after the first half of the last super-block; with PAIR, row0 of make() is the
+    // first row of the tile and the number of rows is even
     static ESIMD_INLINE void set_ncols(ctx & c, int ncols) {
         c.nblk = ncols / QK_NVFP4;
-        c.px   = c.nblk * sizeof(block_nvfp4) - 1;
+        c.rb   = c.nblk * sizeof(block_nvfp4);
+        c.px   = c.rb - 1;
+        if constexpr (PAIR) {
+            c.px   = 2 * c.rb - 1;
+            c.xoff = (c.row0 & 1) * (c.rb / 4);
+            c.row0 = c.row0 >> 1;
+            c.h    = (c.h + 1) / 2 - 1;
+        }
     }
 
     // row scales of the 16 sub-blocks of a super-block
@@ -1074,7 +1091,7 @@ template <bool SR> struct xmx_traits_nvfp4 : xmx_traits_base<SR, 7, xmx_scale_ki
         using namespace sycl::ext::intel::esimd;
         constexpr uint32_t bs = sizeof(block_nvfp4);
         scales_t           s;
-        simd<uint32_t, 16> off = rows * (c.px + 1) + sb * (4 * bs);
+        simd<uint32_t, 16> off = rows * c.rb + sb * (4 * bs);
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
             simd<uint32_t, 16> w = 0x7Fu;  // past the end of the row: a zero scale
@@ -1095,8 +1112,8 @@ template <bool SR> struct xmx_traits_nvfp4 : xmx_traits_base<SR, 7, xmx_scale_ki
 
     static ESIMD_INLINE part_t load_part(const ctx & c, int sb, int part) {
         part_t p;
-        p.a = xmx_load_t<8, SR>(c.x, c.px, c.h, sb * sb_dwords + (2 * part) * 9 + 1, c.row0);
-        p.b = xmx_load_t<8, SR>(c.x, c.px, c.h, sb * sb_dwords + (2 * part + 1) * 9 + 1, c.row0);
+        p.a = xmx_load_t<8, SR>(c.x, c.px, c.h, c.xoff + sb * sb_dwords + (2 * part) * 9 + 1, c.row0);
+        p.b = xmx_load_t<8, SR>(c.x, c.px, c.h, c.xoff + sb * sb_dwords + (2 * part + 1) * 9 + 1, c.row0);
         return p;
     }
 
@@ -1286,8 +1303,9 @@ ESIMD_INLINE void xmx_mul_mat(const void * vx,
         slm_init<N_ACC * KS * NC * NT * sizeof(float)>();
     }
 
-    const int  bpr  = (ncols + QK_K - 1) / QK_K;
-    const int  row0 = tile * NT;
+    constexpr int RS   = T::pair ? 2 : 1;  // row step within a tile
+    const int     bpr  = (ncols + QK_K - 1) / QK_K;
+    const int     row0 = T::pair ? (tile >> 1) * 2 * NT + (tile & 1) : tile * NT;
     auto       c    = T::make(vx, nrows, bpr, row0);
     auto       cg   = T::make(FUSED ? vg : vx, nrows, bpr, row0);
     if constexpr (T::half_sb) {
@@ -1298,7 +1316,7 @@ ESIMD_INLINE void xmx_mul_mat(const void * vx,
     simd<uint32_t, NT> rows;
 #pragma unroll
     for (int n = 0; n < NT; ++n) {
-        rows[n] = row0 + n < nrows ? row0 + n : nrows - 1;
+        rows[n] = row0 + RS * n < nrows ? row0 + RS * n : nrows - 1;
     }
 
     const uint32_t * yq  = (const uint32_t *) vy;
@@ -1406,7 +1424,7 @@ ESIMD_INLINE void xmx_mul_mat(const void * vx,
         return dst + (size_t) m * ldd;
     };
     // a mapped dst has 16 byte aligned columns, the launch checks it
-    if (row0 + NT <= nrows && (dmap.map || (ldd % 4 == 0 && (uintptr_t) dst % 16 == 0))) {
+    if (!T::pair && row0 + NT <= nrows && (dmap.map || (ldd % 4 == 0 && (uintptr_t) dst % 16 == 0))) {
 #pragma unroll
         for (int m = 0; m < NC; ++m) {
             if (NC <= 8 || m < ncv) {
@@ -1414,14 +1432,14 @@ ESIMD_INLINE void xmx_mul_mat(const void * vx,
             }
         }
     } else {
-        // tail tile or unaligned output
+        // tail tile, unaligned output or every other row
         simd<uint32_t, NT> lane(0, 1);
-        simd_mask<NT>      in_rows = (lane + row0) < (uint32_t) nrows;
+        simd_mask<NT>      in_rows = (lane * RS + row0) < (uint32_t) nrows;
 #pragma unroll
         for (int m = 0; m < NC; ++m) {
             if (NC <= 8 || m < ncv) {
-                scatter<float, NT>(col(m) + row0, lane * (uint32_t) sizeof(float), Cf.template select<NT, 1>(m * NT),
-                                   in_rows);
+                scatter<float, NT>(col(m) + row0, lane * (uint32_t) (RS * sizeof(float)),
+                                   Cf.template select<NT, 1>(m * NT), in_rows);
             }
         }
     }
@@ -1498,7 +1516,8 @@ static void xmx_moe_tiles_launch(const void *               vx,
                                  float *                    dst,
                                  const xmx_moe_tiles_args & a,
                                  dpct::queue_ptr            stream) {
-    const int    n_mt     = (a.nrows + XMX_ROWS - 1) / XMX_ROWS;
+    // with paired rows two tiles cover a block of 2 * XMX_ROWS rows
+    const int    n_mt     = T::pair ? 2 * ((a.nrows + 2 * XMX_ROWS - 1) / (2 * XMX_ROWS)) : (a.nrows + XMX_ROWS - 1) / XMX_ROWS;
     const size_t n_groups = (size_t) a.n_tiles * n_mt;
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(n_groups), sycl::range<1>(1)),
