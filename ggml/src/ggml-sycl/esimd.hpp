@@ -1491,21 +1491,17 @@ struct xmx_moe_tiles_args {
     size_t                              nb2;  // dst bytes per token, a multiple of 16
 };
 
-template <typename T, int NC, int KS_MAX>
+// A thread per work-group: the work-groups are many, a K split with its shared memory reservation was slower.
+template <typename T, int NC>
 static void xmx_moe_tiles_launch(const void *               vx,
                                  const char *               vy,
                                  float *                    dst,
                                  const xmx_moe_tiles_args & a,
-                                 const int                  ks_cap,
                                  dpct::queue_ptr            stream) {
     const int    n_mt     = (a.nrows + XMX_ROWS - 1) / XMX_ROWS;
-    const int    bpr      = (a.ncols + QK_K - 1) / QK_K;
-    const int    kmax     = std::max(1, std::min(KS_MAX, ks_cap));
-    const int    rounds   = (bpr + kmax - 1) / kmax;
-    const int    ks       = (bpr + rounds - 1) / rounds;
     const size_t n_groups = (size_t) a.n_tiles * n_mt;
     stream->submit([&](sycl::handler & cgh) {
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(n_groups * ks), sycl::range<1>(ks)),
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(n_groups), sycl::range<1>(1)),
                          sycl::ext::oneapi::experimental::properties{
                              sycl::ext::intel::experimental::grf_size<xmx_grf<T, NC, false>()> },
                          [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
@@ -1516,9 +1512,9 @@ static void xmx_moe_tiles_launch(const void *               vx,
                              }
                              const char *      w  = (const char *) vx + (size_t) t.expert * a.expert_stride;
                              const xmx_dst_map dm = { a.map + t.n0, a.nb1, a.nb2 };
-                             xmx_mul_mat<T, NC, KS_MAX, false>(w, nullptr, vy + (size_t) t.n0 * a.stride_y_bytes, dst,
-                                                               a.ncols, a.nrows, t.n1 - t.n0, a.stride_y_bytes, 0, 0,
-                                                               g % n_mt, (int) it.get_local_id(0), ks, dm);
+                             xmx_mul_mat<T, NC, 1, false>(w, nullptr, vy + (size_t) t.n0 * a.stride_y_bytes, dst,
+                                                          a.ncols, a.nrows, t.n1 - t.n0, a.stride_y_bytes, 0, 0,
+                                                          g % n_mt, 0, 1, dm);
                          });
     });
 }
