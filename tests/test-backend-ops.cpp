@@ -8394,6 +8394,51 @@ struct test_moe_reduce : public test_case {
     }
 };
 
+// the SiTU activation of build_moe_ffn after a merged gate_up with a per-slot scale (Inkling 2's NVFP4 experts):
+// MUL(gate_up, scale), the gate and up halves as views, beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb); backends may
+// run it as one kernel
+struct test_moe_situ : public test_case {
+    const int64_t n_ff, n_slot, n_tok;
+    const float   beta, lb;
+
+    test_moe_situ(int64_t n_ff, int64_t n_slot, int64_t n_tok, float beta = 4.0f, float lb = 25.0f)
+        : n_ff(n_ff), n_slot(n_slot), n_tok(n_tok), beta(beta), lb(lb) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_ff, n_slot, n_tok, beta, lb);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_SITU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*n_ff, n_slot, n_tok);
+        ggml_set_name(gate_up, "gate_up");
+        ggml_tensor * scale = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slot, n_tok);
+        ggml_set_name(scale, "scale");
+        ggml_tensor * gu   = ggml_mul(ctx, gate_up, scale);
+        ggml_tensor * gate = ggml_view_3d(ctx, gu, n_ff, n_slot, n_tok, gu->nb[1], gu->nb[2], 0);
+        ggml_tensor * up   = ggml_view_3d(ctx, gu, n_ff, n_slot, n_tok, gu->nb[1], gu->nb[2], n_ff*ggml_element_size(gu));
+        ggml_tensor * act  = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gate, 1.0f/beta)), beta);
+        act = ggml_mul(ctx, act, ggml_sigmoid(ctx, gate));
+        up  = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 1.0f/lb)), lb);
+        ggml_tensor * out = ggml_mul(ctx, act, up);
+        ggml_set_name(out, "moe_situ");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // gate and up values past both caps, so the tanh saturates in some elements
+            init_tensor_uniform(t, strcmp(t->name, "scale") == 0 ? 0.5f : -40.0f, strcmp(t->name, "scale") == 0 ? 2.0f : 40.0f);
+        }
+    }
+};
+
 // a short-conv step as build_conv_state_store and Inkling 2's convolve build it: CONCAT(past, x) of a channel slice of
 // the history, the state store (CPY of the last columns, or SET_ROWS of overlapping windows into rollback slots),
 // SSM_CONV of the concat and its residual chain; backends may run it as one kernel
@@ -14192,6 +14237,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128, false, true));
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
+    // the SiTU of a gate_up with a per-slot scale: Inkling 2 Mini's prompt shape, a ragged one, another beta / lb
+    test_cases.emplace_back(new test_moe_situ(1152, 8, 64));
+    test_cases.emplace_back(new test_moe_situ(67, 3, 37));
+    test_cases.emplace_back(new test_moe_situ(256, 8, 5, 2.0f, 10.0f));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
     // normed K / V into the KV cache
     for (ggml_type tc : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
