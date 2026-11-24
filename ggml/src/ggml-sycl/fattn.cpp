@@ -383,8 +383,6 @@ static void ggml_sycl_flash_attn_ext_run(ggml_backend_sycl_context & ctx, ggml_t
 static void ggml_sycl_flash_attn_ext_rel_mask(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q     = dst->src[0];
     const ggml_tensor * mask  = dst->src[3];
-    const ggml_tensor * table = dst->src[6];
-    const ggml_tensor * pos   = dst->src[7];
     const int64_t n_kv = dst->src[1]->ne[1], n_tok = Q->ne[1], n_head = Q->ne[2];
 
     ggml_sycl_pool_alloc<sycl::half> buf(ctx.pool(), n_kv * n_tok * n_head);
@@ -400,9 +398,10 @@ static void ggml_sycl_flash_attn_ext_rel_mask(ggml_backend_sycl_context & ctx, g
         ctx.stream()->memset(zero.get(), 0, n_kv * sizeof(sycl::half));
         m_data = (const char *) zero.get();
     }
+    const ggml_sycl_fattn_rel_bias rel = ggml_sycl_fattn_get_rel_bias(dst);
     const ggml_sycl_rel_bias_mask_args a = {
-        (const char *) table->data, (const char *) pos->data, m_data, (char *) buf.get(),
-        n_head, n_kv, n_tok, table->nb[1], table->nb[0], table->nb[2], pos->nb[0], pos->nb[1],
+        rel.table, (const char *) rel.idx, m_data, (char *) buf.get(),
+        n_head, n_kv, n_tok, (size_t) rel.tb1, sizeof(float), (size_t) rel.tb2, sizeof(int32_t), (size_t) rel.ib1 * sizeof(int32_t),
         sizeof(sycl::half), m_nb1, mask_h.nb[1], mask_h.nb[2], true, true,
     };
     ggml_sycl_rel_bias_mask(a, ctx.stream());
@@ -520,8 +519,6 @@ static void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_t
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
-    const ggml_tensor * table = dst->src[6];
-    const ggml_tensor * pos   = dst->src[7];
 
     ggml_sycl_attn_dec_args a = {};
     a.q          = (const char *) Q->data;
@@ -551,13 +548,13 @@ static void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_t
     // the output is [D, n_head, n_tok]
     a.o_h        = (int64_t) (dst->nb[1] / sizeof(float));
     a.o_t        = (int64_t) (dst->nb[2] / sizeof(float));
-    if (table) {
-        a.rel_table = (const char *) table->data;
-        a.rel_pos   = (const int32_t *) pos->data;
-        a.r_tb1     = table->nb[1];
-        a.r_tb2     = table->nb[2];
-        a.r_pb0     = pos->nb[0] / sizeof(int32_t);
-        a.r_pb1     = pos->nb[1] / sizeof(int32_t);
+    const ggml_sycl_fattn_rel_bias rel = ggml_sycl_fattn_get_rel_bias(dst);
+    if (rel.table) {
+        a.rel_table = rel.table;
+        a.rel_idx   = rel.idx;
+        a.r_tb1     = (size_t) rel.tb1;
+        a.r_tb2     = (size_t) rel.tb2;
+        a.r_ib1     = (size_t) rel.ib1;
     }
     ggml_sycl_attn_dec(ctx, a);
 }

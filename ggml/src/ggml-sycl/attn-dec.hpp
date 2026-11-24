@@ -21,11 +21,11 @@ struct ggml_sycl_attn_dec_args {
     bool         mask_f16;
     bool         v_rows;
     int64_t      o_t, o_h;
-    // indexed bias (see ggml_flash_attn_ext_add_indexed_bias): table[rel_pos[kv, token], head, token], or null
+    // indexed bias (see ggml_flash_attn_ext_add_indexed_bias): table[idx[kv, token], head, token], or null
     const char *    rel_table;
-    const int32_t * rel_pos;
+    const int32_t * rel_idx;
     size_t          r_tb1, r_tb2;   // table strides in bytes along the head and the token
-    size_t          r_pb0, r_pb1;   // rel_pos strides in elements along kv and the token
+    size_t          r_ib1;          // idx row stride in elements
 };
 
 bool ggml_sycl_attn_dec_supported(int64_t D, int64_t nq);

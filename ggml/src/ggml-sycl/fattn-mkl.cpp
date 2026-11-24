@@ -165,9 +165,9 @@ static void mkl_fa_online_softmax_chunk(
                     mask_h   = mask_data + (int64_t)m_head * mask_head_stride;
                     m_stride = mask_row_stride;
                 }
-                // relative-position bias of this query and head: table[rel_pos[kv, q_row], h, q_row]
+                // indexed bias of this query and head: table[idx[kv, q_row], h, q_row]
                 const float *   rel_t = rel.table ? (const float *) (rel.table + (int64_t) (kvh_head + gqa_group) * rel.tb1 + q_row * rel.tb2) : nullptr;
-                const int32_t * rel_p = rel.table ? rel.pos + q_row * rel.pb1 : nullptr;
+                const int32_t * rel_i = rel.table ? rel.idx + q_row * rel.ib1 : nullptr;
                 // Score at chunk offset i — original per-element math.
                 auto score = [&](int i) {
                     float s = KQ_row[i];
@@ -179,7 +179,7 @@ static void mkl_fa_online_softmax_chunk(
                             + (chunk_start + i)];
                     }
                     if (rel_t) {
-                        s += rel_t[rel_p[(chunk_start + i) * rel.pb0]];
+                        s += rel_t[rel_i[chunk_start + i]];
                     }
                     return s;
                 };
@@ -376,13 +376,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     const ggml_tensor * sinks = dst->src[4];
     ggml_tensor * KQV = dst;
 
-    ggml_sycl_fattn_rel_bias rel = {};
-    if (ggml_flash_attn_ext_has_indexed_bias(dst)) {
-        const ggml_tensor * table = dst->src[6];
-        const ggml_tensor * pos   = dst->src[7];
-        rel = { (const char *) table->data, (const int32_t *) pos->data, (int64_t) table->nb[1], (int64_t) table->nb[2],
-                (int64_t) (pos->nb[0] / sizeof(int32_t)), (int64_t) (pos->nb[1] / sizeof(int32_t)) };
-    }
+    const ggml_sycl_fattn_rel_bias rel = ggml_sycl_fattn_get_rel_bias(dst);
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);

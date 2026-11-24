@@ -40,13 +40,29 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst);
 
 size_t ggml_sycl_flash_attn_ext_get_alloc_size(const ggml_tensor * dst);
 
-// the indexed bias of a flash attention node (src[6], src[7]): bias[kv, q, h] = table[pos[kv, q], h, q]
+// the indexed bias of a flash attention node (src[6], src[7]): bias[kv, q, h] = table[idx[kv, q], h, q], see
+// ggml_flash_attn_ext_add_indexed_bias
 struct ggml_sycl_fattn_rel_bias {
     const char *    table = nullptr;  // null: no bias
-    const int32_t * pos   = nullptr;
-    int64_t         tb1 = 0, tb2 = 0; // table strides in bytes (along the head and the query); distances are contiguous
-    int64_t         pb0 = 0, pb1 = 0; // pos strides in elements (along kv and the query)
+    const int32_t * idx   = nullptr;  // contiguous rows of n_kv
+    int64_t         tb1 = 0, tb2 = 0;  // table strides in bytes (along the head and the query); distances are contiguous
+    int64_t         ib1 = 0;           // idx row stride in elements
+    uint32_t        d_max = 0;         // n_dist - 1
 };
+
+static inline ggml_sycl_fattn_rel_bias ggml_sycl_fattn_get_rel_bias(const ggml_tensor * dst) {
+    ggml_sycl_fattn_rel_bias rel = {};
+    if (ggml_flash_attn_ext_has_indexed_bias(dst)) {
+        const ggml_tensor * table = dst->src[6];
+        rel.table = (const char *) table->data;
+        rel.idx   = (const int32_t *) dst->src[7]->data;
+        rel.tb1   = (int64_t) table->nb[1];
+        rel.tb2   = (int64_t) table->nb[2];
+        rel.ib1   = (int64_t) (dst->src[7]->nb[1] / sizeof(int32_t));
+        rel.d_max = (uint32_t) (table->ne[0] - 1);
+    }
+    return rel;
+}
 
 void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
