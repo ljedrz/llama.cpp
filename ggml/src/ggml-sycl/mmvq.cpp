@@ -2887,13 +2887,20 @@ void ggml_sycl_mul_mat_id_nvfp4_xmx(const void * vx, size_t expert_stride, int n
     GGML_ASSERT((uintptr_t) vy % 64 == 0 && stride_y_bytes % 64 == 0 && (uintptr_t) dst % 16 == 0 && nb1 % 16 == 0 &&
                 nb2 % 16 == 0);
     const esimd::xmx_moe_tiles_args a = { tiles, map, n_tiles, expert_stride, ncols, nrows, stride_y_bytes, nb1, nb2 };
-    // 2D block loads need a 64 byte aligned base of every expert, other rows are read row by row
-    const bool sr = ggml_sycl_xmx_short_rows(GGML_TYPE_NVFP4, ncols) || (uintptr_t) vx % 64 != 0 || expert_stride % 64 != 0;
-#    define MOE_RUN(NC)                                                                           \
-        if (sr) {                                                                                 \
-            esimd::xmx_moe_tiles_launch<esimd::xmx_traits_nvfp4<true>, NC>(vx, vy, dst, a, stream);  \
-        } else {                                                                                  \
-            esimd::xmx_moe_tiles_launch<esimd::xmx_traits_nvfp4<false>, NC>(vx, vy, dst, a, stream); \
+    static const bool pair_on = ggml_sycl_get_env("GGML_SYCL_NVFP4_MOE_XMX_PAIR", 1);
+    // 2D block loads need a 64 byte aligned base of every expert and a pitch of 16 bytes: rows of another size are
+    // read in pairs when two rows make such a pitch, else row by row
+    const size_t rb      = (size_t) ncols / QK_NVFP4 * sizeof(block_nvfp4);
+    const bool   aligned = (uintptr_t) vx % 64 == 0 && expert_stride % 64 == 0;
+    const bool   sr      = !aligned || ggml_sycl_xmx_short_rows(GGML_TYPE_NVFP4, ncols);
+    const bool   pair    = sr && aligned && pair_on && nrows % 2 == 0 && (2 * rb) % 16 == 0 && ncols >= 4 * QK_K;
+#    define MOE_RUN(NC)                                                                                 \
+        if (pair) {                                                                                     \
+            esimd::xmx_moe_tiles_launch<esimd::xmx_traits_nvfp4<false, true>, NC>(vx, vy, dst, a, stream); \
+        } else if (sr) {                                                                                \
+            esimd::xmx_moe_tiles_launch<esimd::xmx_traits_nvfp4<true>, NC>(vx, vy, dst, a, stream);        \
+        } else {                                                                                        \
+            esimd::xmx_moe_tiles_launch<esimd::xmx_traits_nvfp4<false>, NC>(vx, vy, dst, a, stream);       \
         }
     switch (ggml_sycl_nvfp4_moe_xmx_bn()) {
         case 16:
