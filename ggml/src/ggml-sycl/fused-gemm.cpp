@@ -164,14 +164,6 @@ template <typename F> static void fg_visit_combo(int idx, F && f) {
 // device reports is launched, so the runtime never asks IGC for the others.
 // (FG_AOT_SG is defined in fused-gemm.hpp, which the ESIMD kernels share)
 
-// Upper bound on the tile count when total_rows rows are routed to n_as experts: the worst case gives
-// each expert one row and fills whole tiles with the rest. The bound depends only on the shape, not
-// on the routing, so the pool reuses one buffer every ubatch instead of keeping one per size seen.
-static constexpr int64_t grouped_gemm_max_tiles(int64_t total_rows, int64_t n_as, int64_t BN) {
-    return total_rows <= n_as ? total_rows : n_as + (total_rows - n_as) / BN;
-}
-// Tiles do not cross experts, so the bound is not ceil(total_rows / BN): 34 rows over 2 experts with
-// BN = 16 split 17 + 17 need 2 + 2 tiles, where the ceil gives 3.
 static_assert(grouped_gemm_max_tiles(34, 2, 16) == 4);
 
 // the device lists S with an f32 accumulator and output
@@ -1297,14 +1289,14 @@ using mmid_sched_atomic = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed
                                            sycl::access::address_space::local_space>;
 
 bool ggml_sycl_build_mmid_schedule(const int32_t * ids_dev, size_t ids_token_stride, int64_t n_as, int64_t n_ids,
-                                   int64_t n_tokens, int64_t n_tiles_max, mmid_row_mapping * row_mapping,
+                                   int64_t n_tokens, int64_t n_tiles_max, int bn, mmid_row_mapping * row_mapping,
                                    ggml_sycl_grouped_gemm_tile * tiles, uint32_t * expert_offsets,
                                    dpct::queue_ptr stream) {
     if (n_as <= 0 || n_as > GGML_SYCL_MMID_SCHED_MAX_EXPERTS || n_ids <= 0 || n_tokens <= 0 || n_ids > INT32_MAX / n_tokens) {
         return false;
     }
     const int64_t n_routes = n_tokens * n_ids;
-    if (n_tiles_max < grouped_gemm_max_tiles(n_routes, n_as, GGML_SYCL_FG_BN)) {
+    if (bn <= 0 || n_tiles_max < grouped_gemm_max_tiles(n_routes, n_as, bn)) {
         return false;
     }
 
@@ -1368,7 +1360,7 @@ bool ggml_sycl_build_mmid_schedule(const int32_t * ids_dev, size_t ids_token_str
                 sycl::group_barrier(grp);
 
                 for (int64_t e = tid; e < n_as; e += MMID_SCHED_WG) {
-                    cnt[e] = (off[e + 1] - off[e] + GGML_SYCL_FG_BN - 1) / GGML_SYCL_FG_BN;
+                    cnt[e] = (off[e + 1] - off[e] + bn - 1) / bn;
                 }
                 sycl::group_barrier(grp);
 
@@ -1384,8 +1376,8 @@ bool ggml_sycl_build_mmid_schedule(const int32_t * ids_dev, size_t ids_token_str
                     const uint32_t base = off[e];
                     const uint32_t end  = off[e + 1];
                     for (uint32_t j = 0; j < cnt[e]; ++j) {
-                        const uint32_t n0 = base + j * GGML_SYCL_FG_BN;
-                        const uint32_t n1 = n0 + GGML_SYCL_FG_BN < end ? n0 + GGML_SYCL_FG_BN : end;
+                        const uint32_t n0 = base + j * bn;
+                        const uint32_t n1 = n0 + bn < end ? n0 + bn : end;
                         tiles[toff[e] + j] = { (int32_t) e, (int32_t) n0, (int32_t) n1 };
                     }
                 }
@@ -1419,7 +1411,7 @@ static bool fg_grouped_device_run(ggml_type src0_type, bool reordered, const voi
         ggml_sycl_pool_alloc<mmid_row_mapping> rows(pool, total_rows);
         ggml_sycl_pool_alloc<ggml_sycl_grouped_gemm_tile> tiles(pool, max_tiles);
         ggml_sycl_pool_alloc<uint32_t> offsets(pool, n_as + 1);
-        if (!ggml_sycl_build_mmid_schedule(ids_dev, ids_token_stride, n_as, n_ids, n_tokens, max_tiles,
+        if (!ggml_sycl_build_mmid_schedule(ids_dev, ids_token_stride, n_as, n_ids, n_tokens, max_tiles, S::BN,
                                            rows.get(), tiles.get(), offsets.get(), stream)) {
             return false;
         }

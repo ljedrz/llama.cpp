@@ -606,9 +606,11 @@ template <int NC> constexpr int xmx_n_split() {
     return NC <= 8 ? 32 : (NC == 16 ? 16 : 8);
 }
 
-inline bool xmx_supported(const void * vx, const int ncols) {
+// NVFP4 rows may end after the first half of a super-block
+inline bool xmx_supported(const void * vx, const int ncols, const ggml_type type) {
+    const int qk = type == GGML_TYPE_NVFP4 ? QK_K / 2 : QK_K;
     // 2D block loads need a 64 byte aligned base
-    return ncols % QK_K == 0 && (uintptr_t) vx % 64 == 0;
+    return ncols % qk == 0 && ncols >= QK_K && (uintptr_t) vx % 64 == 0;
 }
 
 // transposed 2D block load of 16 rows, dword (kd, n) lands at [kd * 16 + n]
@@ -645,6 +647,7 @@ enum class xmx_scale_kind {
 // What every quant type states about itself. nc_wide is the tile width from which it takes the large register file.
 template <bool SR, int NC_WIDE, xmx_scale_kind KIND> struct xmx_traits_base {
     static constexpr bool short_rows = SR;
+    static constexpr bool half_sb    = false;  // rows may end in the middle of a super-block
     static constexpr int  nc_wide    = NC_WIDE;
     static constexpr bool has_min    = KIND == xmx_scale_kind::min;
     static constexpr bool plain      = KIND == xmx_scale_kind::plain;
@@ -1036,19 +1039,28 @@ ESIMD_INLINE simd<float, 16> xmx_ue4m3(const simd<uint32_t, 16> & x) {
 // four 16 wide sub-blocks and 32 bytes of E2M1 codes. Byte j of a sub-block holds weight j in its low nibble and
 // weight j + 8 in its high nibble, so a super-block is 4 blocks and every load stays dword aligned.
 template <bool SR> struct xmx_traits_nvfp4 : xmx_traits_base<SR, 7, xmx_scale_kind::split> {
-    static constexpr int sb_dwords = 4 * sizeof(block_nvfp4) / 4;
+    static constexpr int  sb_dwords = 4 * sizeof(block_nvfp4) / 4;
+    static constexpr bool half_sb   = true;
 
     struct ctx : xmx_ctx_base {
         const uint8_t * x;
         unsigned        px;
+        int             nblk;  // blocks of 64 per row
     };
 
     static ESIMD_INLINE ctx make(const void * vx, int nrows, int bpr, int row0) {
         ctx c;
         xmx_ctx_init(c, nrows, bpr, row0);
-        c.x  = (const uint8_t *) vx;
-        c.px = xmx_pitch(bpr, 4 * sizeof(block_nvfp4));
+        c.x    = (const uint8_t *) vx;
+        c.px   = xmx_pitch(bpr, 4 * sizeof(block_nvfp4));
+        c.nblk = 4 * bpr;
         return c;
+    }
+
+    // a row of ncols, which may end after the first half of the last super-block
+    static ESIMD_INLINE void set_ncols(ctx & c, int ncols) {
+        c.nblk = ncols / QK_NVFP4;
+        c.px   = c.nblk * sizeof(block_nvfp4) - 1;
     }
 
     // row scales of the 16 sub-blocks of a super-block
@@ -1062,10 +1074,13 @@ template <bool SR> struct xmx_traits_nvfp4 : xmx_traits_base<SR, 7, xmx_scale_ki
         using namespace sycl::ext::intel::esimd;
         constexpr uint32_t bs = sizeof(block_nvfp4);
         scales_t           s;
-        simd<uint32_t, 16> off = (rows * c.bpr + sb) * (4 * bs);
+        simd<uint32_t, 16> off = rows * (c.px + 1) + sb * (4 * bs);
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
-            simd<uint32_t, 16> w = gather<uint32_t, 16>((const uint32_t *) c.x, off + k * bs);
+            simd<uint32_t, 16> w = 0x7Fu;  // past the end of the row: a zero scale
+            if (4 * sb + k < c.nblk) {
+                w = gather<uint32_t, 16>((const uint32_t *) c.x, off + k * bs);
+            }
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 s.v[4 * k + j] = xmx_ue4m3((w >> (8 * j)) & 0xFFu);
@@ -1232,6 +1247,13 @@ template <int N> ESIMD_INLINE simd<float, N> xmx_glu_act(const simd<float, N> & 
     return 0.5f * gate * (1.0f + t);
 }
 
+// columns that are routes of a MoE batch: column m is stored at dst + map[m].i1 * nb1 + map[m].i2 * nb2
+struct xmx_dst_map {
+    const mmid_row_mapping * map = nullptr;
+    size_t                   nb1 = 0;
+    size_t                   nb2 = 0;
+};
+
 // activations come in through 2D block loads, one for the (d, s) pairs of a super-block (s is unused) and one per two
 // groups for the quants, the DPAS A operand needs no repacking. Groups with two scales (16 wide) mask the
 // weights instead, zeros in B drop the other half of K.
@@ -1250,7 +1272,8 @@ ESIMD_INLINE void xmx_mul_mat(const void * vx,
                               const int    glu_op,
                               const int    tile,
                               const int    lid,
-                              const int    ks) {
+                              const int    ks,
+                              const xmx_dst_map & dmap = {}) {
     using namespace sycl::ext::intel::esimd;
 
     constexpr int  NT    = XMX_ROWS;
@@ -1263,10 +1286,14 @@ ESIMD_INLINE void xmx_mul_mat(const void * vx,
         slm_init<N_ACC * KS * NC * NT * sizeof(float)>();
     }
 
-    const int  bpr  = ncols / QK_K;
+    const int  bpr  = (ncols + QK_K - 1) / QK_K;
     const int  row0 = tile * NT;
-    const auto c    = T::make(vx, nrows, bpr, row0);
-    const auto cg   = T::make(FUSED ? vg : vx, nrows, bpr, row0);
+    auto       c    = T::make(vx, nrows, bpr, row0);
+    auto       cg   = T::make(FUSED ? vg : vx, nrows, bpr, row0);
+    if constexpr (T::half_sb) {
+        T::set_ncols(c, ncols);
+        T::set_ncols(cg, ncols);
+    }
 
     simd<uint32_t, NT> rows;
 #pragma unroll
@@ -1291,7 +1318,8 @@ ESIMD_INLINE void xmx_mul_mat(const void * vx,
     }
 
     for (int sb = lid; sb < bpr; sb += ks) {
-        auto                 sc = T::load_scales(c, sb, rows);
+        const bool           two = !T::half_sb || sb * QK_K + QK_K / 2 < ncols;  // false: the row ends after the first half
+        auto                 sc  = T::load_scales(c, sb, rows);
         typename T::scales_t scg;
         if constexpr (FUSED) {
             scg = T::load_scales(cg, sb, rows);
@@ -1308,6 +1336,9 @@ ESIMD_INLINE void xmx_mul_mat(const void * vx,
 
 #pragma unroll
         for (int part = 0; part < 2; ++part) {
+            if (part == 1 && !two) {
+                break;
+            }
             const auto         pd = T::load_part(c, sb, part);
             typename T::part_t pdg;
             if constexpr (FUSED) {
@@ -1367,11 +1398,19 @@ ESIMD_INLINE void xmx_mul_mat(const void * vx,
         Cf *= xmx_glu_act<NC * NT>(Cfg, glu_op);
     }
 
-    if (row0 + NT <= nrows && ldd % 4 == 0 && (uintptr_t) dst % 16 == 0) {
+    auto col = [&](int m) -> float * {
+        if (dmap.map) {
+            const mmid_row_mapping r = dmap.map[m];
+            return (float *) ((char *) dst + r.i1 * dmap.nb1 + r.i2 * dmap.nb2);
+        }
+        return dst + (size_t) m * ldd;
+    };
+    // a mapped dst has 16 byte aligned columns, the launch checks it
+    if (row0 + NT <= nrows && (dmap.map || (ldd % 4 == 0 && (uintptr_t) dst % 16 == 0))) {
 #pragma unroll
         for (int m = 0; m < NC; ++m) {
             if (NC <= 8 || m < ncv) {
-                block_store<float, NT>(dst + (size_t) m * ldd + row0, Cf.template select<NT, 1>(m * NT));
+                block_store<float, NT>(col(m) + row0, Cf.template select<NT, 1>(m * NT));
             }
         }
     } else {
@@ -1381,8 +1420,8 @@ ESIMD_INLINE void xmx_mul_mat(const void * vx,
 #pragma unroll
         for (int m = 0; m < NC; ++m) {
             if (NC <= 8 || m < ncv) {
-                scatter<float, NT>(dst + (size_t) m * ldd + row0, lane * (uint32_t) sizeof(float),
-                                   Cf.template select<NT, 1>(m * NT), in_rows);
+                scatter<float, NT>(col(m) + row0, lane * (uint32_t) sizeof(float), Cf.template select<NT, 1>(m * NT),
+                                   in_rows);
             }
         }
     }
@@ -1402,9 +1441,9 @@ static void xmx_mul_mat_launch_ks(const void *    vx,
                                   const int       ldd,
                                   const int       glu_op,
                                   dpct::queue_ptr stream) {
-    GGML_ASSERT(ncols % QK_K == 0);
+    GGML_ASSERT(ncols % (T::half_sb ? QK_K / 2 : QK_K) == 0);
     const size_t n_tiles = (nrows + XMX_ROWS - 1) / XMX_ROWS;
-    const int    bpr     = ncols / QK_K;
+    const int    bpr     = (ncols + QK_K - 1) / QK_K;
     const int    rounds  = (bpr + KS_MAX - 1) / KS_MAX;
     const int    ks      = (bpr + rounds - 1) / rounds;
     stream->submit([&](sycl::handler & cgh) {
@@ -1435,6 +1474,53 @@ static void xmx_mul_mat_launch(const void *    vx,
     constexpr int ks_max = xmx_n_split<NC>() / (FUSED ? 2 : 1);
     xmx_mul_mat_launch_ks<T, NC, ks_max, FUSED>(vx, vg, vy, dst, ncols, nrows, ncv, stride_y_bytes, ldd, glu_op,
                                                 stream);
+}
+
+// MoE prompt batch over the tiles of ggml_sycl_build_mmid_schedule(): row r of vy holds the q8_1 activations of
+// route map[r], a work-group per (tile, 16 weight rows), tiles past the schedule are empty. Each output column goes to
+// the (slot, token) row of its route.
+struct xmx_moe_tiles_args {
+    const ggml_sycl_grouped_gemm_tile * tiles;
+    const mmid_row_mapping *            map;
+    int                                 n_tiles;
+    size_t                              expert_stride;  // bytes
+    int                                 ncols;
+    int                                 nrows;
+    int                                 stride_y_bytes;
+    size_t                              nb1;  // dst bytes per slot, a multiple of 16
+    size_t                              nb2;  // dst bytes per token, a multiple of 16
+};
+
+template <typename T, int NC, int KS_MAX>
+static void xmx_moe_tiles_launch(const void *               vx,
+                                 const char *               vy,
+                                 float *                    dst,
+                                 const xmx_moe_tiles_args & a,
+                                 const int                  ks_cap,
+                                 dpct::queue_ptr            stream) {
+    const int    n_mt     = (a.nrows + XMX_ROWS - 1) / XMX_ROWS;
+    const int    bpr      = (a.ncols + QK_K - 1) / QK_K;
+    const int    kmax     = std::max(1, std::min(KS_MAX, ks_cap));
+    const int    rounds   = (bpr + kmax - 1) / kmax;
+    const int    ks       = (bpr + rounds - 1) / rounds;
+    const size_t n_groups = (size_t) a.n_tiles * n_mt;
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(n_groups * ks), sycl::range<1>(ks)),
+                         sycl::ext::oneapi::experimental::properties{
+                             sycl::ext::intel::experimental::grf_size<xmx_grf<T, NC, false>()> },
+                         [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                             const int                         g = it.get_group(0);
+                             const ggml_sycl_grouped_gemm_tile t = a.tiles[g / n_mt];
+                             if (t.n1 <= t.n0) {
+                                 return;
+                             }
+                             const char *      w  = (const char *) vx + (size_t) t.expert * a.expert_stride;
+                             const xmx_dst_map dm = { a.map + t.n0, a.nb1, a.nb2 };
+                             xmx_mul_mat<T, NC, KS_MAX, false>(w, nullptr, vy + (size_t) t.n0 * a.stride_y_bytes, dst,
+                                                               a.ncols, a.nrows, t.n1 - t.n0, a.stride_y_bytes, 0, 0,
+                                                               g % n_mt, (int) it.get_local_id(0), ks, dm);
+                         });
+    });
 }
 
 // FUSED: vx and vg are the up and gate weights, dst gets up * act(gate) with glu_op a ggml_glu_op
@@ -1470,10 +1556,10 @@ static void xmx_mul_mat_ncols(const void *    vx,
             XMX_CASE(7);
             XMX_CASE(8);
 #undef XMX_CASE
-            // short row variants are for tests, not built for the wide tiles
+            // short row variants are for tests and for NVFP4 rows of a pitch that 2D block loads do not take
 #define XMX_CASE_WIDE(N)                                                                                         \
     case N:                                                                                                      \
-        if constexpr (!T::short_rows && (!FUSED || N <= XMX_FUSED_CHUNK)) {                                      \
+        if constexpr ((!T::short_rows || (T::half_sb && !FUSED)) && (!FUSED || N <= XMX_FUSED_CHUNK)) {          \
             xmx_mul_mat_launch<T, N, FUSED>(vx, vg, y, d, ncols, nrows, n, stride_y_bytes, ldd, glu_op, stream); \
         }                                                                                                        \
         break

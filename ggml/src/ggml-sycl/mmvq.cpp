@@ -2152,14 +2152,14 @@ static bool ggml_sycl_mul_mat_vec_q_xmx(int                 device,
 
     const int ne00 = src0->ne[0];
     const int ldd  = dst->ne[0];
-    if (!ggml_sycl_esimd::xmx_supported(src0_dd_i, ne00)) {
+    if (!ggml_sycl_esimd::xmx_supported(src0_dd_i, ne00, src0->type)) {
         GGML_ASSERT(!plain);
         return false;
     }
 
-    // rows under 64 bytes use the variant without 2D block loads, it is not built for the widest tile
-    const bool short_rows = ne00 < 4 * QK_K;
-    if (short_rows && src1_ncols > 8) {
+    // the variant without 2D block loads is built for the wide tiles only for NVFP4
+    const bool short_rows = ggml_sycl_xmx_short_rows(src0->type, ne00);
+    if (short_rows && src1_ncols > 8 && src0->type != GGML_TYPE_NVFP4) {
         GGML_ASSERT(!plain);
         return false;
     }
@@ -2198,12 +2198,12 @@ bool ggml_sycl_mul_mat_vec_q_glu_xmx(int              device,
     if (ncols_dst < ggml_sycl_xmx_min_cols(src0_type) || ncols_dst > g_ggml_sycl_xmx_glu_max_cols) {
         return false;
     }
-    if (!ggml_sycl_esimd::xmx_supported(vx, ncols) || !ggml_sycl_esimd::xmx_supported(vgate, ncols) ||
+    if (!ggml_sycl_esimd::xmx_supported(vx, ncols, src0_type) || !ggml_sycl_esimd::xmx_supported(vgate, ncols, src0_type) ||
         (uintptr_t) vy % 64 != 0 || stride_col_y_bytes % 16 != 0) {
         return false;
     }
-    // rows under 64 bytes use the variant without 2D block loads, it is not built for the wide tiles
-    const bool short_rows = ncols < 4 * QK_K;
+    // the variant without 2D block loads is not built for the wide tiles of the fused kernel
+    const bool short_rows = ggml_sycl_xmx_short_rows(src0_type, ncols);
     if (short_rows && ncols_dst > 8) {
         return false;
     }
@@ -2871,6 +2871,49 @@ static void mul_mat_vec_nvfp4_id_f32(const uint8_t * __restrict__ vx_base, const
             }
         }
     }
+}
+
+int ggml_sycl_nvfp4_moe_xmx_bn() {
+    static const int bn = ggml_sycl_get_env("GGML_SYCL_NVFP4_MOE_XMX_BN", 32);
+    return bn == 16 || bn == 64 ? bn : 32;
+}
+
+void ggml_sycl_mul_mat_id_nvfp4_xmx(const void * vx, size_t expert_stride, int ncols, int nrows, const char * vy,
+                                    int stride_y_bytes, const ggml_sycl_grouped_gemm_tile * tiles,
+                                    const mmid_row_mapping * map, int n_tiles, float * dst, size_t nb1, size_t nb2,
+                                    dpct::queue_ptr stream) {
+#ifdef GGML_SYCL_MMVQ_HAS_XMX
+    namespace esimd = ggml_sycl_esimd;
+    GGML_ASSERT((uintptr_t) vy % 64 == 0 && stride_y_bytes % 64 == 0 && (uintptr_t) dst % 16 == 0 && nb1 % 16 == 0 &&
+                nb2 % 16 == 0);
+    static const int ks_cap = ggml_sycl_get_env("GGML_SYCL_NVFP4_MOE_XMX_KS", 32);
+    const esimd::xmx_moe_tiles_args a = { tiles, map, n_tiles, expert_stride, ncols, nrows, stride_y_bytes, nb1, nb2 };
+    // 2D block loads need a 64 byte aligned base of every expert, other rows are read row by row
+    const bool sr = ggml_sycl_xmx_short_rows(GGML_TYPE_NVFP4, ncols) || (uintptr_t) vx % 64 != 0 || expert_stride % 64 != 0;
+#    define MOE_RUN(NC)                                                                                              \
+        if (sr) {                                                                                                    \
+            esimd::xmx_moe_tiles_launch<esimd::xmx_traits_nvfp4<true>, NC, esimd::xmx_n_split<NC>()>(vx, vy, dst, a,   \
+                                                                                                    ks_cap, stream); \
+        } else {                                                                                                     \
+            esimd::xmx_moe_tiles_launch<esimd::xmx_traits_nvfp4<false>, NC, esimd::xmx_n_split<NC>()>(vx, vy, dst, a,  \
+                                                                                                     ks_cap, stream); \
+        }
+    switch (ggml_sycl_nvfp4_moe_xmx_bn()) {
+        case 16:
+            MOE_RUN(16);
+            break;
+        case 64:
+            MOE_RUN(64);
+            break;
+        default:
+            MOE_RUN(32);
+            break;
+    }
+#    undef MOE_RUN
+#else
+    GGML_UNUSED_VARS(vx, expert_stride, ncols, nrows, vy, stride_y_bytes, tiles, map, n_tiles, dst, nb1, nb2, stream);
+    GGML_ABORT("no XMX");
+#endif
 }
 
 void ggml_sycl_mul_mat_vec_nvfp4_id_f32(const void * vx_base, const float * y, const int32_t * ids, float * dst,

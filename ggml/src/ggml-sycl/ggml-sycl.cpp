@@ -5379,9 +5379,9 @@ static bool can_use_xmx_batch(int device, const ggml_tensor * src0, const ggml_t
 #endif // GGML_SYCL_MMVQ_HAS_XMX
 }
 
-// Weights of the types in ggml_sycl_xmx_plain_type() take the XMX kernel as they are stored: whole super-blocks per
-// row on a 64 byte aligned base (2D block loads). Rows under 64 bytes use the variant without 2D block loads, it is
-// not built for the wide tiles. A batch wider than MMVQ_MAX_BATCH_SIZE had its activations in floating point before,
+// Weights of the types in ggml_sycl_xmx_plain_type() take the XMX kernel as they are stored: whole halves of
+// super-blocks per row on a 64 byte aligned base (2D block loads). Rows that 2D block loads do not take are read
+// row by row. A batch wider than MMVQ_MAX_BATCH_SIZE had its activations in floating point before,
 // it only comes here when the src1 precision request [TAG_GGML_PREC] allows q8. There is no column limit: for these
 // types the kernel is the fastest for wide batches too.
 bool ggml_sycl_xmx_plain_usable(int                 device,
@@ -5398,7 +5398,8 @@ bool ggml_sycl_xmx_plain_usable(int                 device,
         return false;
     }
     const int64_t ncols = src1->ne[1];
-    if (src0->ne[0] % QK_K != 0 || (uintptr_t) src0->data % 64 != 0 || (src0->ne[0] < 4 * QK_K && ncols > 8)) {
+    // NVFP4 rows may end after the first half of a super-block, short rows take the wide tiles too
+    if (src0->ne[0] % (QK_K / 2) != 0 || src0->ne[0] < QK_K || (uintptr_t) src0->data % 64 != 0) {
         return false;
     }
     if (ncols > MMVQ_MAX_BATCH_SIZE) {
@@ -7263,6 +7264,102 @@ static bool ggml_sycl_mul_mat_id_device_sched_eligible(const ggml_tensor * dst) 
            src1->nb[1] == sizeof(float)*src1->ne[0] && dst->nb[1] == sizeof(float)*dst->ne[0];
 }
 
+// NVFP4 prompt MUL_MAT_ID on the XMX kernel over a device schedule (no host wait): the activations are taken as q8_1
+// [TAG_GGML_PREC], the quantize reads 8 byte pieces of the src1 rows and the kernel stores 16 bytes of a dst row at a time
+static bool ggml_sycl_mul_mat_id_nvfp4_xmx_ok(ggml_backend_sycl_context & ctx, const ggml_tensor * dst) {
+#ifdef GGML_SYCL_MMVQ_HAS_XMX
+    static const bool   on   = ggml_sycl_get_env("GGML_SYCL_NVFP4_MOE_XMX", 1);
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+    if (!on || src0->type != GGML_TYPE_NVFP4 || !ggml_sycl_xmx_enabled(ctx.device) ||
+        !ggml_sycl_mul_mat_id_device_sched_eligible(dst)) {
+        return false;
+    }
+    const int32_t src1_prec = ggml_sycl_src1_prec(dst);
+    if (src1_prec != GGML_PREC_UNDEFINED && src1_prec < GGML_PREC_Q8) {
+        return false;
+    }
+    const int64_t K        = src0->ne[0];
+    const int64_t n_as     = src0->ne[2];
+    const int64_t n_ids    = ids->ne[0];
+    const int64_t n_tokens = ids->ne[1];
+    if (K % (QK_K / 2) != 0 || K < QK_K || K > INT32_MAX / 2 || src0->ne[1] > INT32_MAX || src1->ne[0] != K ||
+        src1->ne[2] != n_tokens || src1->ne[3] != 1 || dst->ne[1] != n_ids || dst->ne[2] != n_tokens ||
+        dst->ne[3] != 1 || n_as > GGML_SYCL_MMID_SCHED_MAX_EXPERTS || n_ids > INT32_MAX / n_tokens) {
+        return false;
+    }
+    if ((uintptr_t) src1->data % 16 != 0 || src1->nb[1] % 16 != 0 || src1->nb[2] % 16 != 0 ||
+        (uintptr_t) dst->data % 16 != 0 || dst->nb[1] % 16 != 0 || dst->nb[2] % 16 != 0) {
+        return false;
+    }
+    // the schedule is built by one work-group of 256 with three tables of n_as + 1 entries in local memory
+    const sycl::device dev = ctx.stream()->get_device();
+    return dev.get_info<sycl::info::device::max_work_group_size>() >= 256 &&
+           dev.get_info<sycl::info::device::local_mem_size>() >= 3 * (n_as + 1) * sizeof(uint32_t);
+#else
+    GGML_UNUSED_VARS(ctx, dst);
+    return false;
+#endif
+}
+
+static void ggml_sycl_mul_mat_id_nvfp4_xmx_run(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0     = dst->src[0];
+    const ggml_tensor * src1     = dst->src[1];
+    const ggml_tensor * ids      = dst->src[2];
+    const queue_ptr     stream   = ctx.stream();
+    const int           K        = (int) src0->ne[0];
+    const int64_t       n_as     = src0->ne[2];
+    const int64_t       n_ids    = ids->ne[0];
+    const int64_t       n_tokens = ids->ne[1];
+    const int64_t       n_routes = n_ids * n_tokens;
+    const int           bn       = ggml_sycl_nvfp4_moe_xmx_bn();
+    const int64_t       n_tiles  = grouped_gemm_max_tiles(n_routes, n_as, bn);
+
+    ggml_sycl_pool_alloc<mmid_row_mapping>            map(ctx.pool(), n_routes);
+    ggml_sycl_pool_alloc<ggml_sycl_grouped_gemm_tile> tiles(ctx.pool(), n_tiles);
+    ggml_sycl_pool_alloc<uint32_t>                    offsets(ctx.pool(), n_as + 1);
+    GGML_ASSERT(ggml_sycl_build_mmid_schedule((const int32_t *) ids->data, ids->nb[1], n_as, n_ids, n_tokens, n_tiles,
+                                              bn, map.get(), tiles.get(), offsets.get(), stream));
+
+    // the routes in schedule order, quantized in the layout of quantize_and_reorder_q8_1_soa
+    const int stride_y = GGML_PAD(K, MATRIX_ROW_PADDING) / QK8_1 * (int) sizeof(block_q8_1);
+    ggml_sycl_pool_alloc<char> q8(ctx.pool(), (size_t) n_routes * stride_y);
+    GGML_ASSERT((uintptr_t) q8.get() % 64 == 0);
+    {
+        constexpr int            E    = QK8_1 / WARP_SIZE;
+        const int                bpr  = K / QK8_1;
+        const char *             s1   = (const char *) src1->data;
+        const int64_t            ne11 = src1->ne[1];
+        const size_t             nb11 = src1->nb[1];
+        const size_t             nb12 = src1->nb[2];
+        const mmid_row_mapping * rmap = map.get();
+        char *                   y    = q8.get();
+        stream->parallel_for(sycl::nd_range<1>((size_t) n_routes * bpr * WARP_SIZE, WARP_SIZE),
+                             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                 const int64_t          blk = it.get_group(0);
+                                 const int64_t          r   = blk / bpr;
+                                 const int              c   = (int) (blk - r * bpr);
+                                 const mmid_row_mapping rm  = rmap[r];
+                                 const float *          xb =
+                                     (const float *) (s1 + (rm.i1 % ne11) * nb11 + rm.i2 * nb12) + c * QK8_1;
+                                 sycl::vec<int8_t, E> q;
+                                 float                d   = 0.0f;
+                                 float                sum = 0.0f;
+                                 quantize_q8_1_block<E>(xb, q, d, sum, it);
+                                 char * row = y + r * stride_y;
+                                 *reinterpret_cast<sycl::vec<int8_t, E> *>(row + c * QK8_1 + it.get_local_id(0) * E) = q;
+                                 if (it.get_local_id(0) == 0) {
+                                     *(sycl::half2 *) (row + K + c * sizeof(sycl::half2)) =
+                                         sycl::half2(sycl::half(d), sycl::half(sum));
+                                 }
+                             });
+    }
+
+    ggml_sycl_mul_mat_id_nvfp4_xmx(src0->data, src0->nb[2], K, (int) src0->ne[1], q8.get(), stride_y, tiles.get(),
+                                   map.get(), (int) n_tiles, (float *) dst->data, dst->nb[1], dst->nb[2], stream);
+}
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                  ggml_tensor *dst) try {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
@@ -7298,16 +7395,23 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     }
 
     if (ggml_sycl_mul_mat_id_device_sched_eligible(dst)) {
-        if (g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
-            ggml_sycl_xmx_gather_type_enabled(src0->type)) {
-            opt_for_reorder_id(&ctx, src0);
-        }
-        const bool reordered = src0->extra && ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder;
-        const ggml_sycl_grouped_gemm_rows src1_rows = { (char *) src1->data, nullptr, ne11, nb11, nb12 };
-        const ggml_sycl_grouped_gemm_rows dst_rows = { (char *) dst->data, nullptr, ne1, nb1, nb2 };
-        if (ggml_sycl_grouped_dequant_gemm_device(src0->type, reordered, src0->data, nb02, src1_rows,
+        bool done = false;
+        if (ggml_sycl_mul_mat_id_nvfp4_xmx_ok(ctx, dst)) {
+            ggml_sycl_mul_mat_id_nvfp4_xmx_run(ctx, dst);
+            done = true;
+        } else {
+            if (g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
+                ggml_sycl_xmx_gather_type_enabled(src0->type)) {
+                opt_for_reorder_id(&ctx, src0);
+            }
+            const bool reordered = src0->extra && ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder;
+            const ggml_sycl_grouped_gemm_rows src1_rows = { (char *) src1->data, nullptr, ne11, nb11, nb12 };
+            const ggml_sycl_grouped_gemm_rows dst_rows = { (char *) dst->data, nullptr, ne1, nb1, nb2 };
+            done = ggml_sycl_grouped_dequant_gemm_device(src0->type, reordered, src0->data, nb02, src1_rows,
                 ggml_sycl_src1_prec(dst), dst_rows, (const int32_t *) ids->data, ids->nb[1], n_as, n_ids,
-                ids->ne[1], ne01, ne10, ctx.pool(), stream)) {
+                ids->ne[1], ne01, ne10, ctx.pool(), stream);
+        }
+        if (done) {
             // the device schedule drops skipped slots (id == -1), so their dst rows are zeroed here
             const char * ids_data = (const char *) ids->data;
             const size_t ids_nb1  = ids->nb[1];
@@ -8627,7 +8731,7 @@ static bool ggml_sycl_mul_mat_id_needs_sync(ggml_backend_sycl_context * ctx, con
         return true;
     }
     ggml_sycl_nvfp4_id_args nvfp4_args;
-    if (ggml_sycl_mul_mat_id_nvfp4_args(dst, nvfp4_args)) {
+    if (ggml_sycl_mul_mat_id_nvfp4_args(dst, nvfp4_args) || ggml_sycl_mul_mat_id_nvfp4_xmx_ok(*ctx, dst)) {
         return false;
     }
     const bool reordered = src0->extra && ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder;

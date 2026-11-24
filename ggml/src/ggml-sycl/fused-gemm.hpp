@@ -133,9 +133,18 @@ bool ggml_sycl_grouped_dequant_gemm(ggml_type src0_type, bool reordered, const v
                                     int64_t total_rows, std::vector<ggml_sycl_grouped_gemm_tile> & tiles,
                                     ggml_sycl_pool & pool, dpct::queue_ptr stream);
 
-// Build routing and tile tables on the device; unused tile slots are empty.
+// Upper bound on the tile count when total_rows rows are routed to n_as experts: the worst case gives
+// each expert one row and fills whole tiles with the rest. The bound depends only on the shape, not
+// on the routing, so the pool reuses one buffer every ubatch instead of keeping one per size seen.
+// Tiles do not cross experts, so the bound is not ceil(total_rows / BN): 34 rows over 2 experts with
+// BN = 16 split 17 + 17 need 2 + 2 tiles, where the ceil gives 3.
+constexpr int64_t grouped_gemm_max_tiles(int64_t total_rows, int64_t n_as, int64_t BN) {
+    return total_rows <= n_as ? total_rows : n_as + (total_rows - n_as) / BN;
+}
+
+// Build routing and tile tables on the device, tiles of at most bn routes; unused tile slots are empty.
 bool ggml_sycl_build_mmid_schedule(const int32_t * ids_dev, size_t ids_token_stride, int64_t n_as, int64_t n_ids,
-                                   int64_t n_tokens, int64_t n_tiles_max, mmid_row_mapping * row_mapping,
+                                   int64_t n_tokens, int64_t n_tiles_max, int bn, mmid_row_mapping * row_mapping,
                                    ggml_sycl_grouped_gemm_tile * tiles, uint32_t * expert_offsets,
                                    dpct::queue_ptr stream);
 

@@ -284,6 +284,11 @@ static inline bool ggml_sycl_xmx_supports_arch(gpu_arch arch) {
            arch == gpu_arch::intel_gpu_lnl_m;
 }
 
+// rows the XMX kernel reads row by row: 2D block loads need arrays of 64 bytes per row and a pitch of 16 bytes
+static inline bool ggml_sycl_xmx_short_rows(ggml_type type, int64_t ne00) {
+    return ne00 < 4 * QK_K || (type == GGML_TYPE_NVFP4 && ggml_row_size(type, ne00) % 16 != 0);
+}
+
 // fewest columns for which the XMX kernel is faster than the other kernels
 static inline int ggml_sycl_xmx_min_cols(ggml_type type) {
     return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_NVFP4 ? 1 :
