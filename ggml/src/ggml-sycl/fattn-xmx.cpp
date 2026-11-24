@@ -107,14 +107,28 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const char *       kp      = (const char *) K->data;
     const char *       vp      = (const char *) V->data;
     const sycl::half * mp      = (const sycl::half *) mask->data;
-    const float *      sp      = sinks ? (const float *) sinks->data : nullptr;
+    const float *      sk      = sinks ? (const float *) sinks->data : nullptr;
     float *            dp      = (float *) dst->data;
     const uint32_t     k_pitch = K->nb[1], v_pitch = V->nb[1], m_pitch = mask->nb[1];
     const size_t       k_head  = K->nb[2], v_head = V->nb[2];
     const uint32_t     m_rows  = mask->ne[1];
     const int          qtiles  = (n_queries + RPT - 1) / RPT;  // per query head
     const int          tiles   = gqa * qtiles;                 // per KV head
-    const size_t       n_thr   = (size_t) n_kv_heads * tiles;
+
+    // Split the keys when the threads (each a long loop over its keys) are too few to fill the GPU in even waves: about
+    // 1024 fit at once with 256 registers, so 1536 threads ran as one and a half waves. Each split writes its rows
+    // unnormalized with their max and sum, a second kernel combines them. At least 4096 keys per split (shorter caches lost 1%).
+    static const int split_env = ggml_sycl_get_env("GGML_SYCL_FA_XMX_SPLIT", 0);
+    const int64_t    thr_1     = (int64_t) n_kv_heads * tiles;
+    const int        ktiles    = (n_kv + KT - 1) / KT;
+    int              nsplit    = split_env > 0 ? split_env : (int) std::min<int64_t>(8, (8192 + thr_1 - 1) / thr_1);
+    nsplit                     = std::max(1, std::min(nsplit, n_kv / 4096));
+    const int        kt_split  = (ktiles + nsplit - 1) / nsplit;  // key tiles per split
+    nsplit                     = (ktiles + kt_split - 1) / kt_split;
+    const size_t     n_thr     = (size_t) thr_1 * nsplit;
+    const int        q_pad     = qtiles * RPT;
+    ggml_sycl_pool_alloc<float> part_buf(ctx.pool());
+    float *          part      = nsplit > 1 ? part_buf.alloc((size_t) nsplit * n_q_heads * q_pad * (D + 2)) : nullptr;
 
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<1>((n_thr + WGT - 1) / WGT * WGT, WGT),
@@ -123,10 +137,11 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
                 using namespace sycl::ext::intel::esimd;
                 using half = sycl::half;
                 const int tid = it.get_global_id(0);
-                const int kvh = tid / tiles;
+                const int kvh = tid / (tiles * nsplit);
                 if (kvh >= n_kv_heads) {
                     return;
                 }
+                const int sp = (tid / tiles) % nsplit;  // the 16 threads of a work-group read the same keys
                 const int t  = tid % tiles;
                 const int h  = kvh * gqa + t / qtiles;  // query head
                 const int q0 = (t % qtiles) * RPT;      // first token
@@ -160,7 +175,8 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
                 const uint32_t * kb = (const uint32_t *) (kp + kvh * k_head);
                 const half *     vb = (const half *) (vp + kvh * v_head);
 
-                for (int k0 = 0; k0 < n_kv; k0 += KT) {
+                const int k_end = std::min(n_kv, (sp + 1) * kt_split * KT);
+                for (int k0 = sp * kt_split * KT; k0 < k_end; k0 += KT) {
                     // S = Q K^T, [mb][8 rows][16 keys]
                     simd<float, MB * 8 * KT> S = 0.0f;
 #pragma unroll
@@ -248,13 +264,33 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
                     }
                 }
 
+                if (part) {
+                    // rows [split][head][token]: D unnormalized values, then the max and the sum in base 2
+                    float * pr = part + ((size_t) sp * n_q_heads + h) * q_pad * (D + 2);
+                    simd<float, RPT> mv, lv;
+#pragma unroll
+                    for (int R = 0; R < RPT; ++R) {
+                        mv[R] = mref[R];
+                        lv[R] = lsum[R];
+                        simd<float, D> orow;
+#pragma unroll
+                        for (int c = 0; c < NC; ++c) {
+                            orow.template select<16, 1>(c * 16) = O.template select<16, 1>((((R / 8) * NC + c) * 8 + R % 8) * 16);
+                        }
+                        block_store<float, D>(pr + (size_t) (q0 + R) * D, orow);
+                    }
+                    block_store<float, RPT>(pr + (size_t) q_pad * D + q0, mv);
+                    block_store<float, RPT>(pr + (size_t) q_pad * (D + 1) + q0, lv);
+                    return;
+                }
+
                 // normalize; the sink logit only adds to the denominator
-                const float sink2 = sp ? sp[h] * LOG2E : 0.0f;
+                const float sink2 = sk ? sk[h] * LOG2E : 0.0f;
 #pragma unroll
                 for (int R = 0; R < RPT; ++R) {
                     if (q0 + R < n_queries) {
                         float l = lsum[R];
-                        if (sp) {
+                        if (sk) {
                             l += exp2(simd<float, 1>(sink2 - mref[R]))[0];
                         }
                         const float inv = l > 0.0f ? 1.0f / l : 0.0f;
@@ -268,5 +304,35 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
                 }
             });
     });
+
+    if (part) {
+        // out = sum_s 2^(m_s - M) O_s / (sum_s 2^(m_s - M) l_s + 2^(sink - M)), M the max over the splits
+        const size_t n_out = (size_t) n_queries * n_q_heads * D;
+        stream->parallel_for(sycl::nd_range<1>((n_out + 127) / 128 * 128, 128), [=](sycl::nd_item<1> it) {
+            const size_t e = it.get_global_id(0);
+            if (e >= n_out) {
+                return;
+            }
+            const int     d  = e % D;
+            const int     h  = (e / D) % n_q_heads;
+            const int     q  = e / ((size_t) D * n_q_heads);
+            const size_t  ss = (size_t) n_q_heads * q_pad * (D + 2);  // floats per split
+            const float * p0 = part + (size_t) h * q_pad * (D + 2);
+            float         M  = NEG;
+            for (int s = 0; s < nsplit; ++s) {
+                M = sycl::fmax(M, p0[s * ss + (size_t) q_pad * D + q]);
+            }
+            float o = 0.0f, l = 0.0f;
+            for (int s = 0; s < nsplit; ++s) {
+                const float w = sycl::exp2(p0[s * ss + (size_t) q_pad * D + q] - M);
+                o += w * p0[s * ss + (size_t) q * D + d];
+                l += w * p0[s * ss + (size_t) q_pad * (D + 1) + q];
+            }
+            if (sk) {
+                l += sycl::exp2(sk[h] * LOG2E - M);
+            }
+            dp[((size_t) q * n_q_heads + h) * D + d] = l > 0.0f ? o / l : 0.0f;
+        });
+    }
 #endif  // GGML_SYCL_FA_XMX_BUILD
 }
