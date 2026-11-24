@@ -6141,6 +6141,8 @@ static bool ggml_sycl_is_view_or_noop(const ggml_tensor * t);
 //   (x - tanh(wf*g)*x) + tanh(wu*g)*m
 // as MUL_MAT(wf), TANH, MUL, SUB, MUL_MAT(wu), TANH, MUL, ADD, with views between them. Runs them as one kernel and
 // returns the number of nodes after i it took, 0 when the pattern does not match.
+static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst);
+
 static int ggml_sycl_fuse_gate_mix(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
     constexpr int n_ops = 8;
     static const ggml_op ops[n_ops] = { GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL,   GGML_OP_SUB,
@@ -6176,16 +6178,17 @@ static int ggml_sycl_fuse_gate_mix(ggml_backend_sycl_context & ctx, ggml_cgraph 
     const int64_t       k  = wf->ne[0];
     const int64_t       nr = wf->ne[1];
     const int64_t       nc = g->ne[1];
-    if (wf->type != GGML_TYPE_F32 || wu->type != GGML_TYPE_F32 || !ggml_are_same_shape(wf, wu) || wf->nb[1] != wu->nb[1] ||
-        !ggml_is_contiguous(wf) || !ggml_is_contiguous(wu) || wf->ne[2] != 1 || wf->ne[3] != 1 ||
-        !ggml_sycl_gate_mix_f32_supported(k, nc) || (uintptr_t) wf->data % 16 || (uintptr_t) wu->data % 16 ||
-        wf->nb[1] % 16 || ggml_backend_buffer_is_sycl_split(wf->buffer) || ggml_backend_buffer_is_sycl_split(wu->buffer)) {
+    if (wf->type != GGML_TYPE_F32 || wu->type != GGML_TYPE_F32 || !ggml_are_same_shape(wf, wu) || wf->ne[2] != 1 ||
+        wf->ne[3] != 1 || g->type != GGML_TYPE_F32 || g->ne[0] != k || g->ne[2] != 1 || g->ne[3] != 1) {
         return 0;
     }
-    if (g->type != GGML_TYPE_F32 || g->ne[0] != k || g->ne[2] != 1 || g->ne[3] != 1 || g->nb[0] != sizeof(float) ||
-        (uintptr_t) g->data % 16 || g->nb[1] % 16) {
-        return 0;
-    }
+    // the mat-vec kernel (a few tokens) computes both products itself; prompt batches run the two MUL_MATs as they are
+    // and the rest as one element-wise kernel
+    const bool vec = ggml_sycl_gate_mix_f32_supported(k, nc) && wf->nb[1] == wu->nb[1] && ggml_is_contiguous(wf) &&
+                     ggml_is_contiguous(wu) && (uintptr_t) wf->data % 16 == 0 && (uintptr_t) wu->data % 16 == 0 &&
+                     wf->nb[1] % 16 == 0 && !ggml_backend_buffer_is_sycl_split(wf->buffer) &&
+                     !ggml_backend_buffer_is_sycl_split(wu->buffer) && g->nb[0] == sizeof(float) &&
+                     (uintptr_t) g->data % 16 == 0 && g->nb[1] % 16 == 0;
     // x, m and the output: [nr, nc] F32 with contiguous rows
     for (const ggml_tensor * v : { x, m, (const ggml_tensor *) out }) {
         if (v->type != GGML_TYPE_F32 || v->ne[0] != nr || v->ne[1] != nc || v->ne[2] != 1 || v->ne[3] != 1 ||
@@ -6208,6 +6211,46 @@ static int ggml_sycl_fuse_gate_mix(ggml_backend_sycl_context & ctx, ggml_cgraph 
     };
     if (overlap(out, g) || (overlap(out, x) && !same(x)) || (overlap(out, m) && !same(m))) {
         return 0;
+    }
+
+    if (!vec) {
+        // the products F and U, [nr, nc]: in the graph's order U comes after x was read, so the allocator may have put
+        // U on x, m or F, which this order would overwrite before the element-wise kernel reads them
+        for (const ggml_tensor * p : { (const ggml_tensor *) mf, (const ggml_tensor *) mu }) {
+            if (p->type != GGML_TYPE_F32 || p->ne[0] != nr || p->ne[1] != nc || p->ne[2] != 1 || p->ne[3] != 1 ||
+                p->nb[0] != sizeof(float) || (overlap(out, p) && !same(p))) {
+                return 0;
+            }
+        }
+        if (overlap(mu, mf) || overlap(mu, x) || overlap(mu, m)) {
+            return 0;
+        }
+        if (!ggml_sycl_compute_forward(ctx, mf) || !ggml_sycl_compute_forward(ctx, mu)) {
+            GGML_ABORT("gate mix: MUL_MAT failed");
+        }
+        const char *  fd = (const char *) mf->data;
+        const char *  ud = (const char *) mu->data;
+        const char *  xd = (const char *) x->data;
+        const char *  md = (const char *) m->data;
+        char *        od = (char *) out->data;
+        const size_t  fnb = mf->nb[1], unb = mu->nb[1], xnb = x->nb[1], mnb = m->nb[1], onb = out->nb[1];
+        const int64_t nel = nr * nc;
+        const int     wg  = 256;
+        scope_op_debug_print scope_dbg_print(__func__, out, /*num_src=*/2, " : gate mix epilogue");
+        SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+        ctx.stream()->parallel_for(sycl::nd_range<1>((nel + wg - 1) / wg * wg, wg), [=](sycl::nd_item<1> it) {
+            const int64_t j = it.get_global_id(0);
+            if (j >= nel) {
+                return;
+            }
+            const int64_t r = j % nr, c = j / nr;
+            const float   f  = *((const float *) (fd + c * fnb) + r);
+            const float   u  = *((const float *) (ud + c * unb) + r);
+            const float   xv = *((const float *) (xd + c * xnb) + r);
+            const float   mv = *((const float *) (md + c * mnb) + r);
+            *((float *) (od + c * onb) + r) = (xv - sycl::tanh(f) * xv) + sycl::tanh(u) * mv;
+        });
+        return idx[n_ops - 1] - i;
     }
 
     const ggml_sycl_gate_mix_args a = {
@@ -6566,14 +6609,33 @@ static int ggml_sycl_fuse_moe_situ(ggml_backend_sycl_context & ctx, ggml_cgraph 
 }
 
 // The MoE output of build_moe_ffn at the MUL of node i: MUL(experts [n_embd, n_slot, n_tok], weights [1, n_slot, n_tok]),
-// a VIEW per slot and the chain of ADDs over them, as one kernel that sums the weighted slots in the same order.
+// a VIEW per slot and the chain of ADDs over them, as one kernel that sums the weighted slots in the same order. A
+// per-slot scale of the experts just before (MUL(experts, scale [1, n_slot, n_tok]) at node i, the weights MUL at i + 1)
+// is taken too: prompt batches have it there, a few tokens fold it into the NVFP4 MoE GEMV.
 // Returns the number of nodes after i it took, 0 when the pattern does not match.
 static int ggml_sycl_fuse_moe_reduce(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
-    ggml_tensor * mul = cgraph->nodes[i];
-    if (!g_ggml_sycl_enable_fusion || mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32) {
+    if (!g_ggml_sycl_enable_fusion) {
         return 0;
     }
-    const ggml_tensor * ex = mul->src[0];
+    // a [1, n_slot, n_tok] F32 factor of the [n_embd, n_slot, n_tok] F32 a
+    const auto is_slot_factor = [](const ggml_tensor * f, const ggml_tensor * a) {
+        return f->type == GGML_TYPE_F32 && f->ne[0] == 1 && f->ne[1] == a->ne[1] && f->ne[2] == a->ne[2] && f->ne[3] == 1;
+    };
+    ggml_tensor * pre = nullptr;  // the per-slot scale, when there is one
+    ggml_tensor * mul = cgraph->nodes[i];
+    if (mul->op == GGML_OP_MUL && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
+        cgraph->nodes[i + 1]->src[0] == mul && mul->type == GGML_TYPE_F32 && mul->src[0]->type == GGML_TYPE_F32 &&
+        mul->src[0]->nb[0] == sizeof(float) && ggml_are_same_shape(mul, mul->src[0]) &&
+        is_slot_factor(mul->src[1], mul->src[0]) && is_slot_factor(cgraph->nodes[i + 1]->src[1], mul)) {
+        pre = mul;
+        mul = cgraph->nodes[i + 1];
+    }
+    const int i_mul = pre ? i + 1 : i;
+    if (mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    const ggml_tensor * ex = pre ? pre->src[0] : mul->src[0];
+    const ggml_tensor * sc = pre ? pre->src[1] : nullptr;
     const ggml_tensor * w  = mul->src[1];
     const int64_t       n_slot = ex->ne[1];
     if (ex->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || ex->nb[0] != sizeof(float) || w->ne[0] != 1 ||
@@ -6584,9 +6646,13 @@ static int ggml_sycl_fuse_moe_reduce(ggml_backend_sycl_context & ctx, ggml_cgrap
     const int64_t n_embd = ex->ne[0];
     const int64_t n_tok  = ex->ne[2];
 
-    std::vector<int>     idx = { i };
+    std::vector<int>     idx = { i_mul };
     std::vector<ggml_op> ops = { GGML_OP_MUL };
-    int                  k   = i + 1;
+    if (pre) {
+        idx.insert(idx.begin(), i);
+        ops.insert(ops.begin(), GGML_OP_MUL);
+    }
+    int                  k   = i_mul + 1;
     for (int64_t s = 0; s < n_slot; ++s, ++k) {
         const ggml_tensor * v = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
         if (!v || v->op != GGML_OP_VIEW || v->view_src != mul || v->ne[0] != n_embd || v->ne[1] != n_tok ||
@@ -6596,10 +6662,10 @@ static int ggml_sycl_fuse_moe_reduce(ggml_backend_sycl_context & ctx, ggml_cgrap
         idx.push_back(k);
         ops.push_back(GGML_OP_VIEW);
     }
-    const ggml_tensor * prev = cgraph->nodes[i + 1];
+    const ggml_tensor * prev = cgraph->nodes[i_mul + 1];
     for (int64_t s = 1; s < n_slot; ++s, ++k) {
         const ggml_tensor * a = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
-        if (!a || a->op != GGML_OP_ADD || a->src[0] != prev || a->src[1] != cgraph->nodes[i + 1 + s] ||
+        if (!a || a->op != GGML_OP_ADD || a->src[0] != prev || a->src[1] != cgraph->nodes[i_mul + 1 + s] ||
             a->type != GGML_TYPE_F32) {
             return 0;
         }
@@ -6618,28 +6684,39 @@ static int ggml_sycl_fuse_moe_reduce(ggml_backend_sycl_context & ctx, ggml_cgrap
         const char * b0 = (const char *) b->data;
         return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
     };
-    if (overlap(out, ex) || overlap(out, w)) {
+    if (overlap(out, ex) || overlap(out, w) || (sc && overlap(out, sc))) {
         return 0;
     }
 
     const char *  ex_d = (const char *) ex->data;
     const char *  w_d  = (const char *) w->data;
+    const char *  s_d  = sc ? (const char *) sc->data : nullptr;
     float *       dst  = (float *) out->data;
     const size_t  enb1 = ex->nb[1], enb2 = ex->nb[2], wnb1 = w->nb[1], wnb2 = w->nb[2];
+    const size_t  snb1 = sc ? sc->nb[1] : 0, snb2 = sc ? sc->nb[2] : 0;
     const int64_t n    = n_embd * n_tok;
     const int     wg   = 256;
+    // the slot scale, then the weight, in the graph's order of the products
+    const auto slot = [=](const char * xr, const char * wr, const char * sr, int64_t s) {
+        float v = *(const float *) (xr + s * enb1);
+        if (sr) {
+            v *= *(const float *) (sr + s * snb1);
+        }
+        return v * *(const float *) (wr + s * wnb1);
+    };
     ctx.stream()->parallel_for(sycl::nd_range<1>((n + wg - 1) / wg * wg, wg), [=](sycl::nd_item<1> it) {
         const int64_t j = it.get_global_id(0);
         if (j >= n) {
             return;
         }
-        const int64_t e  = j % n_embd;
-        const int64_t t  = j / n_embd;
-        const char *  xr = ex_d + t * enb2 + e * sizeof(float);
-        const char *  wr = w_d + t * wnb2;
-        float         acc = *(const float *) xr * *(const float *) wr;
+        const int64_t e   = j % n_embd;
+        const int64_t t   = j / n_embd;
+        const char *  xr  = ex_d + t * enb2 + e * sizeof(float);
+        const char *  wr  = w_d + t * wnb2;
+        const char *  sr  = s_d ? s_d + t * snb2 : nullptr;
+        float         acc = slot(xr, wr, sr, 0);
         for (int64_t s = 1; s < n_slot; ++s) {
-            acc += *(const float *) (xr + s * enb1) * *(const float *) (wr + s * wnb1);
+            acc += slot(xr, wr, sr, s);
         }
         dst[j] = acc;
     });
