@@ -6819,18 +6819,30 @@ static int ggml_sycl_fuse_depth_mix(ggml_backend_sycl_context & ctx, ggml_cgraph
     const bool ok_prev  = !overlap(o, prev) ||
                           (one_wg && (char *) o->data >= (char *) prev->data &&
                            ((char *) o->data - (char *) prev->data) % prev->nb[1] == 0);
-    if (!ok_last || !ok_prev) {
+    // otherwise (prompt batches, where the allocator often puts the output over the states) the kernel writes a
+    // scratch copy, which then goes to the output: one copy instead of the CONCAT, the transposed CONT and two
+    // batched products of one small matrix per token
+    const bool via_tmp = !ok_last || !ok_prev;
+    if (via_tmp && !ggml_is_contiguous(o)) {
         return 0;
     }
 
+    scope_op_debug_print scope_dbg_print(__func__, o, /*num_src=*/2, via_tmp ? " : depth mix via scratch" : " : depth mix");
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    ggml_sycl_pool_alloc<float> tmp(ctx.pool());
+    char * dst = (char *) o->data;
+    if (via_tmp) {
+        dst = (char *) tmp.alloc(ggml_nelements(o));
+    }
     const ggml_sycl_depth_mix_args a = {
-        (const char *) prev->data, (const char *) last->data, (const char *) query->data, (char *) o->data,
+        (const char *) prev->data, (const char *) last->data, (const char *) query->data, dst,
         c->ne[0], c->ne[1], nq, c->ne[2], ggml_get_op_params_f32(sm, 0),
         prev->nb[1], prev->nb[2], last->nb[2], query->nb[1], o->nb[1], o->nb[2],
     };
-    scope_op_debug_print scope_dbg_print(__func__, o, /*num_src=*/2, " : depth mix");
-    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
     ggml_sycl_depth_mix_f32(a, ctx.stream());
+    if (via_tmp) {
+        SYCL_CHECK(CHECK_TRY_ERROR(ctx.stream()->memcpy(o->data, dst, ggml_nbytes(o))));
+    }
     return idx[n - 1] - i;
 }
 
