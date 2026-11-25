@@ -6846,6 +6846,73 @@ static int ggml_sycl_fuse_depth_mix(ggml_backend_sycl_context & ctx, ggml_cgraph
     return idx[n - 1] - i;
 }
 
+// CONCAT(a, b) along dim 0 at node i, read only by an F32 MUL_MAT with a contiguous F32 weight, for batches of 16+
+// columns (the Inkling 2 loop controllers' gate input [norm(cur); norm(message)]): the product as two GEMMs over the
+// two K ranges of the weight, the second accumulating, each reading its input in place, so the concat is not written.
+// Returns the number of nodes after i it took, 0 when the pattern does not match.
+static int ggml_sycl_fuse_concat_mul_mat(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * c = cgraph->nodes[i];
+    if (!g_ggml_sycl_enable_fusion || c->op != GGML_OP_CONCAT || ggml_get_op_params_i32(c, 0) != 0 ||
+        c->type != GGML_TYPE_F32 || c->ne[1] < 16 || c->ne[2] != 1 || c->ne[3] != 1) {
+        return 0;
+    }
+    const ggml_tensor * a = c->src[0];
+    const ggml_tensor * b = c->src[1];
+    for (const ggml_tensor * t : { a, b }) {
+        if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float) || t->ne[1] != c->ne[1] || t->ne[2] != 1 ||
+            t->ne[3] != 1 || t->nb[1] % sizeof(float) != 0) {
+            return 0;
+        }
+    }
+
+    std::vector<int>     idx = { i };
+    std::vector<ggml_op> ops = { GGML_OP_CONCAT };
+    int                  k   = i + 1;
+    for (; k < cgraph->n_nodes && ggml_sycl_is_view_or_noop(cgraph->nodes[k]); ++k) {
+        if (cgraph->nodes[k]->view_src == c) {
+            return 0;  // a view of the concat would read memory that is not written
+        }
+    }
+    ggml_tensor * mm = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
+    if (!mm || mm->op != GGML_OP_MUL_MAT || mm->src[1] != c || mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm)) {
+        return 0;
+    }
+    const ggml_tensor * w = mm->src[0];
+    if (w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || w->ne[0] != c->ne[0] || w->ne[2] != 1 || w->ne[3] != 1 ||
+        ggml_backend_buffer_is_sycl_split(w->buffer)) {
+        return 0;
+    }
+    idx.push_back(k);
+    ops.push_back(GGML_OP_MUL_MAT);
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idx.data(), (int) idx.size(), ops.data(), &idx.back(), 1)) {
+        return 0;
+    }
+
+    scope_op_debug_print scope_dbg_print(__func__, mm, /*num_src=*/2, " : concat into mul_mat");
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    dpct::queue_ptr stream = ctx.stream();
+    // the GEMM reads its input while it writes: an output over a or b (the allocator may put it there, the concat being
+    // their last reader) goes through a scratch copy
+    const bool                  via_tmp = ggml_sycl_overlap(mm, a) || ggml_sycl_overlap(mm, b);
+    ggml_sycl_pool_alloc<float> tmp(ctx.pool());
+    float *                     dst = via_tmp ? tmp.alloc(ggml_nelements(mm)) : (float *) mm->data;
+
+    const int64_t N = w->ne[1], T = c->ne[1], K = w->ne[0], Ka = a->ne[0];
+    const float   one = 1.0f, zero = 0.0f;
+    SYCL_CHECK(CHECK_TRY_ERROR(oneapi::mkl::blas::column_major::gemm(
+        *stream, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans, N, T, Ka,
+        dpct::get_value(&one, *stream), (const float *) w->data, K, (const float *) a->data, a->nb[1] / sizeof(float),
+        dpct::get_value(&zero, *stream), dst, N)));
+    SYCL_CHECK(CHECK_TRY_ERROR(oneapi::mkl::blas::column_major::gemm(
+        *stream, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans, N, T, K - Ka,
+        dpct::get_value(&one, *stream), (const float *) w->data + Ka, K, (const float *) b->data,
+        b->nb[1] / sizeof(float), dpct::get_value(&one, *stream), dst, N)));
+    if (via_tmp) {
+        SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(mm->data, dst, ggml_nbytes(mm))));
+    }
+    return k - i;
+}
+
 // L2_NORM then SCALE at node i, optionally after a MUL by a [ncols, nrows or 1] weight: the scaled L2 clips of
 // Inkling 2. Returns the number of nodes after i it took, 0 when the pattern does not match.
 // After the norm chain nodes[idx] (its output y, F32 [ncols, nrows, ntok] contiguous): a SET_ROWS of y (through a view)
@@ -8511,6 +8578,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         if (node->op == GGML_OP_CONCAT) {
             const int skip = ggml_sycl_fuse_depth_mix(*sycl_ctx, cgraph, i);
+            if (skip > 0) {
+                i += skip;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_CONCAT) {
+            const int skip = ggml_sycl_fuse_concat_mul_mat(*sycl_ctx, cgraph, i);
             if (skip > 0) {
                 i += skip;
                 continue;

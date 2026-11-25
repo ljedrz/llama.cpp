@@ -9530,6 +9530,41 @@ struct test_gate_mix : public test_case {
     }
 };
 
+// the input of an Inkling 2 loop controller: [a; b] concatenated along dim 0, b a strided view (one message of several
+// per token), into an F32 product; backends may run the product over the two K ranges without writing the concat
+struct test_concat_mul_mat : public test_case {
+    const int64_t ka, kb, nr, nc;
+
+    test_concat_mul_mat(int64_t ka, int64_t kb, int64_t nr, int64_t nc) : ka(ka), kb(kb), nr(nr), nc(nc) {}
+
+    std::string vars() override {
+        return VARS_TO_STR4(ka, kb, nr, nc);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONCAT_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-6; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ka, nc);
+        ggml_set_name(a, "a");
+        ggml_tensor * msgs = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, kb, 4, nc);
+        ggml_set_name(msgs, "msgs");
+        ggml_tensor * b = ggml_view_2d(ctx, msgs, kb, nc, msgs->nb[2], 2*msgs->nb[1]);
+        ggml_set_name(b, "b");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ka + kb, nr);
+        ggml_set_name(w, "w");
+        ggml_tensor * out = ggml_mul_mat(ctx, w, ggml_concat(ctx, a, b, 0));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // the SiTU activation of build_moe_ffn after a merged gate_up with a per-slot scale (Inkling 2's NVFP4 experts):
 // MUL(gate_up, scale), the gate and up halves as views, beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb); backends may
 // run it as one kernel
@@ -15926,6 +15961,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gate_mix(64, 2304, 3));
     test_cases.emplace_back(new test_gate_mix(64, 2304, 64));
     test_cases.emplace_back(new test_gate_mix(64, 67, 37));
+    test_cases.emplace_back(new test_concat_mul_mat(2304, 2304, 64, 1));
+    test_cases.emplace_back(new test_concat_mul_mat(2304, 2304, 64, 1024));
+    test_cases.emplace_back(new test_concat_mul_mat(100, 37, 23, 41));
     // the SiTU of a gate_up with a per-slot scale: Inkling 2 Mini's prompt shape, a ragged one, another beta / lb
     test_cases.emplace_back(new test_moe_situ(1152, 8, 64));
     test_cases.emplace_back(new test_moe_situ(67, 3, 37));
