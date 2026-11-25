@@ -1378,6 +1378,10 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
     // the Markov head reads the context state of the last committed token (Inkling2 f_rnn)
     // it comes back from the injection as h_nextn, kept for the last ctx_rows positions of each sequence
     bool has_markov_context = false;
+
+    // without a confidence head, p_min cuts the draft by the draft token's probability over the sampled candidates
+    bool has_confidence_head = false;
+
     size_t ctx_rows = 0;
     std::vector<float>     ctx_embd;
     std::vector<llama_pos> ctx_pos;
@@ -1412,13 +1416,17 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             draw_seed.assign(n_seq, -1);
         }
 
-        if (this->params.p_min > 0.0f) {
+        {
             char buf[16] = {};
-            const bool has_conf =
+            has_confidence_head =
                 llama_model_meta_val_str(model_dft, "dflash.has_confidence_head", buf, sizeof(buf)) < 0 ||
                 std::strcmp(buf, "true") == 0;
-            if (!has_conf) {
-                throw std::runtime_error("DSpark draft has no confidence head: please set --spec-draft-p-min 0");
+            if (this->params.p_min > 0.0f && !has_confidence_head) {
+                if (this->params.probabilistic) {
+                    throw std::runtime_error("DSpark draft has no confidence head: please set --spec-draft-p-min 0");
+                }
+                LOG_INF("%s: no confidence head, p_min %.2f cuts the greedy draft at the first token below it\n",
+                        __func__, (double) this->params.p_min);
             }
         }
 
@@ -1595,7 +1603,7 @@ public:
             }
 
             // DSpark: read from the first draft slot, truncate below the confidence threshold
-            const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+            const float * conf = params.p_min > 0.0f && has_confidence_head ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
             for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
                 const int32_t idx = beg + i;
 
@@ -1614,6 +1622,18 @@ public:
                 }
 
                 const llama_token id = cur_p->data[0].id;
+
+                if (params.p_min > 0.0f && !has_confidence_head) {
+                    // the softmax of the first candidate over the sampled candidates (the backend's top-k): an upper
+                    // bound of its probability over the vocabulary, close to it when the drafter is confident
+                    float sum = 0.0f;
+                    for (size_t k = 0; k < cur_p->size; ++k) {
+                        sum += expf(cur_p->data[k].logit - cur_p->data[0].logit);
+                    }
+                    if (1.0f / sum < params.p_min) {
+                        break;
+                    }
+                }
 
                 common_sampler_accept(smpl, id, true);
 
