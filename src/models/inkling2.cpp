@@ -405,7 +405,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         if (!rel_bias) {
             rel_bias = ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0);
         }
-        ggml_tensor * table = ggml_mul_mat(ctx0, rel_bias, Rcur);
+        // one GEMM over all heads and tokens, not a product per token
+        ggml_tensor * table = ggml_mul_mat(ctx0, rel_bias, ggml_reshape_2d(ctx0, Rcur, hparams.n_relative, n_head*n_tokens));
+        table = ggml_reshape_3d(ctx0, table, table->ne[0], n_head, n_tokens);
 
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
         table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
