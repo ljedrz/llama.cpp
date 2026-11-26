@@ -220,7 +220,8 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel_impl(const int device, 
             if (V->ne[0] != 512) {
                 return BEST_FATTN_KERNEL_NONE;
             }
-            if (!gqa_opt_applies) {
+            // the tile kernel for 576/512 has only the variants for GQA ratios that are multiples of 4
+            if (!gqa_opt_applies || gqa_ratio % 4 != 0) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
