@@ -15400,6 +15400,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     add_rel(128, 4, 1, 2056, 3, 1025, true);
     add_rel(128, 4, 4, 2056, 4, 1025, false);
     add_rel(256, 4, 4, 2056, 3, 513, true);
+    // verify batches over long caches: XMX with the keys split over many threads, a ragged cache, 3 tokens from 64K cells
+    for (int64_t nb : { 3, 5, 8, 16 }) {
+        add_rel(128, 8, 3, 16400, nb, 1025, true);
+        add_rel(128, 8, 3, 16400, nb, 1025, true, GGML_TYPE_F16, true);
+    }
+    add_rel(128, 8, 3, 70000, 3, 1025, true, GGML_TYPE_F16, true);
     // short caches in short chunks: n_kv 256 and 1032
     add_rel(128, 8, 3, 256, 1, 1025, true);
     add_rel(128, 8, 3, 1032, 3, 1025, true);
@@ -16536,6 +16542,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, kv, 1024, 1025));
         test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, kv, 1024, 1025, true, GGML_TYPE_F16, true));
         test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, kv, 1024, 1025, true, GGML_TYPE_F16, true, true));
+    }
+    // verify batches of a speculative draft over a long cache (Inkling 2), the bias from the positions
+    for (int64_t kv : {2048, 4096, 32768, 131072}) {
+        for (int64_t nb : {1, 2, 3, 4, 5, 8, 16}) {
+            test_cases.emplace_back(new test_flash_attn_ext_rel(128, 8, 3, kv, nb, 1025, true, GGML_TYPE_F16, true, true));
+        }
     }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

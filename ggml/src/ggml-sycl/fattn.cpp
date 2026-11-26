@@ -358,6 +358,12 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel_rel(const int device, c
     const bool dec_q8  = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && (uintptr_t) K->data % 2 == 0 &&
                          K->nb[1] % 2 == 0 && K->nb[2] % 2 == 0 && (uintptr_t) V->data % 2 == 0 && V->nb[1] % 2 == 0 &&
                          V->nb[2] % 2 == 0;
+    // verify batches over long caches: the XMX kernel with the keys split over many threads reads the cache about once,
+    // attn-dec once per few query vectors (128K cache, 8 tokens: 1.26 against 3.1 ms)
+    if (g_ggml_sycl_fa_xmx && K->ne[1] >= 4096 && (Q->ne[1] >= 4 || (Q->ne[1] == 3 && K->ne[1] >= 65536)) &&
+        ggml_sycl_fattn_xmx_supported(device, dst)) {
+        return BEST_FATTN_KERNEL_XMX;
+    }
     if (g_ggml_sycl_attn_dec && (dec_f16 || dec_q8) && Q->type == GGML_TYPE_F32 && Q->ne[0] == V->ne[0] &&
         ggml_sycl_attn_dec_supported(Q->ne[0], Q->ne[1] * gqa_ratio) && K->ne[1] >= 256 &&
         K->ne[1] % 8 == 0 && logit_softcap == 0.0f && (uintptr_t) Q->data % 16 == 0 && Q->nb[1] % 16 == 0 &&

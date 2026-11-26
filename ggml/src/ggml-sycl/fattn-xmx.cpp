@@ -123,6 +123,10 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const int        ktiles    = (n_kv + KT - 1) / KT;
     int              nsplit    = split_env > 0 ? split_env : (int) std::min<int64_t>(8, (8192 + thr_1 - 1) / thr_1);
     nsplit                     = std::max(1, std::min(nsplit, n_kv / 4096));
+    // a few tokens (a verify batch) make few threads: split the keys further, ~1536 threads of at least 256 keys
+    if (split_env <= 0 && thr_1 * 8 < 1536) {
+        nsplit = (int) std::max<int64_t>(1, std::min<int64_t>((1536 + thr_1 - 1) / thr_1, n_kv / 256));
+    }
     const int        kt_split  = (ktiles + nsplit - 1) / nsplit;  // key tiles per split
     nsplit                     = (ktiles + kt_split - 1) / kt_split;
     const size_t     n_thr     = (size_t) thr_1 * nsplit;
