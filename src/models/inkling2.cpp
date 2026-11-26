@@ -471,21 +471,12 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     return cur;
 }
 
-void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks) {
+ggml_tensor * llama_model_inkling2::graph::build_readout(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks) {
     cur = ggml_reshape_2d(ctx0, mix(blocks, cur, model.output_res_query), n_embd, n_tokens);
-    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    return build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+}
 
-    // DSpark target features: the last one is the final norm output of every token
-    res->t_layer_inp[n_layer] = cur;
-
-    if (inp_out_ids) {
-        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
-    }
-
-    cb(cur, "result_norm", -1);
-    res->t_embd = cur;
-
-    // lm_head
+ggml_tensor * llama_model_inkling2::graph::build_head(ggml_tensor * cur) {
     cur = build_lora_mm(model.output, cur);
 
     if (hparams.f_final_logit_softcapping != 0.0f) {
@@ -495,7 +486,34 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
     }
 
     // drop the padded vocabulary
-    cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
+    return ggml_cont(ctx0, ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
+}
+
+void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks, int tap, ggml_tensor * ref, float cd_strength) {
+    cur = build_readout(cur, blocks);
+
+    // DSpark target features: the last one is the final norm output of every token
+    res->t_layer_inp[tap < 0 ? n_layer : tap] = cur;
+
+    if (inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
+    cb(cur, "result_norm", -1);
+    res->t_embd = cur;
+
+    cur = build_head(cur);
+
+    if (ref) {
+        // LoopCD: z + w*(z - ref), w = cd_strength*(1 - (p1 - p2)) from the top two probabilities of z
+        const int64_t n_vocab = cur->ne[0];
+        const int64_t n_rows  = cur->ne[1];
+        ggml_tensor * probs = ggml_soft_max(ctx0, cur);
+        ggml_tensor * top   = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, probs, 1, n_vocab, n_rows), ggml_top_k(ctx0, probs, 2));
+        ggml_tensor * p0    = ggml_view_2d(ctx0, top, 1, n_rows, top->nb[2], 0);
+        ggml_tensor * p1    = ggml_view_2d(ctx0, top, 1, n_rows, top->nb[2], top->nb[1]);
+        ggml_tensor * w     = ggml_scale_bias(ctx0, ggml_abs(ctx0, ggml_sub(ctx0, p0, p1)), -cd_strength, cd_strength);
+        cur = ggml_add(ctx0, cur, ggml_mul(ctx0, ggml_sub(ctx0, cur, ref), w));    }
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;

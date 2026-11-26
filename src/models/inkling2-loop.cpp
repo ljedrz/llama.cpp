@@ -1,6 +1,9 @@
 #include "models.h"
 
 int llama_model_inkling2_loop::layer_phys(int il) const {
+    if (il >= n_visit) {
+        return core_end + (il - n_visit);
+    }
     return il < n_phys ? il : core_start + (il - n_phys) % (core_end - core_start);
 }
 
@@ -12,6 +15,7 @@ void llama_model_inkling2_loop::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_LOOP_COUNT,     n_passes);
     ml.get_key(LLM_KV_LOOP_GATE_RANK, gate_rank);
     ml.get_key(LLM_KV_LOOP_VARYING,   varying, false);
+    ml.get_key(LLM_KV_LOOP_CD_STRENGTH, cd_strength, false);
 
     n_phys = hparams.n_layer();
     const uint32_t block = hparams.attn_res_block_size;
@@ -21,7 +25,11 @@ void llama_model_inkling2_loop::load_arch_hparams(llama_model_loader & ml) {
         throw std::runtime_error(format("inkling2_loop: invalid loop core [%u, %u) with block size %u, %u passes or gate rank %u for %d layers",
                 core_start, core_end, block, n_passes, gate_rank, n_phys));
     }
-    const size_t n_slot = n_phys + (size_t) (n_passes - 1)*(core_end - core_start);
+    if (cd_strength < 0.0f || (cd_strength > 0.0f && n_passes < 2)) {
+        throw std::runtime_error(format("inkling2_loop: LoopCD strength %f needs a strength >= 0 and 2+ passes", cd_strength));
+    }
+    n_visit = n_phys + (n_passes - 1)*(core_end - core_start);
+    const size_t n_slot = n_visit + (cd_strength > 0.0f ? n_phys - core_end : 0);
     if (n_slot > LLAMA_MAX_LAYERS) {
         throw std::runtime_error(format("inkling2_loop: %zu cache slots exceed the maximum of %d", n_slot, LLAMA_MAX_LAYERS));
     }
@@ -92,10 +100,16 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     // every pass starts from the prelude output
     auto * prelude = cur;
     const auto prelude_blocks = blocks;
+    ggml_tensor * first = nullptr;
+    std::vector<ggml_tensor *> first_blocks;
     for (uint32_t pass = 0; pass < m.n_passes; ++pass) {
         // the bank of the previous pass: its blocks after the first core block, and its output
         std::vector<ggml_tensor *> bank;
         ggml_tensor * bank_out = nullptr;
+        if (pass == 1) {
+            first        = cur;
+            first_blocks = blocks;
+        }
         if (pass > 0) {
             bank.assign(blocks.begin() + prelude_blocks.size() + 1, blocks.end());
             bank_out = cur;
@@ -118,6 +132,20 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
         res->t_layer_inp[visit++] = cur;
         cur = build_layer(il, il, cur, blocks);
     }
-    GGML_ASSERT(visit == n_layer);
-    build_output(cur, blocks);
+    GGML_ASSERT(visit == m.n_visit);
+
+    // LoopCD reference: the first pass through the coda and the head
+    ggml_tensor * ref = nullptr;
+    if (m.cd_strength > 0.0f) {
+        for (int ip = end; ip < m.n_phys; ++ip) {
+            first = build_layer(m.n_visit + (ip - end), ip, first, first_blocks);
+        }
+        ref = build_readout(first, first_blocks);
+        if (inp_out_ids) {
+            ref = ggml_get_rows(ctx0, ref, inp_out_ids);
+        }
+        ref = build_head(ref);
+        cb(ref, "loopcd_ref", -1);
+    }
+    build_output(cur, blocks, visit, ref, m.cd_strength);
 }

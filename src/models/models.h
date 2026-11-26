@@ -2683,7 +2683,12 @@ struct llama_model_inkling2 : public llama_model_base {
         // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] are mixed into its inputs
         ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
                 ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
-        void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
+        // tap: index of the final norm output in t_layer_inp (-1: n_layer); ref: logits of an earlier pass to contrast with
+        void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks, int tap = -1, ggml_tensor * ref = nullptr, float cd_strength = 0.0f);
+        // final mix and norm, [n_embd, n_tokens]
+        ggml_tensor * build_readout(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
+        // lm_head, softcap and the unpadded vocabulary
+        ggml_tensor * build_head(ggml_tensor * cur);
 
         llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
         llm_graph_input_rs                  * recr = nullptr;
@@ -2722,6 +2727,10 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
     uint32_t n_passes   = 0;
     uint32_t gate_rank  = 0;
     bool     varying    = false; // trained for a varying number of passes
+
+    // LoopCD (arXiv 2610.02185): the first pass also runs the coda in the slots from n_visit, its logits guide the final ones
+    float    cd_strength = 0.0f;
+    int      n_visit     = 0; // cache slots of the normal layer visits
 
     // indexed by physical layer - core_start
     std::vector<loop_layer> loop_layers;
