@@ -3262,6 +3262,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     } else {
         if (bias_table) {
             kq_mask = dense_bias_mask();
+            // before KQ: the gathered bias is freed before KQ is allocated, two n_kv x n_tokens x n_head tensors at a time
+            ggml_build_forward_expand(gf, kq_mask);
         }
         // A cache without an exported scale uses a unit scale.
         if ((ggml_needs_scale(k->type) && !k_scale) || (ggml_needs_scale(v->type) && !v_scale)) {
