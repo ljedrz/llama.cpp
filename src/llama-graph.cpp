@@ -3177,7 +3177,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_tensor * table = ggml_cont(ctx0, ggml_permute(ctx0, bias_table, 1, 0, 2, 3));
         ggml_tensor * bias = ggml_get_rows(ctx0, table, bias_indices);
         bias = ggml_reshape_4d(ctx0, bias, q->ne[2], bias_indices->ne[0], q->ne[1], n_stream);
-        bias = ggml_cont(ctx0, ggml_permute(ctx0, bias, 2, 0, 1, 3));
+        // the mask is added to the permuted view
+        bias = ggml_permute(ctx0, bias, 2, 0, 1, 3);
         cb(bias, "kq_b", il);
 
         ggml_tensor * mask = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
