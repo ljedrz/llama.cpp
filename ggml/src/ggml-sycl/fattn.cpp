@@ -105,7 +105,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_ONEDNN   = 150, // oneDNN SDPA: native F16 (PR #25222)
     BEST_FATTN_KERNEL_TILE     = 200,
     BEST_FATTN_KERNEL_MKL      = 300,
-    BEST_FATTN_KERNEL_XMX      = 350, // relative-position bias: prompts over a long F16 cache, scores in registers (Xe2)
+    BEST_FATTN_KERNEL_XMX      = 350, // relative-position bias: prompts and verify batches over a long F16 or q8_0 cache, scores in registers (Xe2)
     BEST_FATTN_KERNEL_REL_MASK = 400, // relative-position bias: the per-head mask materialized, then a kernel that takes it
     BEST_FATTN_KERNEL_DEC      = 450, // a few tokens over a long F16 cache, one pass over K and V per KV head (attn-dec)
 };
@@ -360,7 +360,12 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel_rel(const int device, c
                          V->nb[2] % 2 == 0;
     // verify batches over long caches: the XMX kernel with the keys split over many threads reads the cache about once,
     // attn-dec once per few query vectors (128K cache, 8 tokens: 1.26 against 3.1 ms)
-    if (g_ggml_sycl_fa_xmx && K->ne[1] >= 4096 && (Q->ne[1] >= 4 || (Q->ne[1] == 3 && K->ne[1] >= 65536)) &&
+    // q8_0 K / V through XMX (dequantized in registers): GGML_SYCL_FA_XMX_Q8=0 leaves them to attn-dec, MKL and TILE
+    static const bool xmx_q8 = ggml_sycl_get_env("GGML_SYCL_FA_XMX_Q8", 1) != 0;
+    const bool        xmx_kv = g_ggml_sycl_fa_xmx && (K->type != GGML_TYPE_Q8_0 || xmx_q8);
+    // q8_0 with 4 tokens from 8192 cells (4096 cells: 86 against 73 us in attn-dec)
+    const int64_t     min_4  = K->type == GGML_TYPE_Q8_0 ? 8192 : 4096;
+    if (xmx_kv && K->ne[1] >= 4096 && (Q->ne[1] >= 5 || (Q->ne[1] == 4 && K->ne[1] >= min_4) || (Q->ne[1] == 3 && K->ne[1] >= 65536)) &&
         ggml_sycl_fattn_xmx_supported(device, dst)) {
         return BEST_FATTN_KERNEL_XMX;
     }
@@ -371,8 +376,8 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel_rel(const int device, c
         return BEST_FATTN_KERNEL_DEC;
     }
 
-    // prompts over long F16 caches: XMX flash attention, else MKL, which applies the bias in its softmax and converts q8_0 K and V to F16 a chunk at a time
-    if (g_ggml_sycl_fa_xmx && Q->ne[1] >= 32 && K->ne[1] >= 1024 && ggml_sycl_fattn_xmx_supported(device, dst)) {
+    // prompts over long caches: XMX flash attention, else MKL, which applies the bias in its softmax and converts q8_0 K and V to F16 a chunk at a time
+    if (xmx_kv && Q->ne[1] >= 32 && K->ne[1] >= 1024 && ggml_sycl_fattn_xmx_supported(device, dst)) {
         return BEST_FATTN_KERNEL_XMX;
     }
     const auto mkl_kv_ok = [](const ggml_tensor * t) {

@@ -1,4 +1,4 @@
-// Flash attention of a prompt over a long F16 cache with the relative-position bias, on Xe2 XMX (ESIMD DPAS).
+// Flash attention of a prompt or a verify batch over a long F16 or q8_0 cache with the relative-position bias, on Xe2 XMX (ESIMD DPAS).
 // A thread holds 16 query rows (16 tokens of one query head) and streams the keys of its KV head 16 at a time.
 // The scores stay in registers, so no score matrix goes through memory (the MKL route writes and reads it twice).
 #include <sycl/sycl.hpp>
@@ -28,6 +28,12 @@ constexpr int   NC    = D / 16;    // 16-wide pieces of a row
 constexpr int   WGT   = 16;        // threads per work-group, all of one KV head: they read the same K / V tiles
 constexpr float LOG2E = 1.4426950408889634f;
 constexpr float NEG   = -1.0e30f;  // start of the running max
+
+// q8_0 K / V: a head row is D/32 blocks of 34 bytes (an F16 scale, 32 int8). Block b is read as a window of dwords from
+// dword q8_win(b), so that it starts on a dword: the scale at byte q8_soff(b) of the window, the quants from byte q8_qoff(b)
+constexpr int q8_win(int b)  { return (34 * b - (b % 2) * 2) / 4; }
+constexpr int q8_soff(int b) { return (b % 2) * 2; }
+constexpr int q8_qoff(int b) { return 2 + (b % 2) * 2; }
 }  // namespace fattn_xmx
 
 static bool fattn_xmx_support_arch(gpu_arch arch) {
@@ -55,11 +61,18 @@ bool ggml_sycl_fattn_xmx_supported(int device, const ggml_tensor * dst) {
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
     // 2D block loads: 64-byte aligned surfaces, pitches a multiple of 16 bytes
     const auto surf_ok = [](const void * p, size_t pitch) { return (uintptr_t) p % 64 == 0 && pitch % 16 == 0; };
-    return K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 && Q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+    // q8_0: the heads of a cell in one row, as in a KV cache view (a head row of 136 bytes cannot be a surface pitch);
+    // the surface of a head starts at its 64-byte line
+    const auto q8_ok = [](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_Q8_0 && t->nb[0] == sizeof(block_q8_0) && t->nb[1] % 16 == 0 && t->nb[2] % 4 == 0 &&
+               (size_t) t->nb[2] * t->ne[2] <= t->nb[1] && (uintptr_t) t->data % 64 == 0;
+    };
+    const bool f16 = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 && K->nb[0] == 2 && V->nb[0] == 2 &&
+                     surf_ok(K->data, K->nb[1]) && K->nb[2] % 64 == 0 && surf_ok(V->data, V->nb[1]) && V->nb[2] % 64 == 0;
+    return (f16 || (q8_ok(K) && q8_ok(V))) && Q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
            Q->ne[0] == D && K->ne[0] == D && V->ne[0] == D && Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 &&
-           K->nb[0] == 2 && V->nb[0] == 2 && Q->ne[2] % K->ne[2] == 0 && logit_softcap == 0.0f && mask &&
+           Q->ne[2] % K->ne[2] == 0 && logit_softcap == 0.0f && mask &&
            mask->type == GGML_TYPE_F16 && mask->ne[2] == 1 && mask->ne[3] == 1 && mask->nb[0] == 2 &&
-           surf_ok(K->data, K->nb[1]) && K->nb[2] % 64 == 0 && surf_ok(V->data, V->nb[1]) && V->nb[2] % 64 == 0 &&
            surf_ok(mask->data, mask->nb[1]) && K->ne[1] >= 32 && ggml_is_contiguous(dst);
 #endif
 }
@@ -135,8 +148,9 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     float *          part      = nsplit > 1 ? part_buf.alloc((size_t) nsplit * n_q_heads * q_pad * (D + 2)) : nullptr;
 
     // a kernel per bias form: the positions and the index rows together held registers that both lost
-    const auto launch = [&](auto pos_tag) {
+    const auto launch = [&](auto pos_tag, auto q8_tag) {
         constexpr bool POS = decltype(pos_tag)::value;
+        constexpr bool Q8  = decltype(q8_tag)::value;
         stream->submit([&](sycl::handler & cgh) {
             cgh.parallel_for(sycl::nd_range<1>((n_thr + WGT - 1) / WGT * WGT, WGT),
                 sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> },
@@ -183,10 +197,52 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
                     const uint32_t * kb = (const uint32_t *) (kp + kvh * k_head);
                     const half *     vb = (const half *) (vp + kvh * v_head);
 
+                    // q8_0: the surface starts at the 64-byte line of the head, the head at dword kx0 / vx0 of the row
+                    const size_t     ka  = (size_t) kvh * k_head, va = (size_t) kvh * v_head;
+                    const size_t     kal = ka / 64 * 64, val = va / 64 * 64;
+                    const uint32_t * kq  = (const uint32_t *) (kp + kal);
+                    const uint32_t * vq  = (const uint32_t *) (vp + val);
+                    const int        kx0 = (int) (ka - kal) / 4, vx0 = (int) (va - val) / 4;
+                    const uint32_t   kw  = k_pitch - (uint32_t) kal - 1, vw = v_pitch - (uint32_t) val - 1;
+
                     const int k_end = std::min(n_kv, (sp + 1) * kt_split * KT);
                     for (int k0 = sp * kt_split * KT; k0 < k_end; k0 += KT) {
                         // S = Q K^T, [mb][8 rows][16 keys]
                         simd<float, MB * 8 * KT> S = 0.0f;
+                        if constexpr (Q8) {
+                            // a block's window transposed, [dword][key]: byte j of dword w of every key is a stride-4 region; each
+                            // quant converts into the DPAS layout [d pair][key][2], the key's scale multiplies it
+#pragma unroll
+                            for (int b = 0; b < D / 32; ++b) {
+                                simd<uint32_t, 9 * KT> kr;
+                                kr.template select<8 * KT, 1>(0)  = load_2d<uint32_t, 8, KT, 1, true, false>(kq, kw, n_kv - 1, k_pitch - 1, kx0 + q8_win(b), k0);
+                                kr.template select<KT, 1>(8 * KT) = load_2d<uint32_t, 1, KT, 1, true, false>(kq, kw, n_kv - 1, k_pitch - 1, kx0 + q8_win(b) + 8, k0);
+                                const simd<half, KT> ks = kr.template bit_cast_view<half>().template select<KT, 2>(q8_soff(b) / 2);
+                                simd<half, 2 * KT>   ks2;
+                                ks2.template select<KT, 2>(0) = ks;
+                                ks2.template select<KT, 2>(1) = ks;
+#pragma unroll
+                                for (int hh = 0; hh < 2; ++hh) {
+                                    simd<half, 16 * KT> kt;
+#pragma unroll
+                                    for (int dl = 0; dl < 16; ++dl) {
+                                        const int p = q8_qoff(b) + 16 * hh + dl;
+                                        kt.template select<KT, 2>((dl / 2) * 2 * KT + dl % 2) =
+                                            convert<half>(simd<int8_t, KT>(kr.template bit_cast_view<int8_t>().template select<KT, 4>((p / 4) * KT * 4 + p % 4)));
+                                    }
+#pragma unroll
+                                    for (int dp = 0; dp < 8; ++dp) {
+                                        kt.template select<2 * KT, 1>(dp * 2 * KT) *= ks2;
+                                    }
+#pragma unroll
+                                    for (int mb = 0; mb < MB; ++mb) {
+                                        S.template select<8 * KT, 1>(mb * 8 * KT) = xmx::dpas<8, 8, float, float, half, half>(
+                                            simd<float, 8 * KT>(S.template select<8 * KT, 1>(mb * 8 * KT)), kt,
+                                            load_2d<half, 16, 8, 1, false, false>(qhead, D * 2 - 1, n_queries - 1, D * 2 - 1, (2 * b + hh) * 16, q0 + mb * 8));
+                                    }
+                                }
+                            }
+                        } else {
 #pragma unroll
                         for (int c = 0; c < NC; ++c) {
                             simd<uint32_t, 8 * KT> kt = load_2d<uint32_t, 8, KT, 1, true, false>(kb, D * 2 - 1, n_kv - 1, k_pitch - 1, c * 8, k0);
@@ -196,6 +252,7 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
                                     simd<float, 8 * KT>(S.template select<8 * KT, 1>(mb * 8 * KT)), kt.template bit_cast_view<half>().read(),
                                     load_2d<half, 16, 8, 1, false, false>(qhead, D * 2 - 1, n_queries - 1, D * 2 - 1, c * 16, q0 + mb * 8));
                             }
+                        }
                         }
 
                         // mask: the tokens' rows of this key tile, [16 rows][16 keys] like S; keys past the cache are masked here
@@ -278,7 +335,36 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
                             P.template select<KT, 1>(R * KT) = convert<half>(p);
                         }
 
-                        // O += P V
+                        // O += P V; q8_0: the key's scale goes onto P, the quants of a key row convert into [key pair][d][2]
+                        if constexpr (Q8) {
+#pragma unroll
+                            for (int b = 0; b < D / 32; ++b) {
+                                simd<uint32_t, 16 * KT>       vr = load_2d<uint32_t, 16, KT, 1, false, false>(vq, vw, n_kv - 1, v_pitch - 1, vx0 + q8_win(b), k0);
+                                simd<uint32_t, KT>            vs = load_2d<uint32_t, 1, KT, 1, true, false>(vq, vw, n_kv - 1, v_pitch - 1, vx0 + q8_win(b), k0);
+                                const simd<half, KT>          sv = vs.template bit_cast_view<half>().template select<KT, 2>(q8_soff(b) / 2);
+                                simd<half, MB * 8 * KT>       Pb;
+#pragma unroll
+                                for (int R = 0; R < RPT; ++R) {
+                                    Pb.template select<KT, 1>(R * KT) = P.template select<KT, 1>(R * KT) * sv;
+                                }
+#pragma unroll
+                                for (int hh = 0; hh < 2; ++hh) {
+                                    const int c = 2 * b + hh;
+                                    simd<half, KT * 16> vt;
+#pragma unroll
+                                    for (int key = 0; key < KT; ++key) {
+                                        vt.template select<16, 2>((key / 2) * 32 + key % 2) =
+                                            convert<half>(simd<int8_t, 16>(vr.template bit_cast_view<int8_t>().template select<16, 1>(key * 64 + q8_qoff(b) + 16 * hh)));
+                                    }
+#pragma unroll
+                                    for (int mb = 0; mb < MB; ++mb) {
+                                        O.template select<8 * 16, 1>((mb * NC + c) * 8 * 16) = xmx::dpas<8, 8, float, float, half, half>(
+                                            simd<float, 8 * 16>(O.template select<8 * 16, 1>((mb * NC + c) * 8 * 16)), vt,
+                                            simd<half, 8 * KT>(Pb.template select<8 * KT, 1>(mb * 8 * KT)));
+                                    }
+                                }
+                            }
+                        } else {
 #pragma unroll
                         for (int c = 0; c < NC; ++c) {
                             simd<half, KT * 16> vt = load_2d<half, 16, KT, 1, false, true>(vb, D * 2 - 1, n_kv - 1, v_pitch - 1, c * 16, k0);
@@ -288,6 +374,7 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
                                     simd<float, 8 * 16>(O.template select<8 * 16, 1>((mb * NC + c) * 8 * 16)), vt,
                                     simd<half, 8 * KT>(P.template select<8 * KT, 1>(mb * 8 * KT)));
                             }
+                        }
                         }
                     }
 
@@ -332,10 +419,11 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
                 });
         });
     };
+    const bool q8 = K->type == GGML_TYPE_Q8_0;
     if (rel.q_pos) {
-        launch(std::true_type{});
+        q8 ? launch(std::true_type{}, std::true_type{}) : launch(std::true_type{}, std::false_type{});
     } else {
-        launch(std::false_type{});
+        q8 ? launch(std::false_type{}, std::true_type{}) : launch(std::false_type{}, std::false_type{});
     }
 
     if (part) {
