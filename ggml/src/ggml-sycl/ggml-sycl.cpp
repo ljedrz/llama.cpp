@@ -3994,9 +3994,33 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
         }
 
         if constexpr(quantize_enabled) {
-            dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs);
+            // a graph node's src1 that the previous quantization already holds (see q8_1_cache_entry)
+            static const bool q8_1_reuse = ggml_sycl_get_env("GGML_SYCL_Q8_1_REUSE", 1);
+            auto &            qc         = ctx.q8_1_cache;
+            const void *      kind       = (const void *) &quantize_row_q8_1_sycl<quantize_f>;
+            const bool cacheable = q8_1_reuse && !split && src1_on_device && src1_is_contiguous &&
+                                   dst == ctx.cur_node && dst->op == GGML_OP_MUL_MAT && dst->src[1] == src1;
+            const bool hit = cacheable && qc.src1 == src1 && qc.data == src1->data && qc.kind == kind &&
+                             qc.padded == src1_padded_col_size &&
+                             std::equal(std::begin(qc.ne), std::end(qc.ne), std::begin(src1->ne)) &&
+                             std::equal(std::begin(qc.nb), std::end(qc.nb), std::begin(src1->nb));
+            if (hit) {
+                dev[i].src1_ddq = (char *) qc.buf;
+            } else if (cacheable) {
+                qc.clear();
+                qc.reserve(stream, nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs);
+                qc.src1   = src1;
+                qc.data   = src1->data;
+                qc.kind   = kind;
+                qc.padded = src1_padded_col_size;
+                std::copy(std::begin(src1->ne), std::end(src1->ne), std::begin(qc.ne));
+                std::copy(std::begin(src1->nb), std::end(src1->nb), std::begin(qc.nb));
+                dev[i].src1_ddq = (char *) qc.buf;
+            } else {
+                dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs);
+            }
 
-            if (src1_on_device && src1_is_contiguous) {
+            if (src1_on_device && src1_is_contiguous && !hit) {
                 scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
                                                      /*num_src=*/2, " : converting src1 to Q8_1");
                 try {
@@ -7805,6 +7829,7 @@ catch (sycl::exception const &exc) {
 static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) try {
     GGML_SYCL_DEBUG("[SYCL] ggml_sycl_compute_forward: dst=%s, op=%s\n", dst->name, ggml_op_name(dst->op));
     if (!g_sycl_loaded) return false;
+    ctx.cur_node = dst;
 
     if (dst->src[0] != nullptr && ggml_backend_buffer_is_sycl_split(dst->src[0]->buffer)) {
         ggml_sycl_set_peer_access(dst->src[1]->ne[1], ctx.device);
@@ -8473,6 +8498,7 @@ static void ggml_sycl_find_gdn_state_rows(const ggml_cgraph * cgraph, ggml_sycl_
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_conv_window_match conv_window;
     sycl_ctx->fused_ahead.clear();
+    sycl_ctx->q8_1_cache.clear();
     ggml_sycl_gdn_state_rows gdn_rows;
     ggml_sycl_find_gdn_state_rows(cgraph, gdn_rows);
     for (int i = 0; i < cgraph->n_nodes; i++) {

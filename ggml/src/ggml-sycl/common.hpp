@@ -631,6 +631,54 @@ struct ggml_backend_sycl_context {
     // cleared at the start of every graph compute
     std::unordered_set<const ggml_tensor *> fused_ahead;
 
+    // the graph node ggml_sycl_compute_forward runs
+    const ggml_tensor * cur_node = nullptr;
+
+    // the activation ggml_sycl_op_mul_mat last quantized to q8_1, in a buffer of its own (the pool frees in stack order
+    // only): the MUL_MATs of graph nodes on the same src1 (the attention projections of a layer) quantize it once. A
+    // graph tensor does not change before its last use, so a match is valid within one graph compute; cleared at the
+    // start of every graph compute. A buffer that grew stays allocated until the context goes (a recorded SYCL graph
+    // may still name it).
+    struct q8_1_cache_entry {
+        const ggml_tensor * src1   = nullptr;
+        const void *        data   = nullptr;
+        const void *        kind   = nullptr;
+        int64_t             padded = 0;
+        int64_t             ne[GGML_MAX_DIMS] = {};
+        size_t              nb[GGML_MAX_DIMS] = {};
+        void *              buf    = nullptr;
+        size_t              cap    = 0;
+        queue_ptr           q      = nullptr;
+        std::vector<void *> retired;
+
+        void clear() { src1 = nullptr; }
+
+        void * reserve(queue_ptr stream, size_t size) {
+            if (size > cap) {
+                if (buf) {
+                    retired.push_back(buf);
+                }
+                cap = std::max(size, 2 * cap);
+                q   = stream;
+                buf = sycl::malloc_device(cap, *stream);
+                GGML_ASSERT(buf != nullptr);
+            }
+            return buf;
+        }
+
+        ~q8_1_cache_entry() {
+            if (q) {
+                q->wait();
+                for (void * p : retired) {
+                    sycl::free(p, *q);
+                }
+                if (buf) {
+                    sycl::free(buf, *q);
+                }
+            }
+        }
+    } q8_1_cache;
+
     ggml_sycl_graph * sycl_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();
         const int64_t eviction_timeout_us = g_ggml_sycl_graph_eviction_timeout * 1'000'000LL;
