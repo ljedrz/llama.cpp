@@ -15,6 +15,10 @@ constexpr bool ggml_sycl_grouped_gemm_esimd_has = std::is_same_v<block_q_t, bloc
                                                   std::is_same_v<block_q_t, block_iq4_xs> ||
                                                   std::is_same_v<block_q_t, block_iq3_s> ||
                                                   std::is_same_v<block_q_t, block_iq3_xxs> ||
+                                                  std::is_same_v<block_q_t, block_iq2_xxs> ||
+                                                  std::is_same_v<block_q_t, block_iq2_xs> ||
+                                                  std::is_same_v<block_q_t, block_iq2_s> ||
+                                                  std::is_same_v<block_q_t, block_iq1_s> ||
                                                   std::is_same_v<block_q_t, block_q2_K> ||
                                                   std::is_same_v<block_q_t, block_q3_K> ||
                                                   std::is_same_v<block_q_t, block_q4_K> ||
