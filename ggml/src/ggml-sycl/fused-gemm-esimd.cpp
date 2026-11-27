@@ -278,16 +278,20 @@ ESIMD_INLINE a_halves grid_signed(simd<uint32_t, GROUPED_GEMM_RC * 8> ge,
                                   simd<uint32_t, GROUPED_GEMM_RC>     signs,
                                   simd<float, GROUPED_GEMM_RC>        d0,
                                   simd<float, GROUPED_GEMM_RC>        d1) {
-    auto                                 gm = ge.template bit_cast_view<uint32_t, GROUPED_GEMM_RC, 8>();
-    simd<uint32_t, GROUPED_GEMM_RC * 16> sg = signs.template replicate_vs_w_hs<GROUPED_GEMM_RC, 1, 16, 0>(0);
-    simd<uint32_t, GROUPED_GEMM_RC * 16> k(0, 1);
-    k &= 15;
+    // the signs on the packed bytes: the 4 sign bits of grid dword e (bits 4e .. 4e + 3) as byte masks, then each
+    // masked byte negated in place (a grid byte is never 0, so the + 1 carries nothing into the next byte); the
+    // signed bytes convert to the same floats as negating after the conversion
+    simd<uint32_t, GROUPED_GEMM_RC * 8> sg = signs.template replicate_vs_w_hs<GROUPED_GEMM_RC, 1, 8, 0>(0);
+    simd<uint32_t, GROUPED_GEMM_RC * 8> e(0, 4);
+    e &= 31;
+    simd<uint32_t, GROUPED_GEMM_RC * 8> m  = ((((sg >> e) & 15) * 0x00204081u) & 0x01010101u) * 0xFFu;
+    simd<uint32_t, GROUPED_GEMM_RC * 8> sv = (ge ^ m) + (m & 0x01010101u);
+    auto                                gm = sv.template bit_cast_view<uint32_t, GROUPED_GEMM_RC, 8>();
     a_halves v;
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
         simd<uint32_t, GROUPED_GEMM_RC * 4> eh = gm.template select<GROUPED_GEMM_RC, 1, 4, 1>(0, 4 * h);
-        simd<float, GROUPED_GEMM_RC * 16>   f  = eh.template bit_cast_view<uint8_t>();
-        f.merge(-f, ((sg >> (k + 16 * h)) & 1) != 0);
+        simd<float, GROUPED_GEMM_RC * 16>   f  = eh.template bit_cast_view<int8_t>();
         v.template select<GROUPED_GEMM_RC * 16, 1>(h * GROUPED_GEMM_RC * 16) = scale_half(f, h == 0 ? d0 : d1);
     }
     return v;
