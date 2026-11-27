@@ -620,13 +620,6 @@ struct ggml_backend_sycl_context {
         return pool(device);
     }
 
-#ifdef GGML_SYCL_GRAPH
-    // Map from first node pointer to graph - allows multiple graphs per context when the
-    // computation is split across CPU/GPU (e.g. with --n-cpu-moe)
-    std::unordered_map<const void *, std::unique_ptr<ggml_sycl_graph>> sycl_graphs;
-
-    int64_t last_graph_eviction_sweep = 0;
-    std::optional<bool> graph_compatible;
     // nodes a fusion earlier in the graph already ran (out of order, e.g. a KV cache write taken into its norm);
     // cleared at the start of every graph compute
     std::unordered_set<const ggml_tensor *> fused_ahead;
@@ -678,6 +671,14 @@ struct ggml_backend_sycl_context {
             }
         }
     } q8_1_cache;
+
+#ifdef GGML_SYCL_GRAPH
+    // Map from first node pointer to graph - allows multiple graphs per context when the
+    // computation is split across CPU/GPU (e.g. with --n-cpu-moe)
+    std::unordered_map<const void *, std::unique_ptr<ggml_sycl_graph>> sycl_graphs;
+
+    int64_t last_graph_eviction_sweep = 0;
+    std::optional<bool> graph_compatible;
 
     ggml_sycl_graph * sycl_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();
