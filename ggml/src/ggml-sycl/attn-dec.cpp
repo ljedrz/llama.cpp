@@ -328,7 +328,8 @@ static void attn_dec_combine(const ggml_sycl_attn_dec_args a, const int64_t n_sp
     for (int64_t s = 0; s < n_split; ++s) {
         acc += w[s] * p0[s * stride + lid];
     }
-    a.dst[h * a.o_h + t * a.o_t + lid] = acc / l;
+    // a fully masked row has no weight and gives zeros, as ggml-cpu
+    a.dst[h * a.o_h + t * a.o_t + lid] = l > 0.0f ? acc / l : 0.0f;
 }
 
 template <int D, int NQ, typename mask_t, bool VROWS, bool Q8>

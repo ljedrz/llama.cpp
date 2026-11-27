@@ -1021,7 +1021,8 @@ static void flash_attn_tile(const char *  Q,
             return;
         }
 
-        const float scale = item_ct1.get_group_range(1) == 1 ? 1.0f / KQ_sum[jc0] : 1.0f;
+        // a fully masked row has no weight and gives zeros, as ggml-cpu
+        const float scale = item_ct1.get_group_range(1) == 1 ? (KQ_sum[jc0] > 0.0f ? 1.0f / KQ_sum[jc0] : 0.0f) : 1.0f;
 
         const int j_dst_unrolled =
             ((sequence * int(ne01.z()) + col_Q_0 + j) * ne02 + head0 + c) * item_ct1.get_group_range(1) +

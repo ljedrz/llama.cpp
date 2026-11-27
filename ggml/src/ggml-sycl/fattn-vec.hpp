@@ -543,7 +543,7 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
                     }
                 }
                 if (item_ct1.get_group_range(1) == 1) {
-                    dst_val /= KQ_sum[j_VKQ];
+                    dst_val = fattn_normalize(dst_val, KQ_sum[j_VKQ]);
                 }
                 dst[(((sequence * int(ne01.z()) + ic0 + j_VKQ) * ne02 + head) * item_ct1.get_group_range(1) +
                      item_ct1.get_group(1)) *

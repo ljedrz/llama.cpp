@@ -241,7 +241,8 @@ static void mkl_fa_normalize_head(
                 // the sink logit only adds to the denominator, against the running max of the row
                 float   sum      = KQ_sum[ksum_idx] +
                     (sinks ? sycl::native::exp(sinks[iqh] - KQ_max[ksum_idx]) : 0.0f);
-                float   inv_sum  = 1.0f / sum;
+                // a fully masked row has no weight and gives zeros, as ggml-cpu
+                float   inv_sum  = sum > 0.0f ? 1.0f / sum : 0.0f;
                 const float * __restrict src = VKQ_accum
                     + src_offset + jc * (int64_t)DV;
                 // Interleaved dst layout (matching TILE):

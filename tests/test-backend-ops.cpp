@@ -5209,6 +5209,84 @@ struct test_attn_kq_softmax_kqv : public test_case {
     }
 };
 
+// flash attention whose first query row sees no key (an all -inf mask row): the output row is zeros, as ggml-cpu gives it;
+// the shapes pick the backend's decode, few-token, split and prompt kernels
+struct test_flash_attn_ext_masked_row : public test_case {
+    const int64_t   hs, nh, gqa, kv, nb;
+    const bool      sinks;
+    const ggml_type type_KV;
+    const bool      bias; // an indexed relative-position bias of 65 distances (one stream)
+
+    std::string vars() override {
+        return VARS_TO_STR8(hs, nh, gqa, kv, nb, sinks, type_KV, bias) + ",masked_row=1";
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    test_flash_attn_ext_masked_row(int64_t hs = 128, int64_t nh = 4, int64_t gqa = 1, int64_t kv = 512, int64_t nb = 1,
+                                   bool sinks = false, ggml_type type_KV = GGML_TYPE_F16, bool bias = false)
+        : hs(hs), nh(nh), gqa(gqa), kv(kv), nb(nb), sinks(sinks), type_KV(type_KV), bias(bias) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, 1);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hs, kv, nh, 1);
+        ggml_set_name(v, "v");
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
+        if (sinks) {
+            ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh*gqa);
+            ggml_set_name(s, "s");
+            ggml_flash_attn_ext_add_sinks(out, s);
+        }
+        if (bias) {
+            ggml_tensor * t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 65, nh*gqa, nb);
+            ggml_set_name(t, "t");
+            ggml_tensor * idx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, nb);
+            ggml_set_name(idx, "idx");
+            ggml_flash_attn_ext_add_indexed_bias(out, t, idx);
+        }
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "idx") == 0) {
+                // the clamped distance of token i (at position kv - nb + i) to cell j
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t i = 0; i < nb; ++i) {
+                    for (int64_t j = 0; j < kv; ++j) {
+                        data[i*kv + j] = (int32_t) std::min<int64_t>(std::abs(kv - nb + i - j), 64);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "t") == 0) {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            } else if (strcmp(t->name, "m") == 0) {
+                // row 0 masked out, the other rows see a prefix of the keys with a small bias
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (int64_t i = 0; i < nb; ++i) {
+                    const int64_t n_vis = i == 0 ? 0 : kv - (kv/4)*(i % 3);
+                    for (int64_t j = 0; j < kv; ++j) {
+                        data[i*kv + j] = ggml_fp32_to_fp16(j < n_vis ? 0.125f*((j + 3*i) % 9 - 4) : -INFINITY);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // flash attention with an indexed bias as Inkling 2 builds it (relative-position bias): the table is a view of a
 // [n_dist, n_head*n_batch] matrix, the indices are the clamped distances, the mask is shared by the heads. The cells
 // hold the positions of a wrapped ring (as a SWA cache does) with empty cells, cells after the queries are not masked
@@ -15379,8 +15457,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // a query row that sees no key: decode (with and without GQA, D 128 / 256), few tokens, long caches (split kernels),
+    // prompt chunks; with sinks the row is all sink
+    for (bool sinks : { false, true }) {
+        for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_masked_row(128, 4, 1, 512,   1, sinks, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext_masked_row(128, 4, 4, 512,   1, sinks, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext_masked_row(256, 4, 4, 512,   1, sinks, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext_masked_row(128, 4, 1, 512,   3, sinks, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext_masked_row(128, 4, 4, 512,   3, sinks, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext_masked_row(128, 4, 1, 16384, 1, sinks, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext_masked_row(128, 4, 4, 16384, 3, sinks, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext_masked_row(128, 8, 4, 2048,  64, sinks, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext_masked_row(256, 4, 4, 2048,  64, sinks, type_KV));
+        }
+        // with the relative-position bias: the few-token kernel, XMX verify over a long cache, an XMX prompt chunk
+        for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_masked_row(128, 8, 3, 2056,  1,  sinks, type_KV, true));
+            test_cases.emplace_back(new test_flash_attn_ext_masked_row(128, 8, 3, 2056,  3,  sinks, type_KV, true));
+            test_cases.emplace_back(new test_flash_attn_ext_masked_row(128, 8, 3, 16400, 8,  sinks, type_KV, true));
+            test_cases.emplace_back(new test_flash_attn_ext_masked_row(128, 8, 3, 2048,  64, sinks, type_KV, true));
+        }
+    }
+
     // every bias case with the indices and with the positions
-    auto add_rel = [&](int64_t hs, int64_t nh, int64_t nr2, int64_t kv, int64_t nb, int64_t n_dist, bool sinks,
+    auto add_rel =[&](int64_t hs, int64_t nh, int64_t nr2, int64_t kv, int64_t nb, int64_t n_dist, bool sinks,
                        ggml_type type_KV = GGML_TYPE_F16, bool causal = false, bool kv_rows = false) {
         for (bool pos : { false, true }) {
             test_cases.emplace_back(new test_flash_attn_ext_rel(hs, nh, nr2, kv, nb, n_dist, sinks, type_KV, causal, pos, kv_rows));

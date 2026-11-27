@@ -20,6 +20,11 @@
 #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// a fully masked query row has no weight: ggml-cpu returns zeros for its 0/0
+static inline float fattn_normalize(float value, float rowsum) {
+    return value == 0.0f && rowsum == 0.0f ? 0.0f : value / rowsum;
+}
+
 typedef void (*fattn_kernel_t)(
     const char* Q,
     const char* K,
@@ -775,7 +780,7 @@ static void flash_attn_stream_k_fixup(float * __restrict__ dst,
     }
 
     // Write back final result:
-    *dst = dst_val / rowsum;
+    *dst = fattn_normalize(dst_val, rowsum);
 }
 
 template <int D>  // D == head size
@@ -829,7 +834,7 @@ static void flash_attn_combine_results(const float * __restrict__ VKQ_parts,
         VKQ_denominator += KQ_max_scale * meta[l].y();
     }
 
-    dst[tid] = VKQ_numerator / VKQ_denominator;
+    dst[tid] = fattn_normalize(VKQ_numerator, VKQ_denominator);
 }
 
 // Carries the sub-group size (and grf_size_automatic when use_large_grf) as
