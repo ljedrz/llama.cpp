@@ -5930,10 +5930,13 @@ static bool ggml_sycl_mul_mat_id_mmvq_eligible(
             case GGML_TYPE_IQ3_S:
             case GGML_TYPE_Q2_0:
                 break;
-            case GGML_TYPE_IQ4_NL:
-                // the grouped GEMM adds ~33 us per token against ~43 here (K 1152): it wins from ~5 tokens
-                if (ne12 > 4) return false;
+            case GGML_TYPE_IQ4_NL: {
+                // the grouped GEMM adds ~33 us per token against ~43 here (K 1152, test-backend-ops): it wins from
+                // ~5 tokens there; GGML_SYCL_MOE_MMVQ_IQ4_NL_MAX_TOKENS moves the cut
+                static const int iq4_nl_max = ggml_sycl_get_env("GGML_SYCL_MOE_MMVQ_IQ4_NL_MAX_TOKENS", 4);
+                if (ne12 > iq4_nl_max) return false;
                 break;
+            }
             default:
                 return false;
         }

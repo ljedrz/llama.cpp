@@ -16174,6 +16174,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_moe_ffn_route(GGML_TYPE_NVFP4, 2304, 1152, 128, 8, 8, 2));
+    // the same expert FFN on the MoE mat-vec of few tokens (one GEMV per token and slot)
+    for (ggml_type type : { GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0 }) {
+        for (int route : { 0, 1, 2, 3 }) {
+            for (int n : { 1, 2, 3, 5, 8 }) {
+                test_cases.emplace_back(new test_moe_ffn_route(type, 256, 128, 16, 4, n, route));
+            }
+        }
+    }
     // the grid IQ / IQ4_NL / Q2_0 experts of the GSQ-RCO Inkling 2 Mini quants: gate_up (K 2304) and down (K 1152) at
     // decode and verify sizes
     for (ggml_type type_a : { GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
