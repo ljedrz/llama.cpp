@@ -30,6 +30,14 @@ void ggml_sycl_op_mul_mat_vec_q(
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream);
 
+// Several tokens in one launch: one GEMV per (token, slot) pair, each with its own ids, src1 row and dst row.
+struct ggml_sycl_moe_tokens {
+    int    n_tokens          = 1;
+    size_t ids_token_stride  = 0;  // int32 elements between the ids of consecutive tokens
+    size_t src1_token_stride = 0;  // bytes between the quantized src1 rows of consecutive tokens
+    size_t dst_token_stride  = 0;  // bytes between the dst rows of consecutive tokens
+};
+
 // Requires standard (non-reorder) block layout for src0.
 // Returns false if src0_type isn't handled; caller should fall back.
 bool ggml_sycl_mul_mat_vec_q_id(
@@ -44,7 +52,8 @@ bool ggml_sycl_mul_mat_vec_q_id(
     size_t             expert_weight_stride, // bytes between experts in vx_base
     size_t             dst_row_stride,       // bytes between dst rows
     size_t             src1_row_stride,      // 0 = shared src1, else per-expert stride in bytes
-    dpct::queue_ptr    stream);
+    dpct::queue_ptr    stream,
+    const struct ggml_sycl_moe_tokens & tok);
 
 struct ggml_sycl_nvfp4_id_args {
     int    ncols;

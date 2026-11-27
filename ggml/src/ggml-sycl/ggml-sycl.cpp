@@ -5914,15 +5914,39 @@ static bool ggml_sycl_mul_mat_id_mmvq_eligible(
     const int64_t ne11 = src1->ne[1];
     const int64_t ne12 = src1->ne[2];
 
-    if (ne12 != 1) return false;
+    // a few tokens (verify batches) run as one GEMV per (token, slot) pair; the reorder layout has a one-token
+    // kernel only. GGML_SYCL_MOE_MMVQ_MAX_TOKENS=1 restores the grouped path for every batch of 2+ tokens.
+    static const int max_tokens = std::max(1, ggml_sycl_get_env("GGML_SYCL_MOE_MMVQ_MAX_TOKENS", 8));
+    if (ne12 < 1 || ne12 > max_tokens) return false;
+    // only the types measured faster this way than in the grouped GEMMs (Arc Pro B70, 2304 x 2304 / 1152 experts, 8
+    // of 128, 2-8 tokens); NVFP4 has its own few-token GEMV
+    if (ne12 > 1) {
+        switch (src0->type) {
+            case GGML_TYPE_IQ1_S:
+            case GGML_TYPE_IQ2_XXS:
+            case GGML_TYPE_IQ2_XS:
+            case GGML_TYPE_IQ2_S:
+            case GGML_TYPE_IQ3_XXS:
+            case GGML_TYPE_IQ3_S:
+            case GGML_TYPE_Q2_0:
+                break;
+            case GGML_TYPE_IQ4_NL:
+                // the grouped GEMM adds ~33 us per token against ~43 here (K 1152): it wins from ~5 tokens
+                if (ne12 > 4) return false;
+                break;
+            default:
+                return false;
+        }
+    }
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
     if (ne10 != src0->ne[0] || ne10 % QK8_1 != 0) return false;
     if (!ggml_is_contiguous(src1)) return false;
 
     const int64_t n_ids_per_group = ids->ne[0];
     if (ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t)) return false;
-    if (ids->ne[1] != 1) return false;
+    if (ids->ne[1] != ne12 || ids->nb[1] % sizeof(int32_t) != 0) return false;
     if (ne11 != 1 && ne11 != n_ids_per_group) return false;
+    if (dst->ne[1] != n_ids_per_group || dst->ne[2] != ne12) return false;
 
     return true;
 }
@@ -5943,6 +5967,7 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
 
     const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
     const int64_t n_ids_per_group = ids->ne[0];
     const queue_ptr stream           = ctx.stream();
     const int       src1_padded_cols = GGML_PAD((int) ne10, MATRIX_ROW_PADDING);
@@ -5956,21 +5981,29 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
         static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
     const bool use_reorder = src0_extra && src0_extra->optimized_feature.reorder;
 
+    // src1 is contiguous: its ne11 * ne12 rows quantize in order, token after token
     ggml_sycl_pool_alloc<char> src1_q8_alloc(ctx.pool(),
-        (size_t) ne11 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
+        (size_t) ne11 * ne12 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
     char * src1_ddq = src1_q8_alloc.get();
     if (use_reorder) {
+        GGML_ASSERT(ne12 == 1);
         quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
             (const float *) src1->data, src1_ddq, (int) ne10, (int) ne11,
             src1_padded_cols, stream);
     } else {
         quantize_row_q8_1_sycl<quantize_q8_1>(
-            (const float *) src1->data, src1_ddq, (int) ne10, (int) ne11,
+            (const float *) src1->data, src1_ddq, (int) ne10, (int) (ne11 * ne12),
             src1_padded_cols, stream);
     }
 
     const size_t bytes_per_qrow = (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
     const size_t src1_row_stride = (ne11 == 1) ? 0 : bytes_per_qrow;
+
+    ggml_sycl_moe_tokens tok;
+    tok.n_tokens          = (int) ne12;
+    tok.ids_token_stride  = ids->nb[1] / sizeof(int32_t);
+    tok.src1_token_stride = (size_t) ne11 * bytes_per_qrow;
+    tok.dst_token_stride  = dst->nb[2];
 
     if (use_reorder) {
         return ggml_sycl_mul_mat_vec_q_id_reorder(
@@ -5985,7 +6018,7 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
         (float *) dst->data, (int) ne10, nrows, n_experts_used,
         /*expert_weight_stride=*/ src0->nb[2],
         /*dst_row_stride=*/ dst->nb[1],
-        src1_row_stride, stream);
+        src1_row_stride, stream, tok);
 }
 
 // counting sort of the routed rows by expert id (row_id_i, as chosen by the router):
@@ -7485,10 +7518,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         return;
     }
 
-    if (ne12 == 1) {
-        if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
-            return;
-        }
+    if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
+        return;
     }
     GGML_ASSERT(!ggml_sycl_mul_mat_id_should_use_mmvq(dst));
 
