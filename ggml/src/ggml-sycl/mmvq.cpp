@@ -2754,7 +2754,10 @@ static void launch_mul_mat_vec_q_moe(
 // NVFP4 MoE expert GEMV on f32 activations, in the stored block layout. Layout of the work after the NVFP4 expert
 // GEMV of trellis-serve (xpu/csrc/inkling2_ops.sycl, MIT): a lane owns one 16 value sub-block per step and a sub-group
 // keeps RP rows in flight. The codes are decoded with integer ops into fp16, an SLM table was slower.
-// Every (token, slot) pair is its own GEMV: with few tokens the experts rarely repeat, so sharing loads buys little.
+// Every (token, slot) pair is its own GEMV. A served 8-token verify batch has ~30 distinct experts in its 64 routes, but
+// a route costs its loads and code decode even right after another route read the same rows (the kernel is not
+// bandwidth-bound there): a variant whose first route on an expert decoded each row once for all routes on it lost to
+// this kernel up to 4 tokens and to the grouped XMX kernel above 4 (2026-11-27).
 
 // two E2M1 codes of q, at bits K and K + 16, as an fp16 pair: magnitude at bit 9 and sign at bit 15 of an fp16 is the
 // value times 2^-14 (subnormals too)
@@ -2819,12 +2822,13 @@ static void mul_mat_vec_nvfp4_id_f32(const uint8_t * __restrict__ vx_base, const
     static_assert(!SITU || RP == 2, "the SiTU epilogue pairs a gate and an up row");
     const auto sg     = item.get_sub_group();
     const int  lane   = sg.get_local_linear_id();
-    const int  token  = item.get_group(1) / args.n_ids;
-    const int  slot   = item.get_group(1) % args.n_ids;
+    // the routes are the fastest grid dimension, the blocks of rows the next: 1-8% faster from 2 to 8 tokens
+    const int  token  = item.get_group(2) / args.n_ids;
+    const int  slot   = item.get_group(2) % args.n_ids;
     const int  i02    = ids_base[(size_t) token * args.ids_token_stride + slot];
     const int  nrows  = args.nrows;
     const int  n_out  = SITU ? nrows / 2 : nrows;
-    const int  n0     = (item.get_group(2) * NSG + sg.get_group_linear_id()) * (SITU ? 1 : RP);
+    const int  n0     = (item.get_group(1) * NSG + sg.get_group_linear_id()) * (SITU ? 1 : RP);
 
     float * dst = (float *) (dst_base + (size_t) token * args.dst_token_stride + (size_t) slot * args.dst_row_stride);
     if (n0 >= n_out) {
@@ -2930,7 +2934,7 @@ void ggml_sycl_mul_mat_vec_nvfp4_id_f32(const void * vx_base, const float * y, c
     const sycl::range<3> block_dims(1, 1, NSG * WARP_SIZE);
     const int rows_per_wg = ep.situ_enabled ? NSG : NSG * RP;
     const int n_out       = ep.situ_enabled ? args.nrows / 2 : args.nrows;
-    const sycl::range<3> block_nums(1, (unsigned) (args.n_tokens * args.n_ids), (unsigned) ((n_out + rows_per_wg - 1) / rows_per_wg));
+    const sycl::range<3> block_nums(1, (unsigned) ((n_out + rows_per_wg - 1) / rows_per_wg), (unsigned) (args.n_tokens * args.n_ids));
     if (ep.situ_enabled) {
         stream->parallel_for(
             sycl::nd_range<3>(block_nums * block_dims, block_dims),

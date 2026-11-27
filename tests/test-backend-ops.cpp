@@ -35,6 +35,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <regex>
 #include <set>
@@ -7258,6 +7259,81 @@ struct test_mul_mat_id_dup : public test_mul_mat_id {
 };
 
 // FP4 W4A8 path on the MoE path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
+// an expert FFN as build_moe_ffn builds it for Inkling 2: the gate_up MUL_MAT_ID on one input row per token with the
+// per-expert scale (RESHAPE, REPEAT, GET_ROWS, MUL) and the SiTU activation, then the down MUL_MAT_ID with its scale.
+// route: 0 every token on the same experts, 1 all routes on distinct experts, 2 top-k from a pool of 32 (about the
+// share of repeated experts of a served verify batch), 3 every route on one of two experts (repeats within a token and
+// more routes on an expert than one work-group takes)
+struct test_moe_ffn_route : public test_case {
+    const ggml_type type;
+    const int64_t   k, n_ff, n_expert, n_used, n_tok;
+    const int       route;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MOE_FFN_ROUTE"; }
+    std::string vars() override { return VARS_TO_STR7(type, k, n_ff, n_expert, n_used, n_tok, route); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_moe_ffn_route(ggml_type type, int64_t k, int64_t n_ff, int64_t n_expert, int64_t n_used, int64_t n_tok, int route)
+        : type(type), k(k), n_ff(n_ff), n_expert(n_expert), n_used(n_used), n_tok(n_tok), route(route) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n_tok);
+        ggml_set_name(x, "x");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tok);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * w_gu = ggml_new_tensor_3d(ctx, type, k, 2*n_ff, n_expert);
+        ggml_tensor * s_gu = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+        ggml_tensor * w_d  = ggml_new_tensor_3d(ctx, type, n_ff, k, n_expert);
+        ggml_tensor * s_d  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+        ggml_set_name(s_gu, "s_gu");
+        ggml_set_name(s_d, "s_d");
+
+        const auto scaled = [&](ggml_tensor * mm, ggml_tensor * ws) {
+            ggml_prec_set_acc(mm, GGML_PREC_BF16);
+            ggml_tensor * s = ggml_reshape_3d(ctx, ws, 1, n_expert, 1);
+            s = ggml_repeat_4d(ctx, s, 1, n_expert, n_tok, 1);
+            s = ggml_get_rows(ctx, s, ids);
+            return ggml_mul(ctx, mm, s);
+        };
+        ggml_tensor * gate_up = scaled(ggml_mul_mat_id(ctx, w_gu, x, ids), s_gu);
+        ggml_tensor * gate = ggml_view_3d(ctx, gate_up, n_ff, n_used, n_tok, gate_up->nb[1], gate_up->nb[2], 0);
+        ggml_tensor * up   = ggml_view_3d(ctx, gate_up, n_ff, n_used, n_tok, gate_up->nb[1], gate_up->nb[2], n_ff*gate_up->nb[0]);
+        ggml_tensor * act  = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gate, 1.0f/4.0f)), 4.0f);
+        act = ggml_mul(ctx, act, ggml_sigmoid(ctx, gate));
+        up  = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 1.0f/25.0f)), 25.0f);
+        ggml_tensor * cur = ggml_mul(ctx, act, up);
+        ggml_tensor * out = scaled(ggml_mul_mat_id(ctx, w_d, cur, ids), s_d);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                const int64_t pool = std::min<int64_t>(32, n_expert);
+                for (int64_t j = 0; j < n_tok; ++j) {
+                    std::vector<int32_t> cand(pool);
+                    std::iota(cand.begin(), cand.end(), 0);
+                    std::shuffle(cand.begin(), cand.end(), rng);
+                    for (int64_t i = 0; i < n_used; ++i) {
+                        data[j*n_used + i] = route == 0 ? (int32_t) ((i*5 + 3) % n_expert) :
+                                             route == 1 ? (int32_t) ((j*n_used + i) % n_expert) :
+                                             route == 2 ? cand[i] : (int32_t) ((i + j) % 2);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "s_gu") == 0 || strcmp(t->name, "s_d") == 0) {
+                init_tensor_uniform(t, 0.5f, 2.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
     test_mul_mat_id_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
@@ -16091,6 +16167,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_concat_mul_mat(100, 37, 23, 41));
     // the SiTU of a gate_up with a per-slot scale: Inkling 2 Mini's prompt shape, a ragged one, another beta / lb
     test_cases.emplace_back(new test_moe_situ(1152, 8, 64));
+    // the NVFP4 expert GEMV of few tokens with repeated experts (fused scale and SiTU, then down), and skipped slots
+    for (int route : { 0, 1, 2, 3 }) {
+        for (int n : { 1, 2, 3, 5, 8 }) {
+            test_cases.emplace_back(new test_moe_ffn_route(GGML_TYPE_NVFP4, 256, 128, 16, 4, n, route));
+        }
+    }
+    test_cases.emplace_back(new test_moe_ffn_route(GGML_TYPE_NVFP4, 2304, 1152, 128, 8, 8, 2));
+    for (int n : { 2, 3, 8 }) {
+        for (bool bcast : { false, true }) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 16, 4, bcast, 96, n, 256, 0, false, true));
+        }
+    }
     test_cases.emplace_back(new test_moe_situ(67, 3, 37));
     test_cases.emplace_back(new test_moe_situ(256, 8, 5, 2.0f, 10.0f));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
