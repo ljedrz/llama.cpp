@@ -1422,6 +1422,47 @@ static bool fg_grouped_device_run(ggml_type src0_type, bool reordered, const voi
         typename S::tsb * packed = packed_b.get();
         using E = typename S::EB;
         constexpr int V = S::VNNI;
+        // B packing. A lane takes one column (route row) and KQB k pairs: it reads KQB * V consecutive floats of
+        // its row, and per k pair the 16 lanes of a sub-group (consecutive columns of one tile) write 16
+        // consecutive packed pairs, so both sides are contiguous (one pair per lane, columns fastest, read 8
+        // bytes from 16 rows per step). Tiles the schedule left empty are not written: the GEMMs skip them.
+        constexpr int KQB = 16;
+        if ((K / V) % KQB == 0 && S::BN % 16 == 0) {
+            const size_t nkb = (size_t) (K / V) / KQB;
+            stream->parallel_for(sycl::nd_range<1>((size_t) Npad * nkb, 16), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                const size_t idx = it.get_global_id(0);
+                const int    kb  = (int) (idx / Npad);
+                const int    n   = (int) (idx - (size_t) kb * Npad);
+                const ggml_sycl_grouped_gemm_tile tile = tile_ptr[n / S::BN];
+                if (tile.n1 <= tile.n0) {
+                    return;
+                }
+                const int row = tile.n0 + n % S::BN;
+                typename S::tsb vals[KQB * V];
+                if (row < tile.n1) {
+                    const mmid_row_mapping mapping = src1.map[row];
+                    const float * in = (const float *) (src1.base + (mapping.i1 % src1.ne1) * src1.nb1 + mapping.i2 * src1.nb2) +
+                                       (size_t) V * KQB * kb;
+#pragma unroll
+                    for (int e = 0; e < KQB * V; ++e) {
+                        vals[e] = E::cvt(in[e]);
+                    }
+                } else {
+#pragma unroll
+                    for (int e = 0; e < KQB * V; ++e) {
+                        vals[e] = typename S::tsb(0.0f);
+                    }
+                }
+#pragma unroll
+                for (int q = 0; q < KQB; ++q) {
+                    typename S::tsb * out = packed + ((size_t) (kb * KQB + q) * Npad + n) * V;
+#pragma unroll
+                    for (int v = 0; v < V; ++v) {
+                        out[v] = vals[q * V + v];
+                    }
+                }
+            });
+        } else
         stream->parallel_for(sycl::range<1>((size_t) Npad * (K / V)), [=](sycl::id<1> id) {
             const size_t idx = id[0];
             const int kq = idx / Npad;
