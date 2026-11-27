@@ -1640,45 +1640,28 @@ vec_dot_iq2_s_q8_1(const void *__restrict__ vbq,
 
     const int ib32 = iqs;
     const int8_t  * q8 = bq8_1[ib32].qs;
-    const uint8_t * signs = bq2->qs + QK_K/8 + 4*ib32;
-    const uint8_t ls1 = bq2->scales[ib32] & 0xf;
-    const uint8_t ls2 = bq2->scales[ib32] >>  4;
-    int sumi1 = 0;
-    for (int l = 0; l < 2; ++l) {
-        const uint32_t * grid = (const uint32_t *)(iq2s_grid + (bq2->qs[4*ib32+l] | ((bq2->qh[ib32] << (8-2*l)) & 0x300)));
-        const uint32_t signs0 = dpct::vectorized_binary<sycl::uchar4>(
-            ((signs[l] & 0xf) * 0x01010101) & 0x08040201, 0x08040201,
-            std::equal_to<>());
-        const uint32_t signs1 = dpct::vectorized_binary<sycl::uchar4>(
-            ((signs[l] >> 4) * 0x01010101) & 0x08040201, 0x08040201,
-            std::equal_to<>());
-        const int grid_l = dpct::vectorized_binary<sycl::uchar4>(
-            grid[0] ^ signs0, signs0, std::minus<>());
-        const int grid_h = dpct::vectorized_binary<sycl::uchar4>(
-            grid[1] ^ signs1, signs1, std::minus<>());
-        sumi1 = dpct::dp4a(grid_l, *((const int *)q8 + 0), sumi1);
-        sumi1 = dpct::dp4a(grid_h, *((const int *)q8 + 1), sumi1);
-        q8 += 8;
-    }
-    int sumi2 = 0;
-    for (int l = 2; l < 4; ++l) {
-        const uint32_t * grid = (const uint32_t *)(iq2s_grid + (bq2->qs[4*ib32+l] | ((bq2->qh[ib32] << (8-2*l)) & 0x300)));
-        const uint32_t signs0 = dpct::vectorized_binary<sycl::uchar4>(
-            ((signs[l] & 0xf) * 0x01010101) & 0x08040201, 0x08040201,
-            std::equal_to<>());
-        const uint32_t signs1 = dpct::vectorized_binary<sycl::uchar4>(
-            ((signs[l] >> 4) * 0x01010101) & 0x08040201, 0x08040201,
-            std::equal_to<>());
-        const int grid_l = dpct::vectorized_binary<sycl::uchar4>(
-            grid[0] ^ signs0, signs0, std::minus<>());
-        const int grid_h = dpct::vectorized_binary<sycl::uchar4>(
-            grid[1] ^ signs1, signs1, std::minus<>());
-        sumi2 = dpct::dp4a(grid_l, *((const int *)q8 + 0), sumi2);
-        sumi2 = dpct::dp4a(grid_h, *((const int *)q8 + 1), sumi2);
-        q8 += 8;
+    // the low bytes of the 4 grid indices and the 4 sign bytes of the group as halfwords (qs is 2-byte aligned after
+    // the fp16 d), the high bits and the scales read once: 6 loads instead of 14
+    const uint16_t * q16 = (const uint16_t *)(bq2->qs + 4*ib32);
+    const uint32_t idx = (uint32_t) q16[0] | ((uint32_t) q16[1] << 16);
+    const uint16_t * s16 = (const uint16_t *)(bq2->qs + QK_K/8 + 4*ib32);
+    const uint32_t signs = (uint32_t) s16[0] | ((uint32_t) s16[1] << 16);
+    const uint32_t qh = bq2->qh[ib32];
+    const uint32_t sc = bq2->scales[ib32];
+    int sumi[2] = { 0, 0 };
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint32_t * grid = (const uint32_t *)(iq2s_grid + (((idx >> (8*l)) & 255) | ((qh << (8-2*l)) & 0x300)));
+        // sign bit j of each half as the mask of its byte j; a grid byte is never 0, so negating one carries nothing over
+        const uint32_t signs0 = iq_sign_mask(signs >> (8*l));
+        const uint32_t signs1 = iq_sign_mask(signs >> (8*l + 4));
+        const int grid_l = (int) ((grid[0] ^ signs0) + (signs0 & 0x01010101u));
+        const int grid_h = (int) ((grid[1] ^ signs1) + (signs1 & 0x01010101u));
+        sumi[l >> 1] = dpct::dp4a(grid_l, get_int_from_int8_aligned(q8, 2*l + 0), sumi[l >> 1]);
+        sumi[l >> 1] = dpct::dp4a(grid_h, get_int_from_int8_aligned(q8, 2*l + 1), sumi[l >> 1]);
     }
     const float d = (float)bq2->d * bq8_1[ib32].ds[0] * 0.25f;
-    return d * ((0.5f + ls1) * sumi1 + (0.5f + ls2) * sumi2);
+    return d * ((0.5f + (sc & 0xf)) * sumi[0] + (0.5f + (sc >> 4)) * sumi[1]);
 #else
     assert(false);
 #endif
@@ -1696,23 +1679,26 @@ vec_dot_iq3_xxs_q8_1(const void *__restrict__ vbq,
     const block_iq3_xxs * bq2 = (const block_iq3_xxs *) vbq;
 
     const int ib32 = iqs;
-    const uint8_t  * q3 = bq2->qs + 8*ib32;
+    // the 8 grid indices of the group as 4 halfwords (qs follows the fp16 d, so it is 2-byte aligned): 4 loads
+    // instead of 8 byte loads
+    const uint16_t * q3 = (const uint16_t *)(bq2->qs + 8*ib32);
+    const uint32_t idx[2] = { (uint32_t) q3[0] | ((uint32_t) q3[1] << 16), (uint32_t) q3[2] | ((uint32_t) q3[3] << 16) };
     const uint16_t * gas = (const uint16_t *)(bq2->qs + QK_K/4) + 2*ib32;
     const int8_t   * q8 = bq8_1[ib32].qs;
     uint32_t aux32 = gas[0] | (gas[1] << 16);
     int sumi = 0;
 #pragma unroll
     for (int l = 0; l < 4; ++l) {
-        const uint32_t grid1 = iq3xxs_grid[q3[2*l+0]];
-        const uint32_t grid2 = iq3xxs_grid[q3[2*l+1]];
+        const uint32_t ix = idx[l >> 1] >> (16 * (l & 1));
+        const uint32_t grid1 = iq3xxs_grid[ix & 255];
+        const uint32_t grid2 = iq3xxs_grid[(ix >> 8) & 255];
         const uint32_t sign_bits = iq_sign_bits(aux32);
         const uint32_t signs0 = iq_sign_mask(sign_bits);
         const uint32_t signs1 = iq_sign_mask(sign_bits >> 4);
         const int grid_l = (grid1 ^ signs0) + (signs0 & 0x01010101);
         const int grid_h = (grid2 ^ signs1) + (signs1 & 0x01010101);
-        sumi = dpct::dp4a(grid_l, *((const int *)q8 + 0), sumi);
-        sumi = dpct::dp4a(grid_h, *((const int *)q8 + 1), sumi);
-        q8 += 8;
+        sumi = dpct::dp4a(grid_l, get_int_from_int8_aligned(q8, 2*l + 0), sumi);
+        sumi = dpct::dp4a(grid_h, get_int_from_int8_aligned(q8, 2*l + 1), sumi);
         aux32 >>= 7;
     }
     const float d = (float)bq2->d * (0.5f + aux32) * bq8_1[ib32].ds[0] * 0.5f;
@@ -1781,20 +1767,27 @@ vec_dot_iq3_s_q8_1(const void *__restrict__ vbq,
     const block_iq3_s * bq2 = (const block_iq3_s *) vbq;
 
     const int ib32 = iqs;
-    const uint8_t  * qs = bq2->qs + 8*ib32;
+    // the low bytes of the 8 grid indices and the 4 sign bytes of the group as halfwords (qs and signs are 2-byte
+    // aligned after the fp16 d), the high bits read once: 7 loads instead of 16
+    const uint16_t * qs = (const uint16_t *)(bq2->qs + 8*ib32);
+    const uint32_t idx[2] = { (uint32_t) qs[0] | ((uint32_t) qs[1] << 16), (uint32_t) qs[2] | ((uint32_t) qs[3] << 16) };
+    const uint16_t * s16 = (const uint16_t *)(bq2->signs + 4*ib32);
+    const uint32_t signs_all = (uint32_t) s16[0] | ((uint32_t) s16[1] << 16);
+    const uint32_t qh = bq2->qh[ib32];
     const int8_t   * q8 = bq8_1[ib32].qs;
     int sumi = 0;
+#pragma unroll
     for (int l = 0; l < 4; ++l) {
-        const uint32_t grid1 = iq3s_grid[qs[2*l+0] | ((bq2->qh[ib32] << (8 - 2*l)) & 256)];
-        const uint32_t grid2 = iq3s_grid[qs[2*l+1] | ((bq2->qh[ib32] << (7 - 2*l)) & 256)];
-        const uint32_t signs = bq2->signs[4 * ib32 + l];
+        const uint32_t ix = idx[l >> 1] >> (16 * (l & 1));
+        const uint32_t grid1 = iq3s_grid[(ix & 255) | ((qh << (8 - 2*l)) & 256)];
+        const uint32_t grid2 = iq3s_grid[((ix >> 8) & 255) | ((qh << (7 - 2*l)) & 256)];
+        const uint32_t signs = (signs_all >> (8 * l)) & 255;
         const uint32_t signs0 = iq_sign_mask(signs);
         const uint32_t signs1 = iq_sign_mask(signs >> 4);
         const int grid_l = (grid1 ^ signs0) + (signs0 & 0x01010101);
         const int grid_h = (grid2 ^ signs1) + (signs1 & 0x01010101);
-        sumi = dpct::dp4a(grid_l, *((const int *)q8 + 0), sumi);
-        sumi = dpct::dp4a(grid_h, *((const int *)q8 + 1), sumi);
-        q8 += 8;
+        sumi = dpct::dp4a(grid_l, get_int_from_int8_aligned(q8, 2*l + 0), sumi);
+        sumi = dpct::dp4a(grid_h, get_int_from_int8_aligned(q8, 2*l + 1), sumi);
     }
     const float d =
         (float)bq2->d *
@@ -1862,16 +1855,21 @@ vec_dot_iq1_s_q8_1(const void *__restrict__ vbq,
     const int ib32 = iqs;
     int sumi = 0;
     const int * q8 = (const int *)bq8_1[ib32].qs;
+    // the low bytes of the 4 grid indices as halfwords (qs is 2-byte aligned after the fp16 d), qh read once
+    const uint16_t * q16 = (const uint16_t *)(bq1->qs + 4*ib32);
+    const uint32_t idx = (uint32_t) q16[0] | ((uint32_t) q16[1] << 16);
+    const uint32_t qh = bq1->qh[ib32];
+#pragma unroll
     for (int l = 0; l < 4; ++l) {
-        const int * grid = (const int *)(iq1s_grid_gpu + (bq1->qs[4*ib32+l] | (((bq1->qh[ib32] >> 3*l) & 7) << 8)));
-        int grid0 = grid[0] & 0x0f0f0f0f;
-        int grid1 = (grid[0] >> 4) & 0x0f0f0f0f;
+        const int grid = (int) iq1s_grid_gpu[((idx >> (8*l)) & 255) | (((qh >> 3*l) & 7) << 8)];
+        int grid0 = grid & 0x0f0f0f0f;
+        int grid1 = (grid >> 4) & 0x0f0f0f0f;
         sumi = dpct::dp4a(q8[2 * l + 1], grid1,
                           dpct::dp4a(q8[2 * l + 0], grid0, sumi));
     }
 
-    const float delta = bq1->qh[ib32] & 0x8000 ? -1-IQ1S_DELTA : -1+IQ1S_DELTA;
-    const float d1q = (float)bq1->d * (2*((bq1->qh[ib32] >> 12) & 7) + 1);
+    const float delta = qh & 0x8000 ? -1-IQ1S_DELTA : -1+IQ1S_DELTA;
+    const float d1q = (float)bq1->d * (2*((qh >> 12) & 7) + 1);
     const float d = d1q * bq8_1[ib32].ds[0];
     const float m = d1q * bq8_1[ib32].ds[1];
     return d * sumi + m * delta;

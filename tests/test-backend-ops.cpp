@@ -16174,6 +16174,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_moe_ffn_route(GGML_TYPE_NVFP4, 2304, 1152, 128, 8, 8, 2));
+    // the grid IQ / IQ4_NL / Q2_0 experts of the GSQ-RCO Inkling 2 Mini quants: gate_up (K 2304) and down (K 1152) at
+    // decode and verify sizes
+    for (ggml_type type_a : { GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
+                              GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S }) {
+        for (int n : { 1, 2, 3, 8 }) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 8, true, 2304, n, 2304));
+        }
+    }
+    for (ggml_type type_a : { GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0 }) {
+        for (int n : { 1, 2, 3, 8 }) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 8, false, 2304, n, 1152));
+        }
+    }
     for (int n : { 2, 3, 8 }) {
         for (bool bcast : { false, true }) {
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 16, 4, bcast, 96, n, 256, 0, false, true));
@@ -16704,6 +16717,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+
+    // Inkling 2 Mini GSQ-RCO quants: grid IQ gate_up experts (K 2304) and IQ4_NL / Q2_0 down experts (K 1152), 8 of 128,
+    // decode and verify sizes
+    for (int bs : {1, 3, 8}) {
+        for (ggml_type type_a : {GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, true, 2304, bs, 2304));
+        }
+        for (ggml_type type_a : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 2304, bs, 1152));
+        }
+    }
 
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
