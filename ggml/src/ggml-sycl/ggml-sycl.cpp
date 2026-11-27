@@ -6584,25 +6584,38 @@ static int ggml_sycl_fuse_conv_step(ggml_backend_sycl_context & ctx, ggml_cgraph
     return 0;
 }
 
-// The SiTU activation of build_moe_ffn after a merged gate_up with a per-slot scale, at the MUL of node i:
-//   MUL(gate_up [2*n_ff, n_slot, n_tok], scale [1, n_slot, n_tok]), VIEW gate, SCALE, TANH, SCALE, SIGMOID(gate), MUL,
+// The SiTU activation of build_moe_ffn after a merged gate_up, as one kernel:
+//   [MUL(gate_up [2*n_ff, n_slot, n_tok], scale [1, n_slot, n_tok]),] VIEW gate, SCALE, TANH, SCALE, SIGMOID(gate), MUL,
 //   VIEW up, SCALE, TANH, SCALE, MUL
-// as one kernel: out = s1*tanh(s0*g)*sigmoid(g) * s3*tanh(s2*u) of the scaled gate g and up u. Prompt batches take it; a
-// few tokens fuse the whole chain into the NVFP4 MoE GEMV (ggml_sycl_fuse_nvfp4_moe) before this sees the MUL.
-// Returns the number of nodes after i it took, 0 when the pattern does not match.
+// out = s1*tanh(s0*g)*sigmoid(g) * s3*tanh(s2*u) of the (scaled) gate g and up u. Experts with a per-slot scale (NVFP4)
+// match at the MUL; without one (e.g. IQ experts) the chain starts at the VIEW of the gate half and matches at the SCALE
+// after it, since views are not visited. Prompt batches take it; NVFP4 few-token batches fuse the whole chain into the
+// NVFP4 MoE GEMV (ggml_sycl_fuse_nvfp4_moe) before this sees the MUL.
+// Returns the number of nodes after i it ran, 0 when the pattern does not match.
 static int ggml_sycl_fuse_moe_situ(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
-    constexpr int  n_ops = 12;
-    static const ggml_op ops[n_ops] = { GGML_OP_MUL,  GGML_OP_VIEW,  GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY,
-                                        GGML_OP_MUL,  GGML_OP_VIEW,  GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
-    ggml_tensor * mul = cgraph->nodes[i];
-    if (!g_ggml_sycl_enable_fusion || mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 || i + n_ops > cgraph->n_nodes) {
+    static const ggml_op ops_scaled[12]   = { GGML_OP_MUL,  GGML_OP_VIEW,  GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY,
+                                              GGML_OP_MUL,  GGML_OP_VIEW,  GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
+    static const ggml_op ops_unscaled[11] = { GGML_OP_VIEW,  GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY,
+                                              GGML_OP_MUL,  GGML_OP_VIEW,  GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
+    if (!g_ggml_sycl_enable_fusion) {
         return 0;
     }
-    const ggml_tensor * gu = mul->src[0];
-    const ggml_tensor * sc = mul->src[1];
-    if (gu->type != GGML_TYPE_F32 || sc->type != GGML_TYPE_F32 || gu->nb[0] != sizeof(float) || sc->ne[0] != 1 ||
-        sc->ne[1] != gu->ne[1] || sc->ne[2] != gu->ne[2] || gu->ne[3] != 1 || sc->ne[3] != 1 || gu->ne[0] % 2 ||
-        !ggml_are_same_shape(mul, gu)) {
+    const bool scaled = cgraph->nodes[i]->op == GGML_OP_MUL;
+    const int       first = scaled ? i : i - 1;  // the first node of the chain
+    const int       n_ops = scaled ? 12 : 11;
+    if (first + n_ops > cgraph->n_nodes) {
+        return 0;
+    }
+    // base: the tensor the two halves view; gu: the gate_up rows; sc: the per-slot scale or none
+    const ggml_tensor * base = scaled ? cgraph->nodes[i] : cgraph->nodes[i - 1]->src[0];
+    const ggml_tensor * gu   = scaled ? base->src[0] : base;
+    const ggml_tensor * sc   = scaled ? base->src[1] : nullptr;
+    if (base == nullptr || base->type != GGML_TYPE_F32 || gu->type != GGML_TYPE_F32 || gu->nb[0] != sizeof(float) ||
+        gu->ne[3] != 1 || gu->ne[0] % 2 || !ggml_are_same_shape(base, gu)) {
+        return 0;
+    }
+    if (sc && (sc->type != GGML_TYPE_F32 || sc->ne[0] != 1 || sc->ne[1] != gu->ne[1] || sc->ne[2] != gu->ne[2] ||
+               sc->ne[3] != 1)) {
         return 0;
     }
     const auto is_unary = [](const ggml_tensor * t, ggml_unary_op op) {
@@ -6616,14 +6629,14 @@ static int ggml_sycl_fuse_moe_situ(ggml_backend_sycl_context & ctx, ggml_cgraph 
         scale = ggml_get_op_params_f32(t, 0);
         return true;
     };
-    // a half of the rows of mul with its strides
+    // a half of the rows of base with its strides
     const auto is_half = [&](const ggml_tensor * t, int half) {
-        return t->op == GGML_OP_VIEW && t->src[0] == mul && t->ne[0] * 2 == mul->ne[0] && t->ne[1] == mul->ne[1] &&
-               t->ne[2] == mul->ne[2] && t->nb[1] == mul->nb[1] && t->nb[2] == mul->nb[2] &&
+        return t->op == GGML_OP_VIEW && t->src[0] == base && t->ne[0] * 2 == base->ne[0] && t->ne[1] == base->ne[1] &&
+               t->ne[2] == base->ne[2] && t->nb[1] == base->nb[1] && t->nb[2] == base->nb[2] &&
                t->view_offs == (size_t) half * t->ne[0] * sizeof(float);
     };
     float          s[4];
-    ggml_tensor ** n = cgraph->nodes + i + 1;
+    ggml_tensor ** n = cgraph->nodes + first + (scaled ? 1 : 0);
     if (!(is_half(n[0], 0) && is_scale(n[1], n[0], s[0]) && is_unary(n[2], GGML_UNARY_OP_TANH) && n[2]->src[0] == n[1] &&
           is_scale(n[3], n[2], s[1]) && is_unary(n[4], GGML_UNARY_OP_SIGMOID) && n[4]->src[0] == n[0] &&
           n[5]->op == GGML_OP_MUL && n[5]->src[0] == n[3] && n[5]->src[1] == n[4] && is_half(n[6], 1) &&
@@ -6632,21 +6645,38 @@ static int ggml_sycl_fuse_moe_situ(ggml_backend_sycl_context & ctx, ggml_cgraph 
         return 0;
     }
     ggml_tensor * out     = n[10];
-    const int     out_idx = i + n_ops - 1;
-    if (out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) ||
-        !ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, &out_idx, 1)) {
+    const int     out_idx = first + n_ops - 1;
+    if (out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out)) {
         return 0;
     }
-    // an output element reads the gate and the up rows of its (slot, token): out may not overlap the inputs
-    if (ggml_sycl_overlap(out, gu) || ggml_sycl_overlap(out, sc)) {
-        return 0;
+    if (scaled) {
+        if (!ggml_can_fuse_subgraph(cgraph, first, n_ops, ops_scaled, &out_idx, 1)) {
+            return 0;
+        }
+    } else {
+        // the two views of gate_up are left out: they compute nothing and gate_up is not written, but the check
+        // takes a view of a tensor outside the subgraph (here the MUL_MAT_ID output) as not elidable
+        static const ggml_op ops_nv[9] = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
+                                           GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL };
+        int idxs[9];
+        for (int k = 0, j = 0; k < n_ops; ++k) {
+            if (ops_unscaled[k] != GGML_OP_VIEW) {
+                idxs[j++] = first + k;
+            }
+        }
+        if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, 9, ops_nv, &out_idx, 1)) {
+            return 0;
+        }
     }
-
+    // an output element reads the gate and the up rows of its (slot, token), further on in gu: where the allocator put
+    // out over gu (gu dies at the up half's SCALE, before out is written), the kernel writes a scratch copy first
+    const bool    in_place = ggml_sycl_overlap(out, gu) || (sc && ggml_sycl_overlap(out, sc));
+    ggml_sycl_pool_alloc<float> scratch(ctx.pool());
     const char *  gu_d  = (const char *) gu->data;
-    const char *  sc_d  = (const char *) sc->data;
-    float *       dst   = (float *) out->data;
+    const char *  sc_d  = sc ? (const char *) sc->data : nullptr;
+    float *       dst   = in_place ? scratch.alloc(ggml_nelements(out)) : (float *) out->data;
     const int64_t n_ff  = out->ne[0], n_slot = out->ne[1];
-    const size_t  gnb1  = gu->nb[1], gnb2 = gu->nb[2], snb1 = sc->nb[1], snb2 = sc->nb[2];
+    const size_t  gnb1  = gu->nb[1], gnb2 = gu->nb[2], snb1 = sc ? sc->nb[1] : 0, snb2 = sc ? sc->nb[2] : 0;
     const int64_t nel   = ggml_nelements(out);
     const float   s0 = s[0], s1 = s[1], s2 = s[2], s3 = s[3];
     const int     wg    = 256;
@@ -6661,12 +6691,15 @@ static int ggml_sycl_fuse_moe_situ(ggml_backend_sycl_context & ctx, ggml_cgraph 
         const int64_t st = j / n_ff;
         const int64_t sl = st % n_slot, t = st / n_slot;
         const float * row = (const float *) (gu_d + sl * gnb1 + t * gnb2);
-        const float   w   = *(const float *) (sc_d + sl * snb1 + t * snb2);
+        const float   w   = sc_d ? *(const float *) (sc_d + sl * snb1 + t * snb2) : 1.0f;
         const float   g   = row[r] * w;
         const float   u   = row[r + n_ff] * w;
         dst[j] = s1 * sycl::tanh(s0 * g) / (1.0f + sycl::exp(-g)) * s3 * sycl::tanh(s2 * u);
     });
-    return n_ops - 1;
+    if (in_place) {
+        ctx.stream()->memcpy(out->data, dst, ggml_nbytes(out));
+    }
+    return out_idx - i;
 }
 
 // The MoE output of build_moe_ffn at the MUL of node i: MUL(experts [n_embd, n_slot, n_tok], weights [1, n_slot, n_tok]),
@@ -8564,6 +8597,15 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 ggml_sycl_ssm_conv_window(*sycl_ctx, conv_window);
                 i           = conv_window.last_idx;
                 conv_window = {};
+                continue;
+            }
+        }
+
+        // the SiTU of MoE experts without a per-slot scale starts at a SCALE (the scaled form is matched at its MUL below)
+        if (node->op == GGML_OP_SCALE) {
+            const int skip = ggml_sycl_fuse_moe_situ(*sycl_ctx, cgraph, i);
+            if (skip > 0) {
+                i += skip;
                 continue;
             }
         }

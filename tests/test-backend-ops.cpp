@@ -7272,7 +7272,8 @@ struct test_moe_ffn_route : public test_case {
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MOE_FFN_ROUTE"; }
     std::string vars() override { return VARS_TO_STR7(type, k, n_ff, n_expert, n_used, n_tok, route); }
     bool run_whole_graph() override { return true; }
-    double max_nmse_err() override { return 5e-4; }
+    // the q8_1 activations of the MoE mat-vec against the CPU's put 2-4 bit experts near 5e-4 after the SiTU
+    double max_nmse_err() override { return type == GGML_TYPE_NVFP4 ? 5e-4 : 1e-3; }
 
     test_moe_ffn_route(ggml_type type, int64_t k, int64_t n_ff, int64_t n_expert, int64_t n_used, int64_t n_tok, int route)
         : type(type), k(k), n_ff(n_ff), n_expert(n_expert), n_used(n_used), n_tok(n_tok), route(route) {}
@@ -9734,12 +9735,13 @@ struct test_concat_mul_mat : public test_case {
 struct test_moe_situ : public test_case {
     const int64_t n_ff, n_slot, n_tok;
     const float   beta, lb;
+    const bool    scaled;  // a per-slot scale on gate_up first (NVFP4 experts), or none (e.g. IQ experts)
 
-    test_moe_situ(int64_t n_ff, int64_t n_slot, int64_t n_tok, float beta = 4.0f, float lb = 25.0f)
-        : n_ff(n_ff), n_slot(n_slot), n_tok(n_tok), beta(beta), lb(lb) {}
+    test_moe_situ(int64_t n_ff, int64_t n_slot, int64_t n_tok, float beta = 4.0f, float lb = 25.0f, bool scaled = true)
+        : n_ff(n_ff), n_slot(n_slot), n_tok(n_tok), beta(beta), lb(lb), scaled(scaled) {}
 
     std::string vars() override {
-        return VARS_TO_STR5(n_ff, n_slot, n_tok, beta, lb);
+        return VARS_TO_STR6(n_ff, n_slot, n_tok, beta, lb, scaled);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -9752,9 +9754,12 @@ struct test_moe_situ : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * gate_up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*n_ff, n_slot, n_tok);
         ggml_set_name(gate_up, "gate_up");
-        ggml_tensor * scale = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slot, n_tok);
-        ggml_set_name(scale, "scale");
-        ggml_tensor * gu   = ggml_mul(ctx, gate_up, scale);
+        ggml_tensor * gu = gate_up;
+        if (scaled) {
+            ggml_tensor * scale = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_slot, n_tok);
+            ggml_set_name(scale, "scale");
+            gu = ggml_mul(ctx, gate_up, scale);
+        }
         ggml_tensor * gate = ggml_view_3d(ctx, gu, n_ff, n_slot, n_tok, gu->nb[1], gu->nb[2], 0);
         ggml_tensor * up   = ggml_view_3d(ctx, gu, n_ff, n_slot, n_tok, gu->nb[1], gu->nb[2], n_ff*ggml_element_size(gu));
         ggml_tensor * act  = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gate, 1.0f/beta)), beta);
@@ -16167,6 +16172,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_concat_mul_mat(100, 37, 23, 41));
     // the SiTU of a gate_up with a per-slot scale: Inkling 2 Mini's prompt shape, a ragged one, another beta / lb
     test_cases.emplace_back(new test_moe_situ(1152, 8, 64));
+    // the same without a per-slot scale (experts without one, e.g. the IQ experts of the GSQ-RCO quants), prompt and verify
+    for (int64_t n_tok : { 1, 3, 64 }) {
+        test_cases.emplace_back(new test_moe_situ(1152, 8, n_tok, 4.0f, 25.0f, false));
+    }
     // the NVFP4 expert GEMV of few tokens with repeated experts (fused scale and SiTU, then down), and skipped slots
     for (int route : { 0, 1, 2, 3 }) {
         for (int n : { 1, 2, 3, 5, 8 }) {
