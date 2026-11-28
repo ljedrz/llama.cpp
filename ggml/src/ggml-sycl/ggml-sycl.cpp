@@ -6560,12 +6560,17 @@ static int ggml_sycl_fuse_conv_step(ggml_backend_sycl_context & ctx, ggml_cgraph
         // a write may only alias a read at the same element (out on res or res2, in place)
         // (x is a view of res, written in place through out, when the residual is the conv input itself)
         const bool          x_in_res = res && x->view_src == res && out->data == res->data;
+        // (the CPY store over the cells past reads, the states read in place from the cache: each element maps to
+        // itself and a work-item reads its window before it writes)
+        const bool          st_on_past = a.store == 1 && st->data == past->data && a.st_nb0 == sizeof(float) &&
+                                         a.st_ne0 == a.n_keep * C && past->nb[1] == (size_t) a.n_keep * sizeof(float) &&
+                                         (S == 1 || a.st_nb1 == past->nb[2]);
         const ggml_tensor * reads[]  = { past, conv->src[1] };
         const ggml_tensor * writes[] = { cat, st, out };
         bool                bad      = false;
         for (const ggml_tensor * w : writes) {
             for (const ggml_tensor * r : reads) {
-                bad = bad || ggml_sycl_overlap(w, r);
+                bad = bad || (ggml_sycl_overlap(w, r) && !(w == st && r == past && st_on_past));
             }
             bad = bad || (ggml_sycl_overlap(w, x) && !(w == out && x_in_res));
             bad = bad || (res && ggml_sycl_overlap(w, res) && !(w == out && out->data == res->data));

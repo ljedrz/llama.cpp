@@ -9781,7 +9781,7 @@ struct test_moe_situ : public test_case {
 // SSM_CONV of the concat and its residual chain; backends may run it as one kernel
 struct test_conv_step : public test_case {
     const int64_t C, n, S;
-    const int     store;     // 0: CPY, 1: SET_ROWS
+    const int     store;     // 0: CPY, 1: SET_ROWS, 2: CPY over the cells past reads (states read in place)
     const int     chain;     // 0: none, 1: + res, 2: then SCALE, 3: then + res2
     const bool    cat_used;  // another node reads a window of the concat (the dynamic taps)
 
@@ -9832,6 +9832,10 @@ struct test_conv_step : public test_case {
             ggml_set_name(state, "state");
             ggml_tensor * last = ggml_view_3d(ctx, cat, np, C, S, cat->nb[1], cat->nb[2], n*cat->nb[0]);
             ggml_tensor * cell = ggml_view_2d(ctx, state, np*C, S, state->nb[1], state->nb[1] + C*np*sizeof(float));
+            st_node = ggml_cpy(ctx, last, cell);
+        } else if (store == 2) {
+            ggml_tensor * last = ggml_view_3d(ctx, cat, np, C, S, cat->nb[1], cat->nb[2], n*cat->nb[0]);
+            ggml_tensor * cell = ggml_view_2d(ctx, hist, np*C, S, hist->nb[2], C*hist->nb[1]);
             st_node = ggml_cpy(ctx, last, cell);
         } else {
             const int64_t kw = std::min(n, K);
@@ -16219,7 +16223,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     // conv steps: decode and verify batches, both store forms, the residual chains, a concat read elsewhere
-    for (int store : { 0, 1 }) {
+    for (int store : { 0, 1, 2 }) {
         for (int64_t n : { 1, 2, 3, 5 }) {
             test_cases.emplace_back(new test_conv_step(1024, n, 1, store, 2));
         }
