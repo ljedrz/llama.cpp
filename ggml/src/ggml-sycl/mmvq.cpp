@@ -2734,6 +2734,91 @@ static void mul_mat_vec_q_moe(
     }
 }
 
+// Codebook table of the MoE mat-vec copied to SLM. The IQ4_NL table lookups cost ~40% of the kernel from global memory,
+// ~15% less from SLM. The 1-2 KB grid tables of IQ3_XXS / IQ3_S were slower from SLM (bank conflicts), so they stay.
+template <typename block_q_t> struct moe_slm_table {
+    static constexpr int n_dwords = 0;
+};
+
+template <> struct moe_slm_table<block_iq4_nl> {
+    static constexpr int n_dwords = 4;
+    static __dpct_inline__ void fill(uint32_t * tab, int i) {
+        tab[i] = (uint8_t) kvalues_iq4nl[4 * i] | ((uint8_t) kvalues_iq4nl[4 * i + 1] << 8) | ((uint8_t) kvalues_iq4nl[4 * i + 2] << 16) | ((uint32_t) (uint8_t) kvalues_iq4nl[4 * i + 3] << 24);
+    }
+    static __dpct_inline__ float vec_dot(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int iqs, const uint32_t * tab) {
+        return vec_dot_iq4_nl_q8_1(vbq, bq8_1, iqs, (const uint8_t *) tab);
+    }
+};
+
+// mul_mat_vec_q_moe with the codebook table of the type in SLM
+template <int qk, int qi, typename block_q_t, int vdr>
+static void mul_mat_vec_q_moe_slm(
+    const void * __restrict__ vx_base, const void * __restrict__ vy_base,
+    float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
+    const int ncols, const int nrows,
+    const size_t expert_weight_stride, const size_t dst_row_stride,
+    const size_t src1_row_stride,
+    const int n_experts_used, const ggml_sycl_moe_tokens tok,
+    uint32_t * tab,
+    const sycl::nd_item<3> & item_ct1) {
+    using T = moe_slm_table<block_q_t>;
+    const int lid = item_ct1.get_local_linear_id();
+    for (int i = lid; i < T::n_dwords; i += item_ct1.get_local_range().size()) {
+        T::fill(tab, i);
+    }
+    sycl::group_barrier(item_ct1.get_group());
+
+    const int token      = item_ct1.get_group(1) / n_experts_used;
+    const int expert_idx = item_ct1.get_group(1) % n_experts_used;
+    const int i02        = ids_dev[(size_t) token * tok.ids_token_stride + expert_idx];
+
+    const char * vy = (const char *) vy_base + (size_t) token * tok.src1_token_stride + (size_t) expert_idx * src1_row_stride;
+    float *      dst = (float *) ((char *) dst_base + (size_t) token * tok.dst_token_stride +
+                                  (size_t) expert_idx * dst_row_stride);
+
+    const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+
+    if (row >= nrows) {
+        return;
+    }
+
+    if (i02 == -1) { // skipped slot
+        if (item_ct1.get_local_id(2) == 0) {
+            dst[row] = 0.0f;
+        }
+        return;
+    }
+
+    const char * vx = (const char *) vx_base + (size_t) i02 * expert_weight_stride;
+
+    const int     blocks_per_row  = ncols / qk;
+    constexpr int blocks_per_warp = (vdr * WARP_SIZE + qi - 1) / qi;
+
+    float tmp = 0.0f;
+
+    const block_q_t *  x = (const block_q_t *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    for (int i = item_ct1.get_local_id(2) / (qi / vdr); i < blocks_per_row; i += blocks_per_warp) {
+        const int ibx = row * blocks_per_row + i;
+        const int iby = i * (qk / QK8_1);
+
+        for (size_t elem = 0; elem < qi / vdr; elem += WARP_SIZE) {
+            const int iqs = elem + vdr * (item_ct1.get_local_id(2) % (qi / vdr));
+            tmp += T::vec_dot(&x[ibx], &y[iby], iqs, tab);
+        }
+    }
+
+#pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+        tmp += dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+    }
+
+    if (item_ct1.get_local_id(2) == 0) {
+        dst[row] = tmp;
+    }
+}
+
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>
 static void launch_mul_mat_vec_q_moe(
     const void * vx_base, const void * vy, const int32_t * ids_dev,
@@ -2741,6 +2826,24 @@ static void launch_mul_mat_vec_q_moe(
     const size_t expert_weight_stride, const size_t dst_row_stride,
     const size_t src1_row_stride,
     dpct::queue_ptr stream, const ggml_sycl_moe_tokens & tok) {
+    if constexpr (moe_slm_table<block_q_t>::n_dwords > 0) {
+        // 2 rows per work-group measured best (1 / 2 / 4 / 8 rows: 30.6 / 29.5 / 30.0 / 31.1 us for IQ4_NL at one token)
+        constexpr int        rows = 2;
+        const sycl::range<3> block_nums(1, (unsigned) (n_experts_used * tok.n_tokens), (unsigned) ((nrows + rows - 1) / rows));
+        const sycl::range<3> block_dims(1, rows, WARP_SIZE);
+        stream->submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<uint32_t, 1> slm(sycl::range<1>(moe_slm_table<block_q_t>::n_dwords), cgh);
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_moe_slm<qk, qi, block_q_t, vdr>(
+                        vx_base, vy, dst_base, ids_dev, ncols, nrows,
+                        expert_weight_stride, dst_row_stride, src1_row_stride, n_experts_used, tok,
+                        slm.get_multi_ptr<sycl::access::decorated::no>().get(), item);
+                });
+        });
+        return;
+    }
     const int            block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
     const sycl::range<3> block_nums(1, (unsigned) (n_experts_used * tok.n_tokens), (unsigned) block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);

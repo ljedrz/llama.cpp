@@ -1918,14 +1918,13 @@ vec_dot_iq1_m_q8_1(const void *__restrict__ vbq,
 
 static __dpct_inline__ float
 vec_dot_iq4_nl_q8_1(const void *__restrict__ vbq,
-                    const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+                    const block_q8_1 *__restrict__ bq8_1, const int &iqs,
+                    const uint8_t * values) {
 
     const block_iq4_nl * bq = (const block_iq4_nl *) vbq;
 
     const uint16_t * q4 = (const uint16_t *)bq->qs + 2*iqs;
     const int32_t  * q8 = (const int32_t  *)bq8_1->qs + iqs;
-
-    const uint8_t * values = (const uint8_t *)kvalues_iq4nl;
 
     int v1, v2;
     int sumi1 = 0, sumi2 = 0;
@@ -1938,6 +1937,12 @@ vec_dot_iq4_nl_q8_1(const void *__restrict__ vbq,
 
     const float d = (float)bq->d * bq8_1->ds[0];
     return d * (sumi1 + sumi2);
+}
+
+static __dpct_inline__ float
+vec_dot_iq4_nl_q8_1(const void *__restrict__ vbq,
+                    const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+    return vec_dot_iq4_nl_q8_1(vbq, bq8_1, iqs, (const uint8_t *) kvalues_iq4nl);
 }
 
 
