@@ -85,12 +85,13 @@ void ggml_sycl_mul_mat_vec_nvfp4_id_f32(const void * vx_base, const float * y, c
 
 // NVFP4 MoE prompt batch on the XMX engines over the tiles of ggml_sycl_build_mmid_schedule(), built with tiles of
 // ggml_sycl_nvfp4_moe_xmx_bn() routes. Row r of vy is route map[r] quantized in the quantize_and_reorder_q8_1_soa
-// layout (64 byte aligned rows). Route (slot, token) is written to dst + slot * nb1 + token * nb2.
+// layout (64 byte aligned rows). Route (slot, token) is written to dst + slot * nb1 + token * nb2, times
+// expert_scale[expert] when it is given.
 int  ggml_sycl_nvfp4_moe_xmx_bn();
 void ggml_sycl_mul_mat_id_nvfp4_xmx(const void * vx, size_t expert_stride, int ncols, int nrows, const char * vy,
                                     int stride_y_bytes, const ggml_sycl_grouped_gemm_tile * tiles,
-                                    const mmid_row_mapping * map, int n_tiles, float * dst, size_t nb1, size_t nb2,
-                                    dpct::queue_ptr stream);
+                                    const mmid_row_mapping * map, int n_tiles, const float * expert_scale, float * dst,
+                                    size_t nb1, size_t nb2, dpct::queue_ptr stream);
 
 // Reorder (SoA) variant of the fused MoE expert GEMV.
 // vx_base: each expert slice (stride expert_weight_stride == src0->nb[2]) is a self-contained reorder/SoA layout.

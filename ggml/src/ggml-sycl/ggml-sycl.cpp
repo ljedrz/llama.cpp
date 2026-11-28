@@ -7483,7 +7483,8 @@ static bool ggml_sycl_mul_mat_id_nvfp4_xmx_ok(ggml_backend_sycl_context & ctx, c
 #endif
 }
 
-static void ggml_sycl_mul_mat_id_nvfp4_xmx_run(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+// Returns true when the kernel applied the weight scale of dst (one value per expert).
+static bool ggml_sycl_mul_mat_id_nvfp4_xmx_run(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0     = dst->src[0];
     const ggml_tensor * src1     = dst->src[1];
     const ggml_tensor * ids      = dst->src[2];
@@ -7536,8 +7537,12 @@ static void ggml_sycl_mul_mat_id_nvfp4_xmx_run(ggml_backend_sycl_context & ctx, 
                              });
     }
 
+    const float * expert_scale = nullptr;
+    const bool    scaled       = ggml_sycl_nvfp4_id_expert_scale(dst, &expert_scale) && expert_scale;
     ggml_sycl_mul_mat_id_nvfp4_xmx(src0->data, src0->nb[2], K, (int) src0->ne[1], q8.get(), stride_y, tiles.get(),
-                                   map.get(), (int) n_tiles, (float *) dst->data, dst->nb[1], dst->nb[2], stream);
+                                   map.get(), (int) n_tiles, expert_scale, (float *) dst->data, dst->nb[1], dst->nb[2],
+                                   stream);
+    return scaled;
 }
 
 // The weight scale of ggml_mul_mat_id_ext (src[3]) applied to dst after the product, as the CPU backend does: per
@@ -7574,7 +7579,8 @@ static void ggml_sycl_mul_mat_id_scale(ggml_backend_sycl_context & ctx, ggml_ten
     });
 }
 
-static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+// Returns true when it applied the weight scale of dst itself (else see ggml_sycl_mul_mat_id_scale).
+static bool ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                  ggml_tensor *dst) try {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
     const ggml_tensor *src0 = dst->src[0];
@@ -7594,11 +7600,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     if (ggml_sycl_mul_mat_id_nvfp4_args(dst, nvfp4_args) && ggml_sycl_nvfp4_id_expert_scale(dst, &nvfp4_ep.expert_scale)) {
         ggml_sycl_mul_mat_vec_nvfp4_id_f32(src0->data, (const float *) src1->data, (const int32_t *) ids->data,
                                            (float *) dst->data, nvfp4_args, nvfp4_ep, stream);
-        return;
+        return nvfp4_ep.expert_scale != nullptr;
     }
 
     if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
-        return;
+        return false;
     }
     GGML_ASSERT(!ggml_sycl_mul_mat_id_should_use_mmvq(dst));
 
@@ -7608,10 +7614,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     }
 
     if (ggml_sycl_mul_mat_id_device_sched_eligible(dst)) {
-        bool done = false;
+        bool done   = false;
+        bool scaled = false;
         if (ggml_sycl_mul_mat_id_nvfp4_xmx_ok(ctx, dst)) {
-            ggml_sycl_mul_mat_id_nvfp4_xmx_run(ctx, dst);
-            done = true;
+            scaled = ggml_sycl_mul_mat_id_nvfp4_xmx_run(ctx, dst);
+            done   = true;
         } else {
             if (g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
                 ggml_sycl_xmx_gather_type_enabled(src0->type)) {
@@ -7643,7 +7650,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                         row[j] = 0.0f;
                     }
                 });
-            return;
+            return scaled;
         }
     }
 
@@ -7842,6 +7849,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             });
         }
     }
+    return false;
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -8161,15 +8169,8 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             if (dst->src[0]->ne[3] != dst->src[1]->ne[3]) {
                 return false;
             }
-            ggml_sycl_mul_mat_id(ctx, dst);
-            if (ggml_get_src_scale(dst, 0)) {
-                ggml_sycl_nvfp4_id_args nvfp4_args;
-                const float *           nvfp4_scale;
-                // the NVFP4 GEMV applies a per-expert scale itself
-                if (!ggml_sycl_mul_mat_id_nvfp4_args(dst, nvfp4_args) ||
-                    !ggml_sycl_nvfp4_id_expert_scale(dst, &nvfp4_scale)) {
-                    ggml_sycl_mul_mat_id_scale(ctx, dst);
-                }
+            if (!ggml_sycl_mul_mat_id(ctx, dst) && ggml_get_src_scale(dst, 0)) {
+                ggml_sycl_mul_mat_id_scale(ctx, dst);
             }
             break;
         case GGML_OP_OUT_PROD:

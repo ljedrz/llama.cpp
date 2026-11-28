@@ -1266,9 +1266,10 @@ template <int N> ESIMD_INLINE simd<float, N> xmx_glu_act(const simd<float, N> & 
 
 // columns that are routes of a MoE batch: column m is stored at dst + map[m].i1 * nb1 + map[m].i2 * nb2
 struct xmx_dst_map {
-    const mmid_row_mapping * map = nullptr;
-    size_t                   nb1 = 0;
-    size_t                   nb2 = 0;
+    const mmid_row_mapping * map   = nullptr;
+    size_t                   nb1   = 0;
+    size_t                   nb2   = 0;
+    float                    scale = 1.0f;  // times the output (the weight scale of the expert)
 };
 
 // activations come in through 2D block loads, one for the (d, s) pairs of a super-block (s is unused) and one per two
@@ -1415,6 +1416,9 @@ ESIMD_INLINE void xmx_mul_mat(const void * vx,
     if constexpr (FUSED) {
         Cf *= xmx_glu_act<NC * NT>(Cfg, glu_op);
     }
+    if (dmap.scale != 1.0f) {
+        Cf *= dmap.scale;
+    }
 
     auto col = [&](int m) -> float * {
         if (dmap.map) {
@@ -1507,6 +1511,7 @@ struct xmx_moe_tiles_args {
     int                                 stride_y_bytes;
     size_t                              nb1;  // dst bytes per slot, a multiple of 16
     size_t                              nb2;  // dst bytes per token, a multiple of 16
+    const float *                       expert_scale;  // [n_expert] or nullptr
 };
 
 // A thread per work-group: the work-groups are many, a K split with its shared memory reservation was slower.
@@ -1530,7 +1535,8 @@ static void xmx_moe_tiles_launch(const void *               vx,
                                  return;
                              }
                              const char *      w  = (const char *) vx + (size_t) t.expert * a.expert_stride;
-                             const xmx_dst_map dm = { a.map + t.n0, a.nb1, a.nb2 };
+                             const xmx_dst_map dm = { a.map + t.n0, a.nb1, a.nb2,
+                                                      a.expert_scale ? a.expert_scale[t.expert] : 1.0f };
                              xmx_mul_mat<T, NC, 1, false>(w, nullptr, vy + (size_t) t.n0 * a.stride_y_bytes, dst,
                                                           a.ncols, a.nrows, t.n1 - t.n0, a.stride_y_bytes, 0, 0,
                                                           g % n_mt, 0, 1, dm);

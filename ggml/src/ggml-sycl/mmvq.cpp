@@ -2991,13 +2991,14 @@ int ggml_sycl_nvfp4_moe_xmx_bn() {
 
 void ggml_sycl_mul_mat_id_nvfp4_xmx(const void * vx, size_t expert_stride, int ncols, int nrows, const char * vy,
                                     int stride_y_bytes, const ggml_sycl_grouped_gemm_tile * tiles,
-                                    const mmid_row_mapping * map, int n_tiles, float * dst, size_t nb1, size_t nb2,
-                                    dpct::queue_ptr stream) {
+                                    const mmid_row_mapping * map, int n_tiles, const float * expert_scale, float * dst,
+                                    size_t nb1, size_t nb2, dpct::queue_ptr stream) {
 #ifdef GGML_SYCL_MMVQ_HAS_XMX
     namespace esimd = ggml_sycl_esimd;
     GGML_ASSERT((uintptr_t) vy % 64 == 0 && stride_y_bytes % 64 == 0 && (uintptr_t) dst % 16 == 0 && nb1 % 16 == 0 &&
                 nb2 % 16 == 0);
-    const esimd::xmx_moe_tiles_args a = { tiles, map, n_tiles, expert_stride, ncols, nrows, stride_y_bytes, nb1, nb2 };
+    const esimd::xmx_moe_tiles_args a = { tiles, map, n_tiles, expert_stride, ncols, nrows, stride_y_bytes, nb1, nb2,
+                                          expert_scale };
     static const bool pair_on = ggml_sycl_get_env("GGML_SYCL_NVFP4_MOE_XMX_PAIR", 1);
     // 2D block loads need a 64 byte aligned base of every expert and a pitch of 16 bytes: rows of another size are
     // read in pairs when two rows make such a pitch, else row by row
@@ -3026,7 +3027,8 @@ void ggml_sycl_mul_mat_id_nvfp4_xmx(const void * vx, size_t expert_stride, int n
     }
 #    undef MOE_RUN
 #else
-    GGML_UNUSED_VARS(vx, expert_stride, ncols, nrows, vy, stride_y_bytes, tiles, map, n_tiles, dst, nb1, nb2, stream);
+    GGML_UNUSED_VARS(vx, expert_stride, ncols, nrows, vy, stride_y_bytes, tiles, map, n_tiles, expert_scale, dst, nb1, nb2,
+                     stream);
     GGML_ABORT("no XMX");
 #endif
 }
