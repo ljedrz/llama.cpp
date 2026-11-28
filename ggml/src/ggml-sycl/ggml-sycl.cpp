@@ -6109,39 +6109,39 @@ static bool ggml_sycl_mul_mat_id_nvfp4_args(const ggml_tensor * dst, ggml_sycl_n
     return true;
 }
 
-// An NVFP4 MUL_MAT_ID of ggml_sycl_mul_mat_vec_nvfp4_id_f32() at node i with what follows it in build_moe_ffn():
-// - the per-expert scale of build_lora_mm_id(): RESHAPE, REPEAT, GET_ROWS, MUL
-// - then for the gate_up of a SiTU MoE the activation: two VIEWs of the halves, SCALE, TANH, SCALE and SIGMOID,
-//   MUL of the gate, SCALE, TANH, SCALE of the up, MUL
+// The weight scale of an NVFP4 MUL_MAT_ID that ggml_sycl_mul_mat_vec_nvfp4_id_f32() applies itself: one value per expert.
+// Other scales are applied after the product (ggml_sycl_mul_mat_id_scale).
+static bool ggml_sycl_nvfp4_id_expert_scale(const ggml_tensor * dst, const float ** scale) {
+    const ggml_tensor * w_s = ggml_get_src_scale(dst, 0);
+    *scale = nullptr;
+    if (w_s == nullptr) {
+        return true;
+    }
+    if (!ggml_is_contiguous(w_s) || ggml_nelements(w_s) != dst->src[0]->ne[2]) {
+        return false;
+    }
+    *scale = (const float *) w_s->data;
+    return true;
+}
+
+// An NVFP4 MUL_MAT_ID of ggml_sycl_mul_mat_vec_nvfp4_id_f32() at node i with its per-expert weight scale and the SiTU
+// activation of the gate_up after it in build_moe_ffn(): two VIEWs of the halves, SCALE, TANH, SCALE and SIGMOID, MUL
+// of the gate, SCALE, TANH, SCALE of the up, MUL.
 // Runs them as one kernel and returns the number of nodes after i it took, 0 when the pattern does not match.
 static int ggml_sycl_fuse_nvfp4_moe(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
     ggml_tensor ** nodes = cgraph->nodes;
     const int      n     = cgraph->n_nodes;
     ggml_tensor *  mmid  = nodes[i];
 
-    ggml_sycl_nvfp4_id_args args;
-    if (!g_ggml_sycl_enable_fusion || mmid->op != GGML_OP_MUL_MAT_ID || !ggml_sycl_mul_mat_id_nvfp4_args(mmid, args) ||
-        i + 4 >= n) {
-        return 0;
-    }
-    ggml_tensor * rs  = nodes[i + 1];
-    ggml_tensor * rp  = nodes[i + 2];
-    ggml_tensor * gr  = nodes[i + 3];
-    ggml_tensor * mul = nodes[i + 4];
-    if (rs->op != GGML_OP_RESHAPE || rp->op != GGML_OP_REPEAT || gr->op != GGML_OP_GET_ROWS || mul->op != GGML_OP_MUL ||
-        rp->src[0] != rs || gr->src[0] != rp || gr->src[1] != mmid->src[2] || mul->src[0] != mmid || mul->src[1] != gr) {
-        return 0;
-    }
-    const ggml_tensor * w_s = rs->src[0];
-    if (w_s->type != GGML_TYPE_F32 || !ggml_is_contiguous(w_s) || ggml_nelements(w_s) != mmid->src[0]->ne[2]) {
-        return 0;
-    }
-
+    ggml_sycl_nvfp4_id_args     args;
     ggml_sycl_nvfp4_id_epilogue ep;
-    ep.expert_scale = (const float *) w_s->data;
+    if (!g_ggml_sycl_enable_fusion || mmid->op != GGML_OP_MUL_MAT_ID || !ggml_sycl_mul_mat_id_nvfp4_args(mmid, args) ||
+        !ggml_sycl_nvfp4_id_expert_scale(mmid, &ep.expert_scale)) {
+        return 0;
+    }
 
-    std::vector<ggml_op> ops = { GGML_OP_MUL_MAT_ID, GGML_OP_RESHAPE, GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL };
-    ggml_tensor * out = mul;
+    std::vector<ggml_op> ops = { GGML_OP_MUL_MAT_ID };
+    ggml_tensor * out = mmid;
 
     const auto is_unary = [](const ggml_tensor * t, ggml_unary_op op) {
         return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == op;
@@ -6154,15 +6154,15 @@ static int ggml_sycl_fuse_nvfp4_moe(ggml_backend_sycl_context & ctx, ggml_cgraph
         scale = ggml_get_op_params_f32(t, 0);
         return true;
     };
-    // a half of the rows of mul with its strides
+    // a half of the rows of mmid with its strides
     const auto is_half = [&](const ggml_tensor * t, int half) {
-        return t->op == GGML_OP_VIEW && t->src[0] == mul && t->ne[0] * 2 == mul->ne[0] && t->ne[1] == mul->ne[1] &&
-               t->ne[2] == mul->ne[2] && t->nb[1] == mul->nb[1] && t->nb[2] == mul->nb[2] &&
+        return t->op == GGML_OP_VIEW && t->src[0] == mmid && t->ne[0] * 2 == mmid->ne[0] && t->ne[1] == mmid->ne[1] &&
+               t->ne[2] == mmid->ne[2] && t->nb[1] == mmid->nb[1] && t->nb[2] == mmid->nb[2] &&
                t->view_offs == (size_t) half * t->ne[0] * sizeof(float);
     };
 
-    ggml_tensor ** s = nodes + i + 5;
-    if (i + 15 < n && is_half(s[0], 0) && is_scale(s[1], s[0], ep.situ[0]) && is_unary(s[2], GGML_UNARY_OP_TANH) &&
+    ggml_tensor ** s = nodes + i + 1;
+    if (i + 11 < n && is_half(s[0], 0) && is_scale(s[1], s[0], ep.situ[0]) && is_unary(s[2], GGML_UNARY_OP_TANH) &&
         s[2]->src[0] == s[1] && is_scale(s[3], s[2], ep.situ[1]) && is_unary(s[4], GGML_UNARY_OP_SIGMOID) &&
         s[4]->src[0] == s[0] && s[5]->op == GGML_OP_MUL && s[5]->src[0] == s[3] && s[5]->src[1] == s[4] &&
         is_half(s[6], 1) && is_scale(s[7], s[6], ep.situ[2]) && is_unary(s[8], GGML_UNARY_OP_TANH) &&
@@ -6172,6 +6172,9 @@ static int ggml_sycl_fuse_nvfp4_moe(ggml_backend_sycl_context & ctx, ggml_cgraph
         ops.insert(ops.end(), { GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
                                 GGML_OP_VIEW, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL });
         out = s[10];
+    }
+    if (!ep.situ_enabled) {
+        return 0;  // the MUL_MAT_ID alone: ggml_sycl_mul_mat_id() runs the same kernel
     }
 
     const int out_idx = i + (int) ops.size() - 1;
@@ -6587,8 +6590,8 @@ static int ggml_sycl_fuse_conv_step(ggml_backend_sycl_context & ctx, ggml_cgraph
 // The SiTU activation of build_moe_ffn after a merged gate_up, as one kernel:
 //   [MUL(gate_up [2*n_ff, n_slot, n_tok], scale [1, n_slot, n_tok]),] VIEW gate, SCALE, TANH, SCALE, SIGMOID(gate), MUL,
 //   VIEW up, SCALE, TANH, SCALE, MUL
-// out = s1*tanh(s0*g)*sigmoid(g) * s3*tanh(s2*u) of the (scaled) gate g and up u. Experts with a per-slot scale (NVFP4)
-// match at the MUL; without one (e.g. IQ experts) the chain starts at the VIEW of the gate half and matches at the SCALE
+// out = s1*tanh(s0*g)*sigmoid(g) * s3*tanh(s2*u) of the (scaled) gate g and up u. With a per-slot scale the chain
+// matches at the MUL; without one (e.g. IQ experts) the chain starts at the VIEW of the gate half and matches at the SCALE
 // after it, since views are not visited. Prompt batches take it; NVFP4 few-token batches fuse the whole chain into the
 // NVFP4 MoE GEMV (ggml_sycl_fuse_nvfp4_moe) before this sees the MUL.
 // Returns the number of nodes after i it ran, 0 when the pattern does not match.
@@ -6705,7 +6708,7 @@ static int ggml_sycl_fuse_moe_situ(ggml_backend_sycl_context & ctx, ggml_cgraph 
 // The MoE output of build_moe_ffn at the MUL of node i: MUL(experts [n_embd, n_slot, n_tok], weights [1, n_slot, n_tok]),
 // a VIEW per slot and the chain of ADDs over them, as one kernel that sums the weighted slots in the same order. A
 // per-slot scale of the experts just before (MUL(experts, scale [1, n_slot, n_tok]) at node i, the weights MUL at i + 1)
-// is taken too: prompt batches have it there, a few tokens fold it into the NVFP4 MoE GEMV.
+// is taken too.
 // Returns the number of nodes after i it took, 0 when the pattern does not match.
 static int ggml_sycl_fuse_moe_reduce(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
     if (!g_ggml_sycl_enable_fusion) {
@@ -7532,6 +7535,40 @@ static void ggml_sycl_mul_mat_id_nvfp4_xmx_run(ggml_backend_sycl_context & ctx, 
                                    map.get(), (int) n_tiles, (float *) dst->data, dst->nb[1], dst->nb[2], stream);
 }
 
+// The weight scale of ggml_mul_mat_id_ext (src[3]) applied to dst after the product, as the CPU backend does: per
+// tensor [1], per expert [n_expert] or per channel and expert [n_out, n_expert], the expert taken from ids.
+static void ggml_sycl_mul_mat_id_scale(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * scale = dst->src[3];
+    const ggml_tensor * ids   = dst->src[2];
+    const int64_t ne0  = dst->ne[0], ne1 = dst->ne[1], ne2 = dst->ne[2];
+    const int64_t n_as = dst->src[0]->ne[2];
+    const bool    per_ch_exp = scale->ne[0] == ne0 && scale->ne[1] == n_as;
+    const bool    per_expert = ggml_nelements(scale) == n_as;
+    const char *  sd   = (const char *) scale->data;
+    const char *  idd  = (const char *) ids->data;
+    char *        dd   = (char *) dst->data;
+    const size_t  snb0 = scale->nb[0], snb1 = scale->nb[1], inb0 = ids->nb[0], inb1 = ids->nb[1];
+    const size_t  nb0  = dst->nb[0], nb1 = dst->nb[1], nb2 = dst->nb[2];
+    const int64_t nel  = ne0 * ne1 * ne2;
+    const int     wg   = 256;
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4, " : weight scale");
+    ctx.stream()->parallel_for(sycl::nd_range<1>((nel + wg - 1) / wg * wg, wg), [=](sycl::nd_item<1> it) {
+        const int64_t j = it.get_global_id(0);
+        if (j >= nel) {
+            return;
+        }
+        const int64_t i0 = j % ne0;
+        const int64_t i1 = (j / ne0) % ne1;
+        const int64_t i2 = j / (ne0 * ne1);
+        const int32_t e  = *(const int32_t *) (idd + i1 * inb0 + i2 * inb1);
+        if (e < 0) {
+            return;
+        }
+        const size_t so = per_ch_exp ? i0 * snb0 + e * snb1 : per_expert ? e * snb0 : 0;
+        *(float *) (dd + i0 * nb0 + i1 * nb1 + i2 * nb2) *= *(const float *) (sd + so);
+    });
+}
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                  ggml_tensor *dst) try {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
@@ -7547,10 +7584,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
 
-    ggml_sycl_nvfp4_id_args nvfp4_args;
-    if (ggml_sycl_mul_mat_id_nvfp4_args(dst, nvfp4_args)) {
+    ggml_sycl_nvfp4_id_args     nvfp4_args;
+    ggml_sycl_nvfp4_id_epilogue nvfp4_ep;
+    if (ggml_sycl_mul_mat_id_nvfp4_args(dst, nvfp4_args) && ggml_sycl_nvfp4_id_expert_scale(dst, &nvfp4_ep.expert_scale)) {
         ggml_sycl_mul_mat_vec_nvfp4_id_f32(src0->data, (const float *) src1->data, (const int32_t *) ids->data,
-                                           (float *) dst->data, nvfp4_args, {}, stream);
+                                           (float *) dst->data, nvfp4_args, nvfp4_ep, stream);
         return;
     }
 
@@ -8119,6 +8157,15 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
                 return false;
             }
             ggml_sycl_mul_mat_id(ctx, dst);
+            if (ggml_get_src_scale(dst, 0)) {
+                ggml_sycl_nvfp4_id_args nvfp4_args;
+                const float *           nvfp4_scale;
+                // the NVFP4 GEMV applies a per-expert scale itself
+                if (!ggml_sycl_mul_mat_id_nvfp4_args(dst, nvfp4_args) ||
+                    !ggml_sycl_nvfp4_id_expert_scale(dst, &nvfp4_scale)) {
+                    ggml_sycl_mul_mat_id_scale(ctx, dst);
+                }
+            }
             break;
         case GGML_OP_OUT_PROD:
             ggml_sycl_op_out_prod(ctx, dst);
@@ -9317,7 +9364,8 @@ static ggml_backend_buffer_t ggml_backend_sycl_device_buffer_from_host_ptr(ggml_
 }
 
 static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    if (ggml_get_src_scale(op, 0)) {
+    // weight scales only on MUL_MAT_ID (see ggml_sycl_mul_mat_id_scale), no activation scales
+    if ((ggml_get_src_scale(op, 0) && op->op != GGML_OP_MUL_MAT_ID) || ggml_get_src_scale(op, 1)) {
         return false;
     }
 

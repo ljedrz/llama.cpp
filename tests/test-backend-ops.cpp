@@ -7260,7 +7260,7 @@ struct test_mul_mat_id_dup : public test_mul_mat_id {
 
 // FP4 W4A8 path on the MoE path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 // an expert FFN as build_moe_ffn builds it for Inkling 2: the gate_up MUL_MAT_ID on one input row per token with the
-// per-expert scale (RESHAPE, REPEAT, GET_ROWS, MUL) and the SiTU activation, then the down MUL_MAT_ID with its scale.
+// per-expert weight scale and the SiTU activation, then the down MUL_MAT_ID with its scale.
 // route: 0 every token on the same experts, 1 all routes on distinct experts, 2 top-k from a pool of 32 (about the
 // share of repeated experts of a served verify batch), 3 every route on one of two experts (repeats within a token and
 // more routes on an expert than one work-group takes)
@@ -7290,21 +7290,19 @@ struct test_moe_ffn_route : public test_case {
         ggml_set_name(s_gu, "s_gu");
         ggml_set_name(s_d, "s_d");
 
-        const auto scaled = [&](ggml_tensor * mm, ggml_tensor * ws) {
+        const auto scaled = [&](ggml_tensor * w, ggml_tensor * b, ggml_tensor * ws) {
+            ggml_tensor * mm = ggml_mul_mat_id_ext(ctx, w, b, ids, ws, nullptr);
             ggml_prec_set_acc(mm, GGML_PREC_BF16);
-            ggml_tensor * s = ggml_reshape_3d(ctx, ws, 1, n_expert, 1);
-            s = ggml_repeat_4d(ctx, s, 1, n_expert, n_tok, 1);
-            s = ggml_get_rows(ctx, s, ids);
-            return ggml_mul(ctx, mm, s);
+            return mm;
         };
-        ggml_tensor * gate_up = scaled(ggml_mul_mat_id(ctx, w_gu, x, ids), s_gu);
+        ggml_tensor * gate_up = scaled(w_gu, x, s_gu);
         ggml_tensor * gate = ggml_view_3d(ctx, gate_up, n_ff, n_used, n_tok, gate_up->nb[1], gate_up->nb[2], 0);
         ggml_tensor * up   = ggml_view_3d(ctx, gate_up, n_ff, n_used, n_tok, gate_up->nb[1], gate_up->nb[2], n_ff*gate_up->nb[0]);
         ggml_tensor * act  = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gate, 1.0f/4.0f)), 4.0f);
         act = ggml_mul(ctx, act, ggml_sigmoid(ctx, gate));
         up  = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 1.0f/25.0f)), 25.0f);
         ggml_tensor * cur = ggml_mul(ctx, act, up);
-        ggml_tensor * out = scaled(ggml_mul_mat_id(ctx, w_d, cur, ids), s_d);
+        ggml_tensor * out = scaled(w_d, cur, s_d);
         ggml_set_name(out, "out");
         return out;
     }
